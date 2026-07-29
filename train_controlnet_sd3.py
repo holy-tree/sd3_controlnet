@@ -1841,6 +1841,15 @@ def main(args):
                 prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
 
+                # DEBUG: 第一次前向时打印 batch 形状
+                if not hasattr(main, "_dbg_first_step"):
+                    main._dbg_first_step = True
+                    logger.info(
+                        f"[DEBUG batch] prompt_embeds.shape={list(prompt_embeds.shape)}, "
+                        f"pooled_prompt_embeds.shape={list(pooled_prompt_embeds.shape)}, "
+                        f"weight_dtype={weight_dtype}"
+                    )
+
                 # controlnet(s) inference
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
                 controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
