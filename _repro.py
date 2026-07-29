@@ -52,7 +52,7 @@ print(f"latent_h={latent_h}, latent_w={latent_w}")
 hidden_states = torch.randn(B, 16, latent_h, latent_w, device=device, dtype=dtype)
 controlnet_cond = torch.randn(B, 16, latent_h, latent_w, device=device, dtype=dtype)
 encoder_hidden_states = torch.randn(B, 77, 4096, device=device, dtype=dtype)  # joint_attention_dim=4096
-pooled_projections = torch.randn(B, 768, device=device, dtype=dtype)  # pooled_projection_dim=768
+pooled_projections = torch.randn(B, 2048, device=device, dtype=dtype)  # pooled_projection_dim=2048 (CLIP-L 768 + CLIP-G 1280)
 timestep = torch.tensor([500], device=device)
 
 print(f"hidden_states       .shape={list(hidden_states.shape)}")
