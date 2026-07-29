@@ -24,7 +24,8 @@ import math
 import os
 import random
 import shutil
-from typing import List
+from datetime import datetime
+from typing import Dict, List
 
 import yaml
 
@@ -230,6 +231,177 @@ def load_text_encoders(class_one, class_two, class_three):
         args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant
     )
     return text_encoder_one, text_encoder_two, text_encoder_three
+
+
+# =============================================================================
+# 按 step 跑 PSNR/SSIM 验证 (移植自 controlnet_file/train_controlnet.py:run_epoch_validation)
+# 仅当 args.run_validation=True 且 args.run_validation_steps > 0 且 global_step % N == 0 时触发.
+# 在主进程上跑 (与 source 一致), 用训练集本身采样 GT/LQ, 与 GT 计算 PSNR/SSIM.
+# =============================================================================
+@torch.no_grad()
+def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_three,
+                        tokenizer_one, tokenizer_two, tokenizer_three,
+                        controlnet, accelerator, weight_dtype, args, step, train_dataset):
+    """
+    每个 --run_validation_steps step 触发:
+      1. 对 args.weather_types 中每个天气, 各抽 --validation_num_samples 个 GT/LQ 对
+      2. 用 SD3 pipeline 从 LQ 生成 pred
+      3. pred vs GT 计算 PSNR / SSIM
+      4. 保存 pred/lq/gt PNG 到 output_dir/validation/<timestamp>_step<N>/<weather>/
+      5. 写 metrics.txt
+      6. 通过 accelerator.log 上报 tensorboard/wandb (val/<weather>/psnr 等)
+    """
+    if not accelerator.is_main_process:
+        return None
+
+    logger.info(f"[Step {step}] 开始 PSNR/SSIM 验证 ...")
+
+    from diffusers import StableDiffusion3ControlNetPipeline
+    from torchvision import transforms as tvt
+
+    # ---- 1. 准备输出目录 ----
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    val_root = Path(args.output_dir) / "validation" / f"{timestamp}_step{step}"
+    val_root.mkdir(parents=True, exist_ok=True)
+
+    # ---- 2. 构造 inference pipeline (复用内存中的 vae / text_encoder / transformer / controlnet) ----
+    # SD3 pipeline 接受显式组件注入, 避免从磁盘重加载 (与 source 一致)
+    # transformer 已被冻结, 重新 from_pretrained 一次比走内存更安全 (因为 accelerator.prepare 可能改了 dtype)
+    pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder_one,
+        text_encoder_2=text_encoder_two,
+        text_encoder_3=text_encoder_three,
+        tokenizer=tokenizer_one,
+        tokenizer_2=tokenizer_two,
+        tokenizer_3=tokenizer_three,
+        controlnet=accelerator.unwrap_model(controlnet),
+        safety_checker=None,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    try:
+        pipeline = pipeline.to(accelerator.device)
+    except (NotImplementedError, TypeError) as e:
+        logger.warning(f"[Step {step}] pipeline.to() 触发错误 ({e}), 回退 to_empty")
+        pipeline.to_empty(device=accelerator.device)
+        if weight_dtype != torch.float32:
+            pipeline = pipeline.to(dtype=weight_dtype)
+    pipeline.set_progress_bar_config(disable=True)
+
+    # ---- 3. 取 train_dataset 的 samples (兼容 torch.Subset) ----
+    base_samples = train_dataset.samples if hasattr(train_dataset, "samples") else train_dataset.dataset.samples
+    num_samples = args.validation_num_samples
+
+    weather_metrics: Dict[str, Dict[str, float]] = {}
+    # 复用 prompt 来源: 训练时的 use_prompt 逻辑 (--use_prompt + --prompt_ratio + --weather_prompts)
+    weather_prompts_lookup = {}
+    if isinstance(getattr(args, "weather_prompts", None), dict):
+        weather_prompts_lookup = dict(args.weather_prompts)
+
+    autocast_enabled = (accelerator.device.type == "cuda")
+
+    for weather in args.weather_types:
+        candidates = [s for s in base_samples if s[2] == weather]
+        if not candidates:
+            logger.warning(f"[Step {step}] 没有 {weather} 类别的样本, 跳过")
+            continue
+
+        # 固定种子以便跨 step 复现 val 集 (与 source 一致: seed 仅依赖 weather)
+        import hashlib
+        weather_seed = int(hashlib.md5(weather.encode("utf-8")).hexdigest()[:8], 16) % (2 ** 31)
+        random.seed(weather_seed)
+        selected = random.sample(candidates, min(num_samples, len(candidates)))
+
+        weather_dir = val_root / weather
+        weather_dir.mkdir(parents=True, exist_ok=True)
+
+        psnr_list, ssim_list = [], []
+        for sample_idx, (gt_path, lq_path, _) in enumerate(selected):
+            # 读 LQ / GT, resize + centercrop 到训练分辨率, 转 tensor [0, 1]
+            preprocess = tvt.Compose([
+                tvt.Resize(args.resolution, interpolation=tvt.InterpolationMode.BILINEAR),
+                tvt.CenterCrop(args.resolution),
+                tvt.ToTensor(),
+            ])
+            lq_img = preprocess(Image.open(lq_path).convert("RGB"))
+            gt_img = preprocess(Image.open(gt_path).convert("RGB"))
+            lq_pil = tvt.ToPILImage()(lq_img)
+
+            # weather-aware prompt (与训练时同源, 但每张独立抽, 训练时是 deterministic_seed,
+            # 这里用 random.random 与训练内的 weather_prompt_ratio 对齐, 便于跑多个 step 看多样本覆盖)
+            prompt = ""
+            if getattr(args, "use_prompt", False) and random.random() < args.prompt_ratio:
+                prompt = weather_prompts_lookup.get(weather, "")
+
+            # SD3 pipeline 推理
+            with torch.autocast("cuda", enabled=autocast_enabled):
+                pred_pil = pipeline(
+                    prompt=prompt,
+                    control_image=lq_pil,
+                    num_inference_steps=args.validation_inference_steps,
+                    guidance_scale=args.validation_guidance_scale,
+                    negative_prompt=args.validation_negative_prompt,
+                    height=args.resolution,
+                    width=args.resolution,
+                ).images[0]
+
+            # pred -> tensor [3, H, W] in [0, 1]
+            pred_tensor = tvt.ToTensor()(pred_pil).to(accelerator.device).clamp(0, 1)
+
+            # PSNR / SSIM (pred vs gt, 都在 [0, 1])
+            from utils.metrics import psnr as calc_psnr, ssim as calc_ssim
+            p = calc_psnr(pred_tensor, gt_img.to(accelerator.device))
+            s = calc_ssim(pred_tensor, gt_img.to(accelerator.device))
+            psnr_list.append(p)
+            ssim_list.append(s)
+
+            # 保存 PNG (pred / lq / gt), 便于人工查看
+            stem = Path(gt_path).stem
+            pred_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_pred.png")
+            lq_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_lq.png")
+            gt_pil = tvt.ToPILImage()(gt_img)
+            gt_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_gt.png")
+
+        if psnr_list:
+            avg_p = sum(psnr_list) / len(psnr_list)
+            avg_s = sum(ssim_list) / len(ssim_list)
+            weather_metrics[weather] = {"psnr": avg_p, "ssim": avg_s}
+            logger.info(f"[Step {step}] [{weather}] PSNR={avg_p:.3f} dB, "
+                        f"SSIM={avg_s:.4f} (n={len(psnr_list)})")
+
+    # ---- 4. 写 metrics.txt 汇总 ----
+    summary_path = val_root / "metrics.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"Step: {step}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Num samples per weather: {num_samples}\n")
+        f.write(f"Inference steps: {args.validation_inference_steps}\n")
+        f.write(f"Guidance scale: {args.validation_guidance_scale}\n\n")
+        f.write("Per-weather metrics:\n")
+        for weather, m in weather_metrics.items():
+            f.write(f"  {weather:8s}  PSNR={m['psnr']:.3f} dB  SSIM={m['ssim']:.4f}\n")
+        if weather_metrics:
+            avg_psnr = sum(m["psnr"] for m in weather_metrics.values()) / len(weather_metrics)
+            avg_ssim = sum(m["ssim"] for m in weather_metrics.values()) / len(weather_metrics)
+            f.write(f"\nAverage:        PSNR={avg_psnr:.3f} dB  SSIM={avg_ssim:.4f}\n")
+
+    # ---- 5. accelerator.log → tensorboard / wandb ----
+    log_dict = {f"val/{w}/psnr": m["psnr"] for w, m in weather_metrics.items()}
+    log_dict.update({f"val/{w}/ssim": m["ssim"] for w, m in weather_metrics.items()})
+    if weather_metrics:
+        log_dict["val/avg_psnr"] = sum(m["psnr"] for m in weather_metrics.values()) / len(weather_metrics)
+        log_dict["val/avg_ssim"] = sum(m["ssim"] for m in weather_metrics.values()) / len(weather_metrics)
+    accelerator.log(log_dict, step=step)
+
+    logger.info(f"[Step {step}] 验证完成, 结果保存到: {val_root}")
+    del pipeline
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return log_dict.get("val/avg_psnr", None)
 
 
 # Copied from dreambooth sd3 example
@@ -644,6 +816,46 @@ def parse_args(input_args=None):
         nargs="+",
         default=None,
         help="(配合 --use_prompt) 自定义天气 prompt, 格式: rain:desc snow:desc haze:desc",
+    )
+
+    # ==================== 按 step 跑 PSNR/SSIM 验证 (移植自 controlnet_file/train_controlnet.py:run_epoch_validation) ====================
+    parser.add_argument(
+        "--run_validation",
+        action="store_true",
+        help="(默认 False) 是否在训练过程中定期计算 PSNR/SSIM. "
+             "与现有 --validation_prompt 图片验证并行存在, 各跑各的.",
+    )
+    parser.add_argument(
+        "--run_validation_steps",
+        type=int,
+        default=2000,
+        help="每 N step 跑一次 PSNR/SSIM 验证 (0 = 禁用 step-based 验证, 仅保留图片验证). "
+             "推荐: 2000 (大训练) / 500 (小训练).",
+    )
+    parser.add_argument(
+        "--validation_num_samples",
+        type=int,
+        default=4,
+        help="每种天气用于 PSNR/SSIM 验证的样本数 (默认 4). "
+             "注意: 仅作训练过程趋势参考, 真实 best 必须靠 evaluate.py 全量评估.",
+    )
+    parser.add_argument(
+        "--validation_inference_steps",
+        type=int,
+        default=20,
+        help="验证时 pipeline 推理步数 (默认 20)",
+    )
+    parser.add_argument(
+        "--validation_guidance_scale",
+        type=float,
+        default=5.5,
+        help="验证时 CFG guidance_scale (默认 5.5)",
+    )
+    parser.add_argument(
+        "--validation_negative_prompt",
+        type=str,
+        default="dotted, noise, blur, lowres, smooth",
+        help="验证时的 negative prompt (默认 'dotted, noise, blur, lowres, smooth')",
     )
     parser.add_argument(
         "--max_sequence_length",
@@ -1374,6 +1586,26 @@ def main(args):
 
     train_dataset = make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, accelerator)
 
+    # ========== 验证开关状态打印 (便于排查 "为什么我以为启用了验证但实际没跑") ==========
+    if args.validation_prompt is not None:
+        logger.info(
+            f"[验证] 上半段 log_validation 已启用: 每 {args.validation_steps} step 用 "
+            f"{len(args.validation_prompt)} 个 prompt + {len(args.validation_image)} 张 LQ 出 "
+            f"{args.num_validation_images} 张图 (无 GT 无指标)"
+        )
+    else:
+        logger.info(
+            "[验证] 上半段 log_validation 未启用 (validation_prompt=null). "
+            "训练期间不会跑 pipeline 出图, 只跑下半段 run_validation (若开启)."
+        )
+    if args.run_validation:
+        logger.info(
+            f"[验证] 下半段 run_step_validation 已启用: 每 {args.run_validation_steps} step, "
+            f"每 weather 采 {args.validation_num_samples} 张, 算 PSNR/SSIM 写 metrics.txt"
+        )
+    else:
+        logger.info("[验证] 下半段 run_step_validation 未启用 (run_validation=false)")
+
     tokenizers = [tokenizer_one, tokenizer_two, tokenizer_three]
     text_encoders = [text_encoder_one, text_encoder_two, text_encoder_three]
 
@@ -1644,6 +1876,28 @@ def main(args):
                             weight_dtype,
                             global_step,
                         )
+
+                    # ===== 按 step 评估 PSNR/SSIM (与现有 log_validation 并行, 不互斥) =====
+                    # 训练时 n=4 验证只是"相对参考", 不可作为 best 依据.
+                    # 真实 best 必须靠手动跑 utils/evaluate_sd3.py 全量评估决定.
+                    if (args.run_validation
+                            and args.run_validation_steps > 0
+                            and global_step > 0
+                            and global_step % args.run_validation_steps == 0):
+                        controlnet.eval()
+                        try:
+                            run_step_validation(
+                                vae,
+                                text_encoder_one, text_encoder_two, text_encoder_three,
+                                tokenizer_one, tokenizer_two, tokenizer_three,
+                                controlnet,
+                                accelerator, weight_dtype, args,
+                                global_step, train_dataset,
+                            )
+                        except Exception as e:
+                            logger.warning(f"[Step {global_step}] run_step_validation 失败: {e}")
+                        finally:
+                            controlnet.train()
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

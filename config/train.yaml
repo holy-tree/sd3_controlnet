@@ -26,7 +26,7 @@ revision: null
 variant: null
 
 # ==================== 输出与缓存 ====================
-output_dir: "./experiment/SD3ControlNet"
+output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet"
 cache_dir: null
 
 # 接续训练 (从 checkpoint 恢复 optimizer / scheduler / global_step):
@@ -37,7 +37,7 @@ resume_from_checkpoint: null
 
 # ==================== 数据集 (源项目布局, 与 --dataset_root 配合) ====================
 # 数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/
-dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+dataset_root: "/root/autodl-tmp/datasets"
 
 # 参与训练的天气类型与划分
 weather_types: ["rain", "snow", "haze"]
@@ -73,8 +73,8 @@ dataloader_num_workers: 0
 
 # ==================== 训练步数 ====================
 num_train_epochs: 1
-max_train_steps: 15000
-checkpointing_steps: 500
+max_train_steps: 20000
+checkpointing_steps: 1000
 checkpoints_total_limit: null
 
 # ==================== 优化器与梯度 ====================
@@ -137,13 +137,19 @@ tracker_project_name: "train_controlnet_SD3"
 # seed (null = 随机)
 seed: null
 
-# ==================== 验证 (按 step 跑 pipeline 出图) ====================
-# 与 SD3 官方一致: validation_image + validation_prompt 配对
-# null = 禁用验证; 提供则每 validation_steps 步出 N 张图
+# ==================== 验证 (按 step 跑 pipeline 出图, SD3 官方 log_validation) ====================
 validation_prompt: null
 validation_image: null
 num_validation_images: 1
 validation_steps: 100
+
+# ==================== 按 step 评估 PSNR/SSIM (移植自源项目 run_epoch_validation) ====================
+run_validation: true                  # 默认关闭 (与源 train.yaml:165 一致)
+run_validation_steps: 1000              # 每 N step 跑一次 (0 = 禁用)
+validation_num_samples: 4               # 每种天气采样数
+validation_inference_steps: 20         # pipeline 推理步数
+validation_guidance_scale: 5.5          # CFG
+validation_negative_prompt: null
 
 # ==================== Hub 推送 (HF) ====================
 push_to_hub: false
