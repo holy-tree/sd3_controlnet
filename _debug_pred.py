@@ -16,6 +16,7 @@ os.environ.setdefault("HF_HOME", "/root/autodl-tmp/hf_cache")
 from diffusers import (
     SD3Transformer2DModel,
     AutoencoderKL,
+    StableDiffusion3Pipeline,
     StableDiffusion3ControlNetPipeline,
 )
 from diffusers.models.controlnets.controlnet_sd3 import SD3ControlNetModel
@@ -33,10 +34,9 @@ print("\n=== 加载 SD3 (无 controlnet) ===")
 vae = AutoencoderKL.from_pretrained(MODEL_ID, subfolder="vae", torch_dtype=dtype, low_cpu_mem_usage=True).to(device)
 print(f"  vae: shift={vae.config.shift_factor}, scale={vae.config.scaling_factor}")
 
-pipe_uncond = StableDiffusion3ControlNetPipeline.from_pretrained(
+# vanilla SD3 用 StableDiffusion3Pipeline (不是 ControlNetPipeline)
+pipe_uncond = StableDiffusion3Pipeline.from_pretrained(
     MODEL_ID,
-    safety_checker=None,
-    revision=None,
     torch_dtype=dtype,
 )
 pipe_uncond = pipe_uncond.to(device)
