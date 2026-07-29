@@ -1018,7 +1018,10 @@ def attach_precomputed_embeddings(train_dataset, tokenizer_one, tokenizer_two, t
                 prompt, args.max_sequence_length,
                 device=accelerator.device,
             )
-            prompt_embed_cache[prompt] = (pe.cpu(), ppe.cpu())
+            # squeeze batch=1: encode_prompt 把单个 prompt 当作 list 处理, 输出自带 batch=1.
+            # 预计算结果存为 per-sample 特征 (无 batch 维), collate 时正常 stack
+            # 否则 stack 后会多一个 dim=1, 跟 accelerate 的 grad_accum wrap 叠加导致 shape 错位
+            prompt_embed_cache[prompt] = (pe.cpu().squeeze(0), ppe.cpu().squeeze(0))
 
     # 复用同一 tensor 引用 (相同 prompt 指向同一个 Tensor 对象, 节省内存)
     prompt_embeds_list: List[torch.Tensor] = [prompt_embed_cache[p][0] for p in resolved_prompts]
@@ -1508,14 +1511,6 @@ def main(args):
         controlnet = SD3ControlNetModel.from_transformer(
             transformer, num_extra_conditioning_channels=args.num_extra_conditioning_channels
         )
-    # debug: 打印 controlnet 关键维度
-    inner_dim = controlnet.inner_dim
-    first_linear = controlnet.transformer_blocks[0].norm1.linear
-    logger.info(
-        f"[ControlNet] inner_dim={inner_dim}, "
-        f"linear.weight.shape={list(first_linear.weight.shape)}, "
-        f"num_layers={len(controlnet.transformer_blocks)}"
-    )
 
 
     transformer.requires_grad_(False)
@@ -1840,15 +1835,6 @@ def main(args):
                 # Get the text embedding for conditioning
                 prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
-
-                # DEBUG: 第一次前向时打印 batch 形状
-                if not hasattr(main, "_dbg_first_step"):
-                    main._dbg_first_step = True
-                    logger.info(
-                        f"[DEBUG batch] prompt_embeds.shape={list(prompt_embeds.shape)}, "
-                        f"pooled_prompt_embeds.shape={list(pooled_prompt_embeds.shape)}, "
-                        f"weight_dtype={weight_dtype}"
-                    )
 
                 # controlnet(s) inference
                 controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
