@@ -1659,23 +1659,25 @@ def main(args):
             pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
         return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
-    compute_embeddings_fn = functools.partial(
-        compute_text_embeddings,
-        text_encoders=text_encoders,
-        tokenizers=tokenizers,
-    )
-    with accelerator.main_process_first():
-        from datasets.fingerprint import Hasher
-
-        # fingerprint used by the cache for the other processes to load the result
-        # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
-        new_fingerprint = Hasher.hash(args)
-        train_dataset = train_dataset.map(
-            compute_embeddings_fn,
-            batched=True,
-            batch_size=args.dataset_preprocess_batch_size,
-            new_fingerprint=new_fingerprint,
+    # --dataset_root 分支: prompt embeddings 已由 attach_precomputed_embeddings 预计算
+    if args.dataset_root is None:
+        compute_embeddings_fn = functools.partial(
+            compute_text_embeddings,
+            text_encoders=text_encoders,
+            tokenizers=tokenizers,
         )
+        with accelerator.main_process_first():
+            from datasets.fingerprint import Hasher
+
+            # fingerprint used by the cache for the other processes to load the result
+            # details: https://github.com/huggingface/diffusers/pull/4038#discussion_r1266078401
+            new_fingerprint = Hasher.hash(args)
+            train_dataset = train_dataset.map(
+                compute_embeddings_fn,
+                batched=True,
+                batch_size=args.dataset_preprocess_batch_size,
+                new_fingerprint=new_fingerprint,
+            )
 
     del text_encoder_one, text_encoder_two, text_encoder_three
     del tokenizer_one, tokenizer_two, tokenizer_three
