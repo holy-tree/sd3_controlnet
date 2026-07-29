@@ -1511,6 +1511,26 @@ def main(args):
         f"linear.weight.shape={list(first_linear.weight.shape)}, "
         f"num_layers={len(controlnet.transformer_blocks)}"
     )
+    # monkey-patch: 在第一次 forward 时打印 temb 的实际形状
+    _orig_norm1_forward = controlnet.transformer_blocks[0].norm1.forward
+    def _debug_norm1_forward(self, x, timestep=None, class_labels=None, hidden_dtype=None, emb=None):
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb_before = emb.shape
+        silu_out = torch.nn.functional.silu(emb)
+        emb_after = silu_out.shape
+        linear_out = self.linear(silu_out)
+        logger.info(
+            f"[DEBUG norm1] emb_in.shape={list(emb_before)}, "
+            f"silu(emb).shape={list(emb_after)}, "
+            f"linear.weight.shape={list(self.linear.weight.shape)}, "
+            f"linear.out.shape={list(linear_out.shape)}, "
+            f"self.emb is None={self.emb is None}"
+        )
+        # fall through to original
+        return _orig_norm1_forward(x, timestep=timestep, class_labels=class_labels, hidden_dtype=hidden_dtype, emb=emb)
+    import types
+    controlnet.transformer_blocks[0].norm1.forward = types.MethodType(_debug_norm1_forward, controlnet.transformer_blocks[0].norm1)
 
 
     transformer.requires_grad_(False)
