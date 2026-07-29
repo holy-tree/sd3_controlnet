@@ -221,14 +221,19 @@ def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_v
 
 # Copied from dreambooth sd3 example
 def load_text_encoders(class_one, class_two, class_three):
+    # T5-XXL (text_encoder_3) in fp32 = ~10GB RAM, 在 RAM 吃紧的环境会被 OOM kill
+    # 直接以 bf16 加载省一半内存; 与训练 mixed_precision 同步, 数值无影响
     text_encoder_one = class_one.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant,
+        torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
     )
     text_encoder_two = class_two.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant,
+        torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
     )
     text_encoder_three = class_three.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant,
+        torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
     )
     return text_encoder_one, text_encoder_two, text_encoder_three
 
@@ -1511,26 +1516,6 @@ def main(args):
         f"linear.weight.shape={list(first_linear.weight.shape)}, "
         f"num_layers={len(controlnet.transformer_blocks)}"
     )
-    # monkey-patch: 在第一次 forward 时打印 temb 的实际形状
-    _orig_norm1_forward = controlnet.transformer_blocks[0].norm1.forward
-    def _debug_norm1_forward(self, x, timestep=None, class_labels=None, hidden_dtype=None, emb=None):
-        if self.emb is not None:
-            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
-        emb_before = emb.shape
-        silu_out = torch.nn.functional.silu(emb)
-        emb_after = silu_out.shape
-        linear_out = self.linear(silu_out)
-        logger.info(
-            f"[DEBUG norm1] emb_in.shape={list(emb_before)}, "
-            f"silu(emb).shape={list(emb_after)}, "
-            f"linear.weight.shape={list(self.linear.weight.shape)}, "
-            f"linear.out.shape={list(linear_out.shape)}, "
-            f"self.emb is None={self.emb is None}"
-        )
-        # fall through to original
-        return _orig_norm1_forward(x, timestep=timestep, class_labels=class_labels, hidden_dtype=hidden_dtype, emb=emb)
-    import types
-    controlnet.transformer_blocks[0].norm1.forward = types.MethodType(_debug_norm1_forward, controlnet.transformer_blocks[0].norm1)
 
 
     transformer.requires_grad_(False)
