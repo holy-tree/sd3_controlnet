@@ -342,7 +342,10 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 prompt = weather_prompts_lookup.get(weather, "")
 
             # SD3 pipeline 推理
-            with torch.autocast("cuda", enabled=autocast_enabled):
+            # 注: torch.autocast("cuda") 默认 dtype=fp16, 会把 bf16 组件 (VAE/transformer/controlnet) 
+            # 强制降到 fp16, fp16 数值范围窄, SD3 累积误差 → VAE decode 出 NaN → 图像全黑.
+            # 修复: 显式指定 dtype=bf16 跟训练 mixed_precision 一致, 或者直接关掉 autocast.
+            with torch.autocast("cuda", enabled=autocast_enabled, dtype=weight_dtype):
                 pred_pil = pipeline(
                     prompt=prompt,
                     control_image=lq_pil,
