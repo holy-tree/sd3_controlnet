@@ -1688,8 +1688,9 @@ def main(args):
                 new_fingerprint=new_fingerprint,
             )
 
-    del text_encoder_one, text_encoder_two, text_encoder_three
-    del tokenizer_one, tokenizer_two, tokenizer_three
+    # 不删除 text_encoder/tokenizer: run_step_validation 会重新构造 SD3 pipeline 跑 PSNR/SSIM 验证.
+    # A800-80GB 显存充裕, 保留 ~6GB 的 text encoder 没问题.
+    # 训练结束 (main() 退出) 时由 Python GC + free_memory 自动回收.
     free_memory()
 
     train_dataloader = torch.utils.data.DataLoader(
