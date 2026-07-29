@@ -1,0 +1,160 @@
+# ============================================================
+# SD3 ControlNet 训练配置 (镜像 controlnet_file/config/train.yaml 的字段命名)
+# ============================================================
+# 启动:
+#   accelerate launch train_controlnet_sd3.py --config config/train.yaml
+#
+# 优先级: CLI 参数 > 本 YAML > argparse 默认值
+#   - YAML 中值为 null 的字段会被跳过 (视为"未设置")
+#   - 想在 CLI 临时覆盖, 直接传 --<flag> <value> 即可
+# ============================================================
+
+# ==================== 模型路径 ====================
+# SD3 基础模型 (gated, 需 hf auth login) 或本地路径
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
+
+# ControlNet 初始化权重来源 (二选一):
+#   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
+#   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
+controlnet_model_name_or_path: null
+
+# SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
+num_extra_conditioning_channels: 0
+
+# HF revision / variant (fp16 等量化版本)
+revision: null
+variant: null
+
+# ==================== 输出与缓存 ====================
+output_dir: "./experiment/SD3ControlNet"
+cache_dir: null
+
+# 接续训练 (从 checkpoint 恢复 optimizer / scheduler / global_step):
+#   null      = 不接续, 从头训
+#   "latest"  = 自动选 output_dir 里最新的 checkpoint
+#   "/path/to/checkpoint-N" = 指定具体 checkpoint
+resume_from_checkpoint: null
+
+# ==================== 数据集 (源项目布局, 与 --dataset_root 配合) ====================
+# 数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/
+dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+
+# 参与训练的天气类型与划分
+weather_types: ["rain", "snow", "haze"]
+splits: ["train"]
+
+# 每个天气类型使用的样本数 (None 表示不限制; 也可填 0/-1)
+rain_num: null
+snow_num: null
+haze_num: null
+
+# ==================== 文本 prompt (天气感知) ====================
+# 是否启用天气 prompt (与源 train.yaml 一致)
+use_prompt: false
+prompt_ratio: 0.2
+
+# 自定义天气 prompt (YAML 直接写 dict, 比 CLI 字符串更清晰)
+weather_prompts:
+  rain: "rainy scene, rain streaks on the image, wet surfaces, overcast sky"
+  snow: "snowy scene, snowflakes covering the image, cold atmosphere, white noise"
+  haze: "hazy scene, foggy atmosphere, low visibility, grayish tone"
+
+# proportion_empty_prompts 在 --dataset_root 模式下会被强制设为 0 (天气 prompt 已在 dataset 解析)
+proportion_empty_prompts: 0
+
+# 训练样本截断 (用于 debug; null = 不截断)
+max_train_samples: null
+
+# ==================== 分辨率与 batch ====================
+resolution: 512
+train_batch_size: 1
+gradient_accumulation_steps: 4
+dataloader_num_workers: 0
+
+# ==================== 训练步数 ====================
+num_train_epochs: 1
+max_train_steps: 15000
+checkpointing_steps: 500
+checkpoints_total_limit: null
+
+# ==================== 优化器与梯度 ====================
+learning_rate: 1.0e-5
+scale_lr: false
+
+# AdamW 参数
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+
+# 8-bit Adam (bitsandbytes)
+use_8bit_adam: false
+
+# ==================== LR Scheduler ====================
+lr_scheduler: "constant"               # linear / cosine / cosine_with_restarts / polynomial / constant / constant_with_warmup
+lr_warmup_steps: 500
+lr_num_cycles: 1                       # 仅 cosine_with_restarts 生效
+lr_power: 1.0                          # 仅 polynomial 生效
+
+# ==================== Flow Matching (SD3 专用) ====================
+# 加权采样策略, 影响 timestep 分布
+weighting_scheme: "logit_normal"       # sigma_sqrt / logit_normal / mode / cosmap
+logit_mean: 0.0
+logit_std: 1.0
+mode_scale: 1.29
+
+# EDM preconditioning: 1=启用 (推荐), 0=关闭
+precondition_outputs: 1
+
+# T5 text encoder 最大序列长度
+max_sequence_length: 77
+
+# dataset.map(compute_embeddings_fn) 的 batch_size (预计算 prompt embeddings 用)
+dataset_preprocess_batch_size: 1000
+
+# ==================== 精度与显存 ====================
+# no / fp16 / bf16 (fp16 配 GradScaler, bf16 跳过; SD3 推荐 bf16)
+mixed_precision: "bf16"
+
+# 是否 upcast VAE 到 fp32 (避免显存压力但牺牲精度)
+upcast_vae: false
+
+# 梯度检查点 (用时间换显存)
+gradient_checkpointing: false
+
+# TF32 (Ampere+)
+allow_tf32: false
+
+# Optimizer zero_grad(set_to_none=True)
+set_grads_to_none: false
+
+# ==================== 日志与 Tracker ====================
+logging_dir: "logs"
+report_to: "tensorboard"               # tensorboard / wandb / comet_ml / all
+tracker_project_name: "train_controlnet_SD3"
+
+# seed (null = 随机)
+seed: null
+
+# ==================== 验证 (按 step 跑 pipeline 出图) ====================
+# 与 SD3 官方一致: validation_image + validation_prompt 配对
+# null = 禁用验证; 提供则每 validation_steps 步出 N 张图
+validation_prompt: null
+validation_image: null
+num_validation_images: 1
+validation_steps: 100
+
+# ==================== Hub 推送 (HF) ====================
+push_to_hub: false
+hub_token: null
+hub_model_id: null
+
+# ==================== 保留旧字段 (HF imagefolder 兼容, 不与 --dataset_root 同用) ====================
+# 想用 HF datasets (fill50k / metadata.jsonl) 时启用下面, 并把 --dataset_root 留空
+dataset_name: null
+dataset_config_name: null
+train_data_dir: null
+image_column: "image"
+conditioning_image_column: "conditioning_image"
+caption_column: "text"

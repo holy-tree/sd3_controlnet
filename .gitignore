@@ -1,0 +1,129 @@
+# ============================================================
+# SD3 ControlNet 训练项目 .gitignore
+# ============================================================
+# 涵盖: Python / PyTorch / HF datasets / 实验产物 / IDE
+# ============================================================
+
+# ---------- Python 字节码 / 缓存 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+uv.lock
+
+# ---------- uv 锁文件 (项目用 pip + pyproject.toml, 不锁版本) ----------
+# 注: 若团队用 uv 协同, 反注释下行; 当前保留 uv.lock 仅作本地记录
+# uv.lock
+
+# ---------- 模型权重 / Checkpoint ----------
+# 训练输出 (含 accelerate save_state 的 checkpoint-N/)
+experiment/
+output/
+outputs/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# ---------- HF datasets 中间缓存 ----------
+# Dataset.from_generator / .map() 会在 ~/.cache/huggingface/datasets/ 写 Arrow
+# (本项目 --dataset_root 路径已消除, 但 --train_data_dir 路径仍可能触发)
+hf_cache/
+
+# ---------- 日志 / Tracker ----------
+logs/
+*.log
+wandb/
+runs/
+tensorboard_logs/
+
+# ---------- 验证 / 评估产物 ----------
+validation/
+*.png
+!dataloaders/**/*.png
+!utils/**/*.png
+!config/**/*.png
+!docs/**/*.png
+!README*.md
+
+# ---------- 上传 / 下载临时文件 ----------
+*.tmp
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Jupyter ----------
+.ipynb_checkpoints/
+*.ipynb
+
+# ---------- IDE ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ---------- pytest / coverage ----------
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.cache
+coverage.xml
+*.cover
+
+# ---------- mypy / linter ----------
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyright_cache/
+
+# ---------- 编译优化产物 ----------
+*.opt-*.pyc
+
+# ============================================================
+# 例外 (必须提交)
+# ============================================================
+# 配置文件 / 代码 / 文档 / 依赖声明 / 小型示例图
+!pyproject.toml
+!*.yaml
+!*.yml
+!*.md
+!*.py
+!*.txt
+!*.json
+!*.csv
+!*.sh
+!*.bat
+!.gitignore
+!.dockerignore
+!LICENSE
+!README*

@@ -1,0 +1,43 @@
+[project]
+name = "sd3-controlnet"
+version = "0.1.0"
+description = "SD3 + ControlNet image-restoration training (adapted from controlnet_file weather-restoration pipeline)"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch>=2.0.0",
+    "diffusers>=0.38.0",
+    "transformers==4.57.1",
+    "accelerate>=0.20.0",
+    "Pillow>=9.0.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "tensorboard>=2.14.0",
+    "wandb>=0.15.0",
+    "datasets>=3.1.0",
+    "torchvision>=0.20.1",
+    "lpips>=0.1.4",
+    "sentencepiece==0.2.0",
+    "huggingface-hub==0.36.0",
+]
+
+#[[tool.uv.index]]
+#url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+#default = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[project.scripts]
+train_controlnet = "train_controlnet:main"
+test_controlnet = "test:main"
+
+
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+extra-index-url = ["https://download.pytorch.org/whl/cu126"
+]
+# 新增这一行，强制优先匹配带+cu126的gpu包
+index-strategy = "unsafe-best-match"

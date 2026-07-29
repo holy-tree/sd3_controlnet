@@ -1,0 +1,90 @@
+# ==================== 模型与输出 ====================
+# SD3 基础模型 (gated, 需 `hf auth login`)
+# 也可改为本地路径, 如 D:/models/stable-diffusion-3-medium-diffusers
+pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
+
+# 训练好的 SD3 ControlNet 权重路径
+# 支持三种结构 (与源 evaluate.py 兼容):
+#   1) <path>/controlnet/config.json
+#   2) <path>/config.json
+#   3) <path>/checkpoint-N/controlnet/config.json  (accelerate save_state 输出)
+controlnet_model_path: "./experiment/SD3ControlNet/checkpoint-50000"
+
+# 评估结果输出目录
+output_dir: "./experiment/eval_sd3"
+
+# ==================== 数据集配置 ====================
+# 各天气类型的 test 集根目录 (相互独立)
+# 与源 config/eval.yaml 完全相同的 key 命名, 直接可平迁
+dataset_rain: "D:/Projects/pycharm/WeaFU-main/dataprocess/rain"
+dataset_snow: "D:/Projects/pycharm/WeaFU-main/dataprocess/snow"
+dataset_haze: "D:/Projects/pycharm/WeaFU-main/dataprocess/haze"
+# 也支持 dataset_root + weather 子目录的方式:
+# dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+# 待评估的天气类型
+weather_types: ["rain", "snow", "haze"]
+# 评估时使用 test 划分
+splits: ["test"]
+
+# ==================== 推理参数 ====================
+# SD3 训练配置默认 512 (与源项目一致)
+resolution: 512
+num_inference_steps: 20
+# SD3 默认不需要高 CFG; SD2 训练用 5.5, SD3 收敛得更快可适当降低
+guidance_scale: 5.5
+negative_prompt: "dotted, noise, blur, lowres, smooth"
+mixed_precision: "fp16"
+seed: 42
+
+# 推理时使用的 prompt (留空则全部使用空 prompt)
+use_prompt: false
+prompt_ratio: 0.2
+
+# ==================== 评估参数 ====================
+# === 评估采样数 (用于计算指标, 默认 0 = 使用全部 test 集) ===
+# 与源 config/eval.yaml 同语义:
+#   0  或负数: 不限制, 跑完整 test 集 (默认, 指标统计更准确)
+#   正数:      仅跑前 N 张 (用于快速调试)
+max_samples_per_weather: 0
+# 截断模式 (与 max_samples_per_weather 配合)
+#   head   : 取前 N 张, 可复现 (默认, 推荐)
+#   random : 随机抽 N 张, 可复现 (若 yaml 设 seed)
+sample_mode: head
+
+# 评估 batch 大小 (一次 pipeline 推几张 LQ)
+# SD3 ControlNet 比 SD2 重得多, 默认 1 更稳; 显存允许时调到 2~4
+# 注意: SD3 pipeline 同时跑多张时显存叠加明显, 推荐先从 1 开始
+eval_batch_size: 1
+
+# === 可视化保存数 (与评估解耦, 与源 eval.yaml 完全一致) ===
+# 控制每个天气类别下保存多少组预测图像 (pred.png / lq.png / gt.png)
+# 评估始终跑完整 test 集 (受 max_samples_per_weather 控制),
+# 但只保存其中一部分用于人工查看
+#
+#   0  : 不保存任何预测图 (只算指标)
+#   -1 : 保存全部评估样本的图 (默认)
+#   正数: 仅保存前 N 张的图
+#
+# 例如:
+#   rain_num: 10  -> rain 保存前 10 张
+#   snow_num: -1  -> snow 全部保存
+#   haze_num: 0   -> haze 不保存
+rain_num: 3
+snow_num: 3
+haze_num: 3
+
+# 是否启用预测图保存 (全局开关, false 则全部不保存, 覆盖每天气设置)
+save_predictions: true
+
+# ==================== LPIPS 配置 ====================
+# LPIPS 使用的 backbone: 'alex' | 'vgg' (默认 alex, 更快)
+lpips_net: "alex"
+
+# ==================== FID 配置 ====================
+# 是否启用 FID 指标计算 (InceptionV3 特征分布距离, 越低越好)
+# 首次运行时会自动下载 InceptionV3 权重 (~100MB) 到 ~/.cache/torch/hub/checkpoints/
+# 计算耗时较长, 调试时可关闭
+enable_fid: true
+# FID 内部 batch size (一次喂 InceptionV3 的图片数, 控制峰值显存)
+# 推荐: 32 (512x512 图约 1.5GB 峰值); OOM 时降到 8 或 4
+fid_batch_size: 32
