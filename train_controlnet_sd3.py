@@ -961,17 +961,82 @@ def parse_args(input_args=None):
     return args
 
 
+def attach_precomputed_embeddings(train_dataset, tokenizer_one, tokenizer_two, tokenizer_three,
+                                   text_encoder_one, text_encoder_two, text_encoder_three,
+                                   args, accelerator):
+    """
+    为 --dataset_root 路径的 train_dataset 预计算 SD3 prompt embeddings (CLIP×2 + T5).
+
+    设计:
+        - 必须由 main() 在 text_encoder_* 已加载完成、.to(device) 之后调用
+        - 在主进程上跑一次 (encode_prompt 内已 .no_grad(), 不会更新 text encoder 权重)
+        - 去重策略: 相同 prompt string 共享同一 tensor 引用 (Python list 复用同一对象)
+          * use_prompt=False (默认): 全部为空 prompt → 1 次 encode + 1 份 tensor
+          * use_prompt=True  + 3 个天气 prompt: 至多 4 次 encode
+        - 把结果挂到 dataset._prompt_embeds / _pooled_prompt_embeds 上,
+          DataLoader 直接消费, 不产生 Arrow 中间文件
+
+    Args:
+        train_dataset: make_train_dataset 的返回值 (PairedCaptionDataset 或 torch.Subset 包装)
+                       若为 Subset, 嵌入到底层 dataset
+        tokenizer_* / text_encoder_*: SD3 三编码器
+        args: 训练参数 (需 .max_sequence_length, .prompt_ratio, .use_prompt, .weather_prompts)
+        accelerator: Accelerator 实例
+    """
+    from dataloaders.paired_dataset import PairedCaptionDataset
+
+    # 解包 torch.Subset → 取底层 PairedCaptionDataset
+    base = train_dataset
+    if isinstance(base, torch.utils.data.Subset):
+        base = base.dataset
+    if not isinstance(base, PairedCaptionDataset):
+        raise TypeError(
+            f"attach_precomputed_embeddings 期望底层为 PairedCaptionDataset, 实得 {type(base).__name__}"
+        )
+
+    # 用与 dataset.__getitem__ 完全相同的 deterministic seed (基于 gt_path),
+    # 保证"预编码用 prompt A"与"__getitem__ 取样用 prompt A"对齐.
+    resolved_prompts = [base._make_prompt(w, deterministic_seed=str(p))
+                        for (p, _, w) in base.samples]
+
+    unique_prompts = list(dict.fromkeys(resolved_prompts))
+    logger.info(f"[数据集] unique prompts: {len(unique_prompts)} / {len(resolved_prompts)} 样本 "
+                f"(去重后 encode 调用次数: {len(unique_prompts)})")
+
+    tokenizers = [tokenizer_one, tokenizer_two, tokenizer_three]
+    text_encoders = [text_encoder_one, text_encoder_two, text_encoder_three]
+    prompt_embed_cache: dict[str, tuple] = {}
+    with torch.no_grad():
+        for prompt in unique_prompts:
+            pe, ppe = encode_prompt(
+                text_encoders, tokenizers,
+                prompt, args.max_sequence_length,
+                device=accelerator.device,
+            )
+            prompt_embed_cache[prompt] = (pe.cpu(), ppe.cpu())
+
+    # 复用同一 tensor 引用 (相同 prompt 指向同一个 Tensor 对象, 节省内存)
+    prompt_embeds_list: List[torch.Tensor] = [prompt_embed_cache[p][0] for p in resolved_prompts]
+    pooled_prompt_embeds_list: List[torch.Tensor] = [prompt_embed_cache[p][1] for p in resolved_prompts]
+    base.attach_precomputed(prompt_embeds_list, pooled_prompt_embeds_list, resolved_prompts)
+
+
 def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, accelerator):
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+    """
+    构建 train_dataset.
 
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
+    注: 该函数只负责"读取+预处理", **不**做 SD3 prompt 编码 (那一步需要 text_encoder_*, 在 main() 里
+        text_encoders 加载完成之后才调用 attach_precomputed_embeddings).
+        分两步走避免 make_train_dataset 在 text_encoders 还未创建时引用未定义变量.
 
+    Returns:
+        - --dataset_root 路径: PairedCaptionDataset (eager, 未预编码)
+        - --train_data_dir / --dataset_name 路径: HF DatasetDict["train"] with .with_transform
+    """
     # === Paired dataset 分支 (源项目数据布局, 优先级最高) ===
-    # 与 --dataset_name / --train_data_dir 互斥: 当指定 --dataset_root 时,
-    # 走纯 torch Dataset 路径 (镜像源 controlnet_file/train_controlnet.py 的 SFT 流程),
-    # 一次预计算 SD3 prompt embeddings 挂在 dataset 上, DataLoader 直接消费, 不产生 Arrow 中间文件.
+    # 与 --dataset_name / --train_data_dir 互斥. 走纯 torch Dataset 路径
+    # (镜像源 controlnet_file/train_controlnet.py 的 SFT 流程), DataLoader 直接消费,
+    # 不产生 Arrow 中间文件.
     if args.dataset_root is not None:
         from dataloaders.paired_dataset import PairedCaptionDataset
 
@@ -1008,47 +1073,11 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
             defer_transforms=False,           # eager 模式, __getitem__ 返回 tensor
         )
 
-        # 预计算 SD3 prompt embeddings (CLIP×2 + T5 → prompt_embeds + pooled_prompt_embeds)
-        # 在主进程上跑一次 (text encoders 已 .requires_grad_(False)), 结果挂到 dataset 上.
-        #
-        # 去重策略: 相同 prompt string 共享同一 tensor 引用 (Python list 复用同一对象).
-        #   use_prompt=False (默认): 全部为空 prompt → 1 次 encode + 1 份 tensor
-        #   use_prompt=True  + N 个天气 prompt: 至多 3 次 encode (rain/snow/haze 各 1)
-        # 编码次数对比原版 18255 次 → 去重后基本只剩常数次.
-        tokenizers = [tokenizer_one, tokenizer_two, tokenizer_three]
-        text_encoders = [text_encoder_one, text_encoder_two, text_encoder_three]
-        # 用与 dataset.__getitem__ 完全相同的 deterministic seed (基于 gt_path),
-        # 保证"预编码用 prompt A"与"__getitem__ 取样用 prompt A"对齐.
-        resolved_prompts = [paired._make_prompt(w, deterministic_seed=str(p))
-                            for (p, _, w) in paired.samples]
-
-        # 按 prompt 去重, 保序 (dict.fromkeys 是 Python 3.7+ 保序去重 idiom)
-        unique_prompts = list(dict.fromkeys(resolved_prompts))
-        logger.info(f"[数据集] unique prompts: {len(unique_prompts)} / {len(resolved_prompts)} 样本 "
-                    f"(去重后 encode 调用次数: {len(unique_prompts)})")
-
-        prompt_embed_cache: dict[str, tuple] = {}
-        with torch.no_grad():
-            for prompt in unique_prompts:
-                pe, ppe = encode_prompt(
-                    text_encoders, tokenizers,
-                    prompt, args.max_sequence_length,
-                    device=accelerator.device,
-                )
-                prompt_embed_cache[prompt] = (pe.cpu(), ppe.cpu())
-
-        # 复用同一 tensor 引用 (相同 prompt 指向同一个 Tensor 对象, 节省内存)
-        prompt_embeds_list: List[torch.Tensor] = [prompt_embed_cache[p][0] for p in resolved_prompts]
-        pooled_prompt_embeds_list: List[torch.Tensor] = [prompt_embed_cache[p][1] for p in resolved_prompts]
-        paired.attach_precomputed(prompt_embeds_list, pooled_prompt_embeds_list, resolved_prompts)
-
-        # 截断 (与 HF 路径语义一致)
+        # max_train_samples 截断 (用 torch Subset, 不动 dataset 内部)
         if args.max_train_samples is not None and args.max_train_samples < len(paired):
-            # 用 torch Subset 截断, 不动 dataset 内部
             paired = torch.utils.data.Subset(paired, range(args.max_train_samples))
 
-        logger.info(f"[数据集] --dataset_root 路径: 纯 torch Dataset, 共 {len(paired)} 样本, "
-                    f"已预计算 prompt embeddings (无 HF 中间文件)")
+        logger.info(f"[数据集] --dataset_root 路径: 纯 torch Dataset, 共 {len(paired)} 样本")
         return paired
 
     elif args.dataset_name is not None:
@@ -1585,6 +1614,17 @@ def main(args):
     text_encoder_three.to(accelerator.device, dtype=weight_dtype)
 
     train_dataset = make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, accelerator)
+
+    # ========== --dataset_root 路径: 预计算 SD3 prompt embeddings ==========
+    # 此时 text_encoder_* 已加载并 .to(device), 可调用 encode_prompt
+    # (放在 HF 流程的 dataset.map(compute_embeddings_fn) 同等位置, 但用纯 torch 列表复用)
+    if args.dataset_root is not None:
+        attach_precomputed_embeddings(
+            train_dataset,
+            tokenizer_one, tokenizer_two, tokenizer_three,
+            text_encoder_one, text_encoder_two, text_encoder_three,
+            args, accelerator,
+        )
 
     # ========== 验证开关状态打印 (便于排查 "为什么我以为启用了验证但实际没跑") ==========
     if args.validation_prompt is not None:
