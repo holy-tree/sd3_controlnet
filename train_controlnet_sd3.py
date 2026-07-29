@@ -1503,6 +1503,15 @@ def main(args):
         controlnet = SD3ControlNetModel.from_transformer(
             transformer, num_extra_conditioning_channels=args.num_extra_conditioning_channels
         )
+    # debug: 打印 controlnet 关键维度
+    inner_dim = controlnet.inner_dim
+    first_linear = controlnet.transformer_blocks[0].norm1.linear
+    logger.info(
+        f"[ControlNet] inner_dim={inner_dim}, "
+        f"linear.weight.shape={list(first_linear.weight.shape)}, "
+        f"num_layers={len(controlnet.transformer_blocks)}"
+    )
+
 
     transformer.requires_grad_(False)
     vae.requires_grad_(False)
