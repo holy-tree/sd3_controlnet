@@ -1724,9 +1724,12 @@ def main(args):
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
 
-        # tensorboard cannot handle list types for config
-        tracker_config.pop("validation_prompt")
-        tracker_config.pop("validation_image")
+        # tensorboard cannot handle list/dict types for config
+        tracker_config.pop("validation_prompt", None)
+        tracker_config.pop("validation_image", None)
+        _scalar_types = (int, float, str, bool, type(None))
+        tracker_config = {k: v for k, v in tracker_config.items()
+                          if isinstance(v, _scalar_types)}
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
