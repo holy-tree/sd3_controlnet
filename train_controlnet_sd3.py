@@ -558,8 +558,8 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
-        help=("Max number of checkpoints to store."),
+        default=3,
+        help=("Max number of checkpoints to store. Old checkpoints are removed when limit is exceeded."),
     )
     parser.add_argument(
         "--resume_from_checkpoint",

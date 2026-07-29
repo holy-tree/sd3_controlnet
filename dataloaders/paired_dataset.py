@@ -16,8 +16,8 @@
         __getitem__ 内完成 Resize/CenterCrop/ToTensor/Normalize,
         返回:
             {
-                "pixel_values":            tensor [3,H,W] in [-1, 1]   (GT)
-                "conditioning_pixel_values": tensor [3,H,W] in [0, 1]  (LQ)
+                "pixel_values":            tensor [3,H,W] in [-1, 1]   (GT, 喂 VAE)
+                "conditioning_pixel_values": tensor [3,H,W] in [-1, 1]  (LQ, 喂 controlnet+VAE)
                 "input_ids":              LongTensor [77]              (CLIP tokenized)
                 "weather":                str
             }
@@ -201,7 +201,7 @@ class PairedCaptionDataset(data.Dataset):
         调用后, __getitem__ 返回:
             {
                 "pixel_values":             tensor [-1, 1],
-                "conditioning_pixel_values": tensor [0, 1],
+                "conditioning_pixel_values": tensor [-1, 1],  # LQ 跟 GT 对称, VAE 要求 [-1, 1]
                 "prompt_embeds":             tensor (T5 长度, dim),
                 "pooled_prompt_embeds":      tensor (dim,),
                 "weather":                   str,
@@ -265,7 +265,7 @@ class PairedCaptionDataset(data.Dataset):
         lq_img = self.to_tensor(lq_img)
 
         result = {
-            "conditioning_pixel_values": lq_img,            # LQ, [0, 1]
+            "conditioning_pixel_values": lq_img * 2.0 - 1.0,  # LQ, [-1, 1] 跟 VAE 输入范围对齐
             "pixel_values":              gt_img * 2.0 - 1.0,  # GT, [-1, 1]
             "weather":                   weather,
         }
