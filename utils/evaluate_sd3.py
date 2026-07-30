@@ -412,9 +412,21 @@ def evaluate(args_config: dict):
                             1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
                             # 中 4 层减半
                             0.5, 0.5, 0.5, 0.5,
-                            # 深 2 层大幅压 (block[10]/[11] stdout 0.85/1.30,
-                            # 注入 7.25, 是 2 像素周期的源头)
+                            # 深 2 层大幅压 (block[10]/[11] 是 2 像素周期源头)
                             0.2, 0.0,
+                        ],
+                        # 关键: control_guidance_* 也得传成 list,
+                        # 才能让 diffusers 的控制网走 "zip per-block" 分支
+                        # (否则 list scale 会被默默取 [0]).
+                        control_guidance_start=[
+                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0, 0.0, 0.0,
+                            0.0, 0.0,
+                        ],
+                        control_guidance_end=[
+                            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                            1.0, 1.0, 1.0, 1.0,
+                            1.0, 1.0,
                         ],
                     ).images
                 infer_time_total = time.time() - t0
