@@ -407,7 +407,6 @@ def evaluate(args_config: dict):
                         height=args_config["resolution"],
                         width=args_config["resolution"],
                         num_images_per_prompt=1,
-                        controlnet_conditioning_scale=0.5,
                     ).images
                 infer_time_total = time.time() - t0
                 infer_time_avg = infer_time_total / B
