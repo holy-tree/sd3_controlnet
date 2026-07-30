@@ -77,6 +77,18 @@ check_min_version("0.32.0")
 logger = get_logger(__name__)
 
 
+# ============================================================
+# 频域 loss: 强制模型在 rFFT 频域对齐 target, 抑制 patch-aligned 周期伪影.
+# 常用包装: pixel-domain MSE + alpha * spectral_loss (alpha 默认 0.5).
+# ============================================================
+def _spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """L2 距离在 rfft 频域: 让模型把模型输出也按 target 的频谱形状对齐, 而不是只匹配均值."""
+    pred_f = torch.fft.rfft2(pred.float(), norm="ortho")
+    target_f = torch.fft.rfft2(target.float(), norm="ortho")
+    diff = pred_f - target_f
+    return (diff.real.pow(2) + diff.imag.pow(2)).mean()
+
+
 def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
     logger.info("Running validation... ")
 
@@ -929,6 +941,19 @@ def parse_args(input_args=None):
         help="Path to YAML config file. 启动方式: accelerate launch train_controlnet_sd3.py --config config/train.yaml",
     )
 
+    # ============================================================
+    # 频域 loss 权重: 与 pixel-domain MSE 联合, 抑制 patch-aligned 格子条纹
+    # 0  = 等同关闭 (只用 MSE)
+    # 0.5 = 推荐起点, PSNR 略掉但频谱对齐, 一般 5e-3 ~ 5e-2 量级
+    # 1.0 = 强烈约束
+    # ============================================================
+    parser.add_argument(
+        "--spectral_loss_weight",
+        type=float,
+        default=0.0,
+        help="频域 loss 权重 (与 pixel MSE 加权求和). 0=关闭, 0.5=推荐.",
+    )
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -1523,6 +1548,26 @@ def main(args):
     text_encoder_three.requires_grad_(False)
     controlnet.train()
 
+    # ============================================================
+    # zero_module 校验: from_transformer 应把 controlnet_blocks 内
+    # "proj" 末尾层真正零初始化. 任何一个 > 1e-6 都意味着 from start 已经在
+    # 注入非零信号, 后期再靠权重衰减/loss 拉回几乎不可能, 必须改 zero_module 实现.
+    # ============================================================
+    if accelerator.is_main_process:
+        n_offending = 0
+        for i, blk in enumerate(controlnet.controlnet_blocks):
+            for name, p in blk.named_parameters():
+                if "proj" in name and p.abs().max().item() > 1e-6:
+                    logger.warning(
+                        f"[zero-init] controlnet_blocks[{i}].{name} 非零: "
+                        f"max={p.abs().max().item():.4e}"
+                    )
+                    n_offending += 1
+        if n_offending == 0:
+            logger.info("[zero-init] controlnet_blocks proj* 全部已 zero-init (max<1e-6)")
+        else:
+            logger.warning(f"[zero-init] 共 {n_offending} 个 proj* 层未真正零初始化")
+
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1881,11 +1926,19 @@ def main(args):
                     target = noise - model_input
 
                 # Compute regular loss.
-                loss = torch.mean(
+                loss_spatial = torch.mean(
                     (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                     1,
                 )
-                loss = loss.mean()
+                loss_spatial = loss_spatial.mean()
+
+                # 频域 loss: rFFT 域 L2, 强制模型对齐 target 的频谱形态,
+                # 抑制"每隔一个 patch 抖动一下"的周期伪影 (16px period).
+                if args.spectral_loss_weight > 0.0:
+                    loss_spectral = _spectral_loss(model_pred, target)
+                    loss = loss_spatial + args.spectral_loss_weight * loss_spectral
+                else:
+                    loss = loss_spatial
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
