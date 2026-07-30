@@ -407,6 +407,15 @@ def evaluate(args_config: dict):
                         height=args_config["resolution"],
                         width=args_config["resolution"],
                         num_images_per_prompt=1,
+                        controlnet_conditioning_scale=[
+                            # 浅 6 层保持
+                            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                            # 中 4 层减半
+                            0.5, 0.5, 0.5, 0.5,
+                            # 深 2 层大幅压 (block[10]/[11] stdout 0.85/1.30,
+                            # 注入 7.25, 是 2 像素周期的源头)
+                            0.2, 0.0,
+                        ],
                     ).images
                 infer_time_total = time.time() - t0
                 infer_time_avg = infer_time_total / B
