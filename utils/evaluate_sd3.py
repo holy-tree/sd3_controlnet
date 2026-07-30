@@ -219,6 +219,12 @@ def build_pipeline(args_config: dict, device, dtype):
             pipeline = pipeline.to(dtype=dtype)
 
     pipeline.set_progress_bar_config(disable=True)
+
+    # SD3 VAE (16 latent channels) is highly sensitive to fp16 decode and produces
+    # characteristic grid/checkerboard artifacts. Force VAE to fp32 while keeping
+    # transformer / controlnet / text encoders in the requested mixed precision.
+    pipeline.vae.to(torch.float32)
+
     return pipeline
 
 
@@ -389,7 +395,7 @@ def evaluate(args_config: dict):
                 # prompts / negative_prompts 与 batch 等长
                 prompts = [prompt] * B
                 t0 = time.time()
-                with torch.autocast("cuda", enabled=(device.type == "cuda")), torch.no_grad():
+                with torch.autocast("cuda", enabled=(device.type == "cuda"), dtype=weight_dtype), torch.no_grad():
                     neg_prompt = args_config["negative_prompt"]
                     neg_prompts = [neg_prompt] * B if isinstance(neg_prompt, str) else neg_prompt
                     outs = pipeline(
