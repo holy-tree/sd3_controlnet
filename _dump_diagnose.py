@@ -210,37 +210,6 @@ fft_summary(rec_fp32[0], "TEST 1b fp32")
 
 
 # ============================================================
-# TEST 1: VAE passthrough
-# ============================================================
-print(f"\n{'='*70}\nTEST 1: VAE passthrough (encode(LQ) → decode)\n{'='*70}")
-with torch.no_grad():
-    posterior = vae.encode(lq_minus).latent_dist
-    latent_mode = posterior.mode()
-    latent_scaled = (latent_mode - vae.config.shift_factor) * vae.config.scaling_factor
-
-    print(f"  posterior.mean   "
-          f"range=[{latent_mode.min():.3f}, {latent_mode.max():.3f}]  "
-          f"std={latent_mode.std():.3f}")
-    print(f"  posterior.std    range=[{posterior.std.min():.3f}, {posterior.std.max():.3f}]")
-    print(f"  latent scaled    "
-          f"range=[{latent_scaled.min():.3f}, {latent_scaled.max():.3f}]  "
-          f"std={latent_scaled.std():.3f}  shape={list(latent_scaled.shape)}")
-
-    latent_for_decode = latent_scaled / vae.config.scaling_factor + vae.config.shift_factor
-    rec = vae.decode(latent_for_decode).sample
-    print(f"  decoded          "
-          f"range=[{rec.min():.3f}, {rec.max():.3f}]  "
-          f"mean={rec.mean():.3f}  std={rec.std():.3f}")
-
-    rec01 = ((rec.clamp(-1, 1) + 1.0) / 2.0).cpu().float()
-    rec_pil = tvt.ToPILImage()(rec01[0])
-    rec_pil.save(OUT_DIR / "test1_vae_passthrough.png")
-    print(f"  saved: {OUT_DIR / 'test1_vae_passthrough.png'}")
-print(f"  >>> 看 test1_vae_passthrough.png 是否有方格")
-fft_summary(rec[0], "VAE recon")
-
-
-# ============================================================
 # TEST 2 & 3: 完整推理带 hooks
 # ============================================================
 print(f"\n[pipe] loading full pipeline")
