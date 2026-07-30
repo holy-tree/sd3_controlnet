@@ -270,10 +270,11 @@ def build_pipeline(args_config: dict, device, dtype):
     pipeline.set_progress_bar_config(disable=True)
 
     # Per-block conditioning scale (见 apply_per_block_scales 的 docstring)
-    # 浅 6 层保持 1.0, 中 4 层减半, 深 2 层大幅压 (block[10]/[11] 是 2 像素周期源头)
+    # 上一档 [.., 0.2, 0.0] 太激进: PSNR 22→16, 说明 block[10]/[11] 是真信号源.
+    # 这里只把 block[10/11] 适度降到 0.5/0.5, 看方格能消多少 + PSNR 别塌.
     BLOCK_SCALES = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-                    0.5, 0.5, 0.5, 0.5,
-                    0.2, 0.0]
+                    1.0, 1.0, 1.0, 1.0,
+                    0.5, 0.5]
     apply_per_block_scales(controlnet, BLOCK_SCALES)
 
     return pipeline
