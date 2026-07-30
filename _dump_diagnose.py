@@ -154,8 +154,59 @@ preprocess = tvt.Compose([
 ])
 lq = preprocess(Image.open(LQ_PATH).convert("RGB"))
 lq_pil = tvt.ToPILImage()(lq)
-lq_minus = (lq.to(device, dtype=dtype) * 2.0 - 1.0).unsqueeze(0)
+lq_minus_bf16 = (lq.to(device, dtype=dtype) * 2.0 - 1.0).unsqueeze(0)
+lq_minus_fp32 = (lq.to(device, dtype=torch.float32) * 2.0 - 1.0).unsqueeze(0)
 print(f"  LQ tensor  range=[{lq.min():.3f}, {lq.max():.3f}]  shape={list(lq.shape)}")
+
+
+# ============================================================
+# TEST 1a: VAE passthrough (bf16, 跟训练一致)
+# ============================================================
+print(f"\n{'='*70}\nTEST 1a: VAE passthrough (bf16, 训练精度)\n{'='*70}")
+with torch.no_grad():
+    posterior = vae.encode(lq_minus_bf16).latent_dist
+    latent_mode = posterior.mode()
+    latent_scaled = (latent_mode - vae.config.shift_factor) * vae.config.scaling_factor
+    print(f"  posterior.mean  range=[{latent_mode.min():.3f}, {latent_mode.max():.3f}], "
+          f"std={latent_mode.std():.3f}")
+    print(f"  posterior.std   range=[{posterior.std.min():.3f}, {posterior.std.max():.3f}]  "
+          f"<-- bf16 下若为 0 是已知现象")
+    print(f"  latent scaled   range=[{latent_scaled.min():.3f}, {latent_scaled.max():.3f}], "
+          f"std={latent_scaled.std():.3f}, shape={list(latent_scaled.shape)}")
+    latent_for_decode = latent_scaled / vae.config.scaling_factor + vae.config.shift_factor
+    rec = vae.decode(latent_for_decode).sample
+    print(f"  decoded         range=[{rec.min():.3f}, {rec.max():.3f}], "
+          f"mean={rec.mean():.3f}, std={rec.std():.3f}")
+    rec01 = ((rec.clamp(-1, 1) + 1.0) / 2.0).cpu().float()
+    tvt.ToPILImage()(rec01[0]).save(OUT_DIR / "test1a_vae_passthrough_bf16.png")
+print(f"  saved: test1a_vae_passthrough_bf16.png  <-- bf16 VAE 出图")
+fft_summary(rec[0], "TEST 1a bf16")
+
+
+# ============================================================
+# TEST 1b: VAE passthrough (fp32, 加载时就指定)
+# ============================================================
+print(f"\n{'='*70}\nTEST 1b: VAE passthrough (fp32)\n{'='*70}")
+vae_fp32 = AutoencoderKL.from_pretrained(
+    MODEL_ID, subfolder="vae", torch_dtype=torch.float32, low_cpu_mem_usage=True,
+).to(device).eval()
+with torch.no_grad():
+    posterior = vae_fp32.encode(lq_minus_fp32).latent_dist
+    latent_mode = posterior.mode()
+    latent_scaled = (latent_mode - vae_fp32.config.shift_factor) * vae_fp32.config.scaling_factor
+    print(f"  posterior.mean  range=[{latent_mode.min():.3f}, {latent_mode.max():.3f}], "
+          f"std={latent_mode.std():.3f}")
+    print(f"  posterior.std   range=[{posterior.std.min():.3f}, {posterior.std.max():.3f}]")
+    print(f"  latent scaled   range=[{latent_scaled.min():.3f}, {latent_scaled.max():.3f}], "
+          f"std={latent_scaled.std():.3f}, shape={list(latent_scaled.shape)}")
+    latent_for_decode = latent_scaled / vae_fp32.config.scaling_factor + vae_fp32.config.shift_factor
+    rec_fp32 = vae_fp32.decode(latent_for_decode).sample
+    print(f"  decoded         range=[{rec_fp32.min():.3f}, {rec_fp32.max():.3f}], "
+          f"mean={rec_fp32.mean():.3f}, std={rec_fp32.std():.3f}")
+    rec_fp32_01 = ((rec_fp32.clamp(-1, 1) + 1.0) / 2.0).cpu().float()
+    tvt.ToPILImage()(rec_fp32_01[0]).save(OUT_DIR / "test1b_vae_passthrough_fp32.png")
+print(f"  saved: test1b_vae_passthrough_fp32.png  <-- fp32 VAE 出图")
+fft_summary(rec_fp32[0], "TEST 1b fp32")
 
 
 # ============================================================
@@ -197,7 +248,10 @@ pipe = StableDiffusion3ControlNetPipeline.from_pretrained(
     MODEL_ID, controlnet=cn, safety_checker=None, torch_dtype=dtype,
 ).to(device)
 pipe.set_progress_bar_config(disable=True)
-pipe.vae.to(torch.float32)
+
+# NOTE: 不在这里 .to(float32), 否则部分 VAE 子模块 dtype 错位会在 encode 时炸
+#      (evaluate_sd3.py 之所以不炸是因为 autocast 兜底了), 而且 dump 这里要的是
+#      训练/推理同款 bf16, 才能反映真实 spatial 异常.
 
 
 captured = {
