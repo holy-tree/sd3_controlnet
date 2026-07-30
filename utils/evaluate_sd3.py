@@ -29,6 +29,7 @@ import os
 import random
 import sys
 import time
+import types
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -196,6 +197,54 @@ def _load_controlnet_smart(cn_path: str):
 
 
 # ============================================================
+# Per-block conditioning scale (diffusers 0.39.0 SD3 ControlNet workaround)
+# ============================================================
+# diffusers 0.39.0 的 SD3 ControlNet 三处吞 list:
+#   1) StableDiffusion3ControlNetPipeline.__call__ 第 316 行:
+#      controlnet_keep.append(keeps[0] if isinstance(self.controlnet, SD3ControlNetModel) else keeps)
+#      → SD3 永远是单标量, 走不到 per-block zip 分支.
+#   2) 同函数 360-362 行:
+#      if isinstance(controlnet_cond_scale, list):
+#          controlnet_cond_scale = controlnet_cond_scale[0]   # 强制取首项
+#   3) SD3ControlNetModel.forward 最后一步:
+#      controlnet_block_res_samples = [sample * conditioning_scale for sample in ...]
+#      → conditioning_scale 只接 float, 不接 list.
+# 因此直接在 pipeline call 里传 list scale 会被静默忽略.
+# 这里 monkey-patch forward, 在原始 forward 之后按 list 独立缩放每个 block 输出.
+def apply_per_block_scales(controlnet, scales):
+    """为 SD3ControlNetModel 注入 per-block conditioning_scale 支持."""
+    n_blocks = len(controlnet.controlnet_blocks)
+    assert len(scales) == n_blocks, \
+        f"len(scales)={len(scales)} != num_blocks={n_blocks}"
+
+    orig_forward = type(controlnet).forward
+
+    def patched_forward(self, *args, **kwargs):
+        out = orig_forward(self, *args, **kwargs)
+        # return_dict=False 路径: out 是 tuple (block_res_samples_list,)
+        if isinstance(out, tuple) and len(out) > 0 and isinstance(out[0], list):
+            block_list = out[0]
+            scaled = [
+                (b.to(torch.float32) * s).to(b.dtype)
+                for b, s in zip(block_list, scales)
+            ]
+            return (scaled,) + out[1:]
+        # return_dict=True 路径: SD3ControlNetOutput
+        if hasattr(out, "controlnet_block_res_samples"):
+            block_list = list(out.controlnet_block_res_samples)
+            scaled = [
+                (b.to(torch.float32) * s).to(b.dtype)
+                for b, s in zip(block_list, scales)
+            ]
+            out.controlnet_block_res_samples = scaled
+        return out
+
+    controlnet.forward = types.MethodType(patched_forward, controlnet)
+    print(f"[build_pipeline] monkey-patched SD3 ControlNet forward per-block: "
+          f"scales={scales}")
+
+
+# ============================================================
 # Pipeline 构建
 # ============================================================
 def build_pipeline(args_config: dict, device, dtype):
@@ -220,10 +269,12 @@ def build_pipeline(args_config: dict, device, dtype):
 
     pipeline.set_progress_bar_config(disable=True)
 
-    # SD3 VAE (16 latent channels) is highly sensitive to fp16 decode and produces
-    # characteristic grid/checkerboard artifacts. Force VAE to fp32 while keeping
-    # transformer / controlnet / text encoders in the requested mixed precision.
-    pipeline.vae.to(torch.float32)
+    # Per-block conditioning scale (见 apply_per_block_scales 的 docstring)
+    # 浅 6 层保持 1.0, 中 4 层减半, 深 2 层大幅压 (block[10]/[11] 是 2 像素周期源头)
+    BLOCK_SCALES = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                    0.5, 0.5, 0.5, 0.5,
+                    0.2, 0.0]
+    apply_per_block_scales(controlnet, BLOCK_SCALES)
 
     return pipeline
 
@@ -407,27 +458,9 @@ def evaluate(args_config: dict):
                         height=args_config["resolution"],
                         width=args_config["resolution"],
                         num_images_per_prompt=1,
-                        controlnet_conditioning_scale=[
-                            # 浅 6 层保持
-                            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-                            # 中 4 层减半
-                            0.5, 0.5, 0.5, 0.5,
-                            # 深 2 层大幅压 (block[10]/[11] 是 2 像素周期源头)
-                            0.2, 0.0,
-                        ],
-                        # 关键: control_guidance_* 也得传成 list,
-                        # 才能让 diffusers 的控制网走 "zip per-block" 分支
-                        # (否则 list scale 会被默默取 [0]).
-                        control_guidance_start=[
-                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                            0.0, 0.0, 0.0, 0.0,
-                            0.0, 0.0,
-                        ],
-                        control_guidance_end=[
-                            1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
-                            1.0, 1.0, 1.0, 1.0,
-                            1.0, 1.0,
-                        ],
+                        # controlnet_conditioning_scale / control_guidance_* 用 list
+                        # 在 diffusers 0.39.0 的 SD3 ControlNet 里被吞 (见 apply_per_block_scales docstring),
+                        # per-block 缩放改由 monkey-patched controlnet.forward 在 build_pipeline 里做.
                     ).images
                 infer_time_total = time.time() - t0
                 infer_time_avg = infer_time_total / B
