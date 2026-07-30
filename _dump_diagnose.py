@@ -123,8 +123,23 @@ vae = AutoencoderKL.from_pretrained(
 ).to(device)
 cn = SD3ControlNetModel.from_pretrained(CKPT_PATH, torch_dtype=dtype).to(device).eval()
 print(f"  vae shift={vae.config.shift_factor}, scale={vae.config.scaling_factor}")
-print(f"  cn.pos_embed_input.weight.abs().max()      = {cn.pos_embed_input.weight.abs().max().item():.4e}")
-print(f"  cn.controlnet_blocks[0].weight.abs().max() = {cn.controlnet_blocks[0].weight.abs().max().item():.4e}")
+def _first_weight_abs_max(module):
+    """找一个 Conv/Linear 的 weight.abs().max(), 找不到返回 None."""
+    for name in ("weight", "proj.weight", "proj.0.weight"):
+        try:
+            obj = module
+            for attr in name.split("."):
+                obj = getattr(obj, attr)
+            return obj.detach().float().abs().max().item()
+        except AttributeError:
+            continue
+    return None
+
+
+print(f"  cn.pos_embed_input weight.abs().max()      "
+      f"= {_first_weight_abs_max(cn.pos_embed_input)}")
+print(f"  cn.controlnet_blocks[0] weight.abs().max() "
+      f"= {_first_weight_abs_max(cn.controlnet_blocks[0])}")
 n_blocks = len(cn.controlnet_blocks)
 print(f"  number of controlnet_blocks = {n_blocks}")
 
