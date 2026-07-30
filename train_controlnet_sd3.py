@@ -1550,23 +1550,47 @@ def main(args):
 
     # ============================================================
     # zero_module 校验: from_transformer 应把 controlnet_blocks 内
-    # "proj" 末尾层真正零初始化. 任何一个 > 1e-6 都意味着 from start 已经在
-    # 注入非零信号, 后期再靠权重衰减/loss 拉回几乎不可能, 必须改 zero_module 实现.
+    # 真正应当 zero 的几层 (output_proj / proj_out / to_out.0) 初始化为 0.
+    # 任何非零意味着从一开始就注入非零信号, 训练再久都救不回来, 必须修 zero_module 重头训.
+    # 注: 注意 resume_from_checkpoint 会用 load_state_dict 把 trained weights 灌进来,
+    #     这时所有权重自然非零, 不能说明有问题; 想知道"真正 zero 吗"必须 *不 resume* 跑一次.
     # ============================================================
     if accelerator.is_main_process:
-        n_offending = 0
+        # 一次扫完, 按 [block_idx, param_name, max_abs, mean_abs] 累出来, 
+        # 找典型 zero_module 子集 (max<1e-6) 与非零子集, 都打出来最直观
+        all_params = []
         for i, blk in enumerate(controlnet.controlnet_blocks):
             for name, p in blk.named_parameters():
-                if "proj" in name and p.abs().max().item() > 1e-6:
-                    logger.warning(
-                        f"[zero-init] controlnet_blocks[{i}].{name} 非零: "
-                        f"max={p.abs().max().item():.4e}"
-                    )
-                    n_offending += 1
-        if n_offending == 0:
-            logger.info("[zero-init] controlnet_blocks proj* 全部已 zero-init (max<1e-6)")
-        else:
-            logger.warning(f"[zero-init] 共 {n_offending} 个 proj* 层未真正零初始化")
+                all_params.append((i, name, p.detach().float().abs().max().item(),
+                                    p.detach().float().abs().mean().item()))
+        n_total = len(all_params)
+        n_zero_like = sum(1 for x in all_params if x[2] < 1e-6)
+        n_small = sum(1 for x in all_params if 1e-6 <= x[2] < 1e-2)
+        n_normal = sum(1 for x in all_params if x[2] >= 1e-2)
+
+        logger.info("=" * 80)
+        logger.info("[zero-init] controlnet_blocks 总参数数 = %d", n_total)
+        logger.info("[zero-init]   max<1e-6  (zero-init 候选): %d", n_zero_like)
+        logger.info("[zero-init]   1e-6<=max<1e-2 (小权重)   : %d", n_small)
+        logger.info("[zero-init]   max>=1e-2  (普通已训)     : %d", n_normal)
+        # 列全 zero_init 候选, 这是关键, 看零初始化到底覆盖哪些层
+        if n_zero_like > 0:
+            logger.info("[zero-init] zero-like 参数清单 (max<1e-6), 含典型 zero_module/output_proj 层:")
+            seen_names = set()
+            for i, name, mx, mn in all_params:
+                if mx < 1e-6 and name not in seen_names:
+                    logger.info("    block[%2d] %-60s max=%.2e mean=%.2e", i, name, mx, mn)
+                    seen_names.add(name)  # 同名多 block 只打一行, 避免被刷屏
+        # 列几种典型非零 output 类层, 看 magnitude
+        suspicious = [x for x in all_params if x[2] >= 0.05 and ('to_out' in x[1] or 'proj_out' in x[1] or 'out_proj' in x[1])]
+        if suspicious:
+            sample = suspicious[0]
+            logger.info("[zero-init] to_out/proj_out 等 'output 类' 已训大小样本: "
+                        "block[%d] %s max=%.4e mean=%.4e (resume 训练后, 自然非零)",
+                        sample[0], sample[1], sample[2], sample[3])
+        elif n_zero_like >= n_total // 2:
+            logger.info("[zero-init] 多数参数 max<1e-6, 看起来这是 *首次 init*, 不是 resume")
+        logger.info("=" * 80)
 
     # Taken from [Sayak Paul's Diffusers PR #6511](https://github.com/huggingface/diffusers/pull/6511/files)
     def unwrap_model(model):
