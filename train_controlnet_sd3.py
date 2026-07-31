@@ -2028,7 +2028,7 @@ def main(args):
                 # latent L1 重建
                 if args.latent_l1_weight > 0.0 and pred_x0 is not None:
                     pred_x0_clamped = pred_x0.clamp(-3.0, 3.0)
-                    loss_l1 = F.l1_loss(pred_x0_clamped, latents.float(), reduction="mean")
+                    loss_l1 = F.l1_loss(pred_x0_clamped, model_input.float(), reduction="mean")
                     loss = loss + args.latent_l1_weight * loss_l1
                 else:
                     loss_l1 = torch.tensor(0.0, device=model_pred.device)
@@ -2037,11 +2037,11 @@ def main(args):
                 loss_freq = torch.tensor(0.0, device=model_pred.device)
                 if args.freq_loss_weight > 0.0 and pred_x0 is not None:
                     pred_fft = torch.fft.rfft2(pred_x0_clamped, norm="ortho")
-                    tgt_fft = torch.fft.rfft2(latents.float(), norm="ortho")
+                    tgt_fft = torch.fft.rfft2(model_input.float(), norm="ortho")
                     loss_freq = F.l1_loss(pred_fft.abs(), tgt_fft.abs(), reduction="mean")
                     loss = loss + args.freq_loss_weight * loss_freq
 
-                # LPIPS 感知损失: 每 N 步算一次, 解码 pred_x0/latents 到 RGB
+                # LPIPS 感知损失: 每 N 步算一次, 解码 pred_x0/model_input 到 RGB
                 loss_lpips = torch.tensor(0.0, device=model_pred.device)
                 if (lpips_model is not None
                         and args.lpips_weight > 0.0
@@ -2055,7 +2055,7 @@ def main(args):
                                 pred_x0_clamped.to(weight_dtype) / scaling
                             ).sample.float().clamp(-1.0, 1.0)
                             gt_rgb = vae.decode(
-                                latents.to(weight_dtype) / scaling
+                                model_input.to(weight_dtype) / scaling
                             ).sample.float().clamp(-1.0, 1.0)
                         d = lpips_model(pred_rgb, gt_rgb)
                         loss_lpips = d.mean()
