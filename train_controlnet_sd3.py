@@ -35,6 +35,7 @@ from pathlib import Path
 import accelerate
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -78,15 +79,9 @@ logger = get_logger(__name__)
 
 
 # ============================================================
-# 频域 loss: 强制模型在 rFFT 频域对齐 target, 抑制 patch-aligned 周期伪影.
-# 常用包装: pixel-domain MSE + alpha * spectral_loss (alpha 默认 0.5).
+# 重建/感知/频域损失计算在主训练循环内联完成 (见下方),
+# 此处不再保留独立的频域 loss helper.
 # ============================================================
-def _spectral_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """L2 距离在 rfft 频域: 让模型把模型输出也按 target 的频谱形状对齐, 而不是只匹配均值."""
-    pred_f = torch.fft.rfft2(pred.float(), norm="ortho")
-    target_f = torch.fft.rfft2(target.float(), norm="ortho")
-    diff = pred_f - target_f
-    return (diff.real.pow(2) + diff.imag.pow(2)).mean()
 
 
 def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
@@ -941,17 +936,47 @@ def parse_args(input_args=None):
         help="Path to YAML config file. 启动方式: accelerate launch train_controlnet_sd3.py --config config/train.yaml",
     )
 
-    # ============================================================
-    # 频域 loss 权重: 与 pixel-domain MSE 联合, 抑制 patch-aligned 格子条纹
-    # 0  = 等同关闭 (只用 MSE)
-    # 0.5 = 推荐起点, PSNR 略掉但频谱对齐, 一般 5e-3 ~ 5e-2 量级
-    # 1.0 = 强烈约束
-    # ============================================================
+# ============================================================
+# 重建/感知/频域损失权重 (镜像 controlnet_file/train_controlnet.py 的四件套)
+# 要求 precondition_outputs=True, 否则 model_pred 不是 x0 预测, 这些项会被强制关闭.
+#
+#   loss = loss_mse
+#        + latent_l1_weight * loss_l1      # latent L1 重建
+#        + freq_loss_weight  * loss_freq   # rFFT 幅值 L1, 保留高频
+#        + lpips_weight      * loss_lpips  # 感知损失 (需 VAE.decode, 较重)
+#
+# 0 = 关闭对应项
+# ============================================================
     parser.add_argument(
-        "--spectral_loss_weight",
-        type=float,
-        default=0.0,
-        help="频域 loss 权重 (与 pixel MSE 加权求和). 0=关闭, 0.5=推荐.",
+            "--latent_l1_weight",
+            type=float,
+            default=0.1,
+            help="latent L1 重建权重: 在隐空间对齐 pred_x0 与 latents, 建议 0.05~0.3, 0=关闭",
+)
+    parser.add_argument(
+            "--freq_loss_weight",
+            type=float,
+            default=0.1,
+            help="rFFT 频域 L1 权重: 在 rfft 幅值空间对齐, 保留高频细节, 建议 0.05~0.2, 0=关闭",
+)
+    parser.add_argument(
+            "--lpips_weight",
+            type=float,
+            default=0.05,
+            help="LPIPS 感知损失权重: 解码 pred_x0/latents 到 RGB 后算感知距离, 建议 0.03~0.1, 0=关闭",
+)
+    parser.add_argument(
+            "--lpips_interval",
+            type=int,
+            default=4,
+            help="每隔 N 步算一次 LPIPS, 其余步置 0, 降低 VAE.decode 开销",
+)
+    parser.add_argument(
+        "--lpips_net",
+        type=str,
+        default="alex",
+        choices=["alex", "vgg"],
+        help="LPIPS backbone: alex (快) / vgg (准)",
     )
 
     if input_args is not None:
@@ -1815,6 +1840,41 @@ def main(args):
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
+    # ============================================================
+    # 可选: 加载 LPIPS 感知损失模型
+    #  - 仅在 lpips_weight>0 时加载, 节省显存
+    #  - freeze 权重, 不参与 optimizer
+    #  - LPIPS 内部把 [0,1] 映射到 [-1,1], 这里与源项目保持一致:
+    #    decode 后 clamp(-1, 1) 直接送入
+    #  - precondition_outputs=False 时 LPIPS 不会使用 (model_pred 非 x0)
+    # ============================================================
+    lpips_model = None
+    if args.lpips_weight > 0.0:
+        try:
+            import lpips as lpips_pkg
+            lpips_model = lpips_pkg.LPIPS(net=args.lpips_net, verbose=False).eval()
+            for p in lpips_model.parameters():
+                p.requires_grad = False
+            lpips_model = lpips_model.to(accelerator.device)
+            logger.info(f"[Loss] LPIPS 已加载 (net={args.lpips_net}, weight={args.lpips_weight}, "
+                        f"interval={args.lpips_interval})")
+        except Exception as e:
+            logger.warning(f"[Loss] LPIPS 加载失败 ({e}), lpips_weight 视为 0")
+            lpips_model = None
+            args.lpips_weight = 0.0
+
+    # 非 precondition 模式下, 重建/感知/频域项无意义, 强制关闭以避免误用
+    if not args.precondition_outputs:
+        if args.latent_l1_weight > 0.0 or args.freq_loss_weight > 0.0 or args.lpips_weight > 0.0:
+            logger.warning(
+                "[Loss] precondition_outputs=False 时 model_pred 为 velocity, "
+                "latent_l1 / freq / lpips 项强制关闭, 仅保留 noise MSE"
+            )
+        args.latent_l1_weight = 0.0
+        args.freq_loss_weight = 0.0
+        args.lpips_weight = 0.0
+        lpips_model = None
+
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -1950,19 +2010,59 @@ def main(args):
                     target = noise - model_input
 
                 # Compute regular loss.
-                loss_spatial = torch.mean(
+                loss_mse = torch.mean(
                     (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                     1,
                 )
-                loss_spatial = loss_spatial.mean()
+                loss_mse = loss_mse.mean()
+                loss = loss_mse
 
-                # 频域 loss: rFFT 域 L2, 强制模型对齐 target 的频谱形态,
-                # 抑制"每隔一个 patch 抖动一下"的周期伪影 (16px period).
-                if args.spectral_loss_weight > 0.0:
-                    loss_spectral = _spectral_loss(model_pred, target)
-                    loss = loss_spatial + args.spectral_loss_weight * loss_spectral
+                # ============================================================
+                # 重建/感知/频域损失 (镜像 controlnet_file/train_controlnet.py)
+                #   precondition_outputs=True 时, model_pred = x0 预测,
+                #   可直接在隐空间与 latents 对齐; 否则 model_pred 为 velocity,
+                #   这些项在加载阶段已强制关闭.
+                # ============================================================
+                pred_x0 = model_pred.float() if args.precondition_outputs else None
+
+                # latent L1 重建
+                if args.latent_l1_weight > 0.0 and pred_x0 is not None:
+                    pred_x0_clamped = pred_x0.clamp(-3.0, 3.0)
+                    loss_l1 = F.l1_loss(pred_x0_clamped, latents.float(), reduction="mean")
+                    loss = loss + args.latent_l1_weight * loss_l1
                 else:
-                    loss = loss_spatial
+                    loss_l1 = torch.tensor(0.0, device=model_pred.device)
+
+                # rFFT 频域 L1: 在频谱幅值上对齐, 保留高频细节
+                loss_freq = torch.tensor(0.0, device=model_pred.device)
+                if args.freq_loss_weight > 0.0 and pred_x0 is not None:
+                    pred_fft = torch.fft.rfft2(pred_x0_clamped, norm="ortho")
+                    tgt_fft = torch.fft.rfft2(latents.float(), norm="ortho")
+                    loss_freq = F.l1_loss(pred_fft.abs(), tgt_fft.abs(), reduction="mean")
+                    loss = loss + args.freq_loss_weight * loss_freq
+
+                # LPIPS 感知损失: 每 N 步算一次, 解码 pred_x0/latents 到 RGB
+                loss_lpips = torch.tensor(0.0, device=model_pred.device)
+                if (lpips_model is not None
+                        and args.lpips_weight > 0.0
+                        and pred_x0 is not None
+                        and (global_step % args.lpips_interval == 0)):
+                    try:
+                        torch.cuda.empty_cache()
+                        with torch.no_grad():
+                            scaling = vae.config.scaling_factor
+                            pred_rgb = vae.decode(
+                                pred_x0_clamped.to(weight_dtype) / scaling
+                            ).sample.float().clamp(-1.0, 1.0)
+                            gt_rgb = vae.decode(
+                                latents.to(weight_dtype) / scaling
+                            ).sample.float().clamp(-1.0, 1.0)
+                        d = lpips_model(pred_rgb, gt_rgb)
+                        loss_lpips = d.mean()
+                        loss = loss + args.lpips_weight * loss_lpips
+                    except Exception as e:
+                        logger.warning(f"[LPIPS] 计算失败 ({e}), 跳过本步")
+                        loss_lpips = torch.tensor(0.0, device=model_pred.device)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -2035,6 +2135,14 @@ def main(args):
                             controlnet.train()
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            # 拆解各项, 便于 tensorboard 对照
+            logs["loss_mse"] = loss_mse.detach().item()
+            if args.latent_l1_weight > 0.0:
+                logs["loss_l1"] = loss_l1.detach().item()
+            if args.freq_loss_weight > 0.0:
+                logs["loss_freq"] = loss_freq.detach().item()
+            if args.lpips_weight > 0.0:
+                logs["loss_lpips"] = loss_lpips.detach().item()
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
