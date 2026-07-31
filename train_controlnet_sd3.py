@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 from datetime import datetime
 from typing import Dict, List
@@ -2082,7 +2083,9 @@ def main(args):
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            # 严格匹配 checkpoint-<整数>, 过滤掉 checkpoint-test_90000 之类非法目录
+                            checkpoints = [d for d in checkpoints
+                                           if re.match(r"^checkpoint-\d+$", d)]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
                             # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
