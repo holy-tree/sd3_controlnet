@@ -1912,6 +1912,22 @@ def main(args):
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
+            # ============================================================
+            # 关键: accelerator.load_state() 会把旧 checkpoint 里的
+            # optimizer.param_groups[0]['lr'] 灌回来 (即旧 LR).
+            # 若你这次在 YAML 里改了 learning_rate, 必须显式覆盖,
+            # 否则会"看起来 YAML 没生效".
+            # 同时, lr_scheduler 内部 base_lrs 也要同步, 否则 scheduler
+            # 会按旧 base 算 warmup/cosine, 后续 lr 还是错的.
+            # ============================================================
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.learning_rate
+            if hasattr(lr_scheduler, "base_lrs"):
+                lr_scheduler.base_lrs = [args.learning_rate] * len(lr_scheduler.base_lrs)
+            accelerator.print(
+                f"[LR] resume 后已强制覆盖为 args.learning_rate = {args.learning_rate}"
+            )
+
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
     else:
