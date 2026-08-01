@@ -1919,27 +1919,45 @@ def main(args):
             # 全部灌回来. 若你这次在 YAML 里改了 learning_rate, 必须显式覆盖,
             # 否则 optimizer 仍是旧 LR, lr_scheduler.step() 也会按旧 base 重算.
             #
+            # accelerate 包装后, lr_scheduler 是 AcceleratedScheduler, base_lrs
+            # 在内层 scheduler 上 (lr_scheduler.schedulers[0] 或 .scheduler),
+            # 外层 wrapper 不暴露该属性. 必须穿透 wrapper 去改.
+            #
             # PyTorch LambdaLR 的 step() 真正读取的是:
             #   group['lr'] = base_lrs[i] * lr_lambda(epoch)
             # 其中 base_lrs 在 __init__ 时取自 group['initial_lr'].
             # 所以必须同时覆盖 optimizer.param_groups 的 ['lr'] 和 ['initial_lr'],
-            # 以及 lr_scheduler.base_lrs, 缺一不可.
+            # 以及 (穿透 wrapper 后的) lr_scheduler.base_lrs, 缺一不可.
             # ============================================================
-            for pg in optimizer.param_groups:
-                pg["lr"] = args.learning_rate
-                pg["initial_lr"] = args.learning_rate
-            # accelerate 可能包装 optimizer, 同步覆盖 scheduler 持有的那份
-            if hasattr(lr_scheduler, "optimizer") and lr_scheduler.optimizer is not optimizer:
-                for pg in lr_scheduler.optimizer.param_groups:
+            # 1) 收集所有需要修改的 optimizer (wrapper + scheduler 持有的内层)
+            opts_to_fix = [optimizer]
+            sched = lr_scheduler
+            # accelerate >= 0.30: lr_scheduler.schedulers 是 list
+            if hasattr(lr_scheduler, "schedulers"):
+                sched = lr_scheduler.schedulers[0]
+                if hasattr(lr_scheduler, "optimizers") and lr_scheduler.optimizers:
+                    opts_to_fix.append(lr_scheduler.optimizers[0])
+            # accelerate 早期版本: lr_scheduler.scheduler 单数
+            elif hasattr(lr_scheduler, "scheduler"):
+                sched = lr_scheduler.scheduler
+                if hasattr(lr_scheduler, "optimizer") and lr_scheduler.optimizer is not None:
+                    opts_to_fix.append(lr_scheduler.optimizer)
+
+            for opt in opts_to_fix:
+                if opt is None:
+                    continue
+                for pg in opt.param_groups:
                     pg["lr"] = args.learning_rate
                     pg["initial_lr"] = args.learning_rate
-            # base_lrs 是 step() 真正用的, 必须覆盖
-            if hasattr(lr_scheduler, "base_lrs"):
-                lr_scheduler.base_lrs = [args.learning_rate] * len(lr_scheduler.base_lrs)
+
+            # 2) 穿透 wrapper 改 base_lrs (step() 真正用的)
+            if hasattr(sched, "base_lrs"):
+                sched.base_lrs = [args.learning_rate] * len(sched.base_lrs)
+
             accelerator.print(
                 f"[LR] resume 后已强制覆盖为 args.learning_rate = {args.learning_rate} "
-                f"(param_groups[0].lr={optimizer.param_groups[0]['lr']}, "
-                f"base_lrs={getattr(lr_scheduler, 'base_lrs', None)})"
+                f"(wrapper.param_groups[0].lr={optimizer.param_groups[0]['lr']}, "
+                f"inner.base_lrs={getattr(sched, 'base_lrs', None)})"
             )
 
             initial_global_step = global_step
