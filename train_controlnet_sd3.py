@@ -1914,18 +1914,32 @@ def main(args):
 
             # ============================================================
             # 关键: accelerator.load_state() 会把旧 checkpoint 里的
-            # optimizer.param_groups[0]['lr'] 灌回来 (即旧 LR).
-            # 若你这次在 YAML 里改了 learning_rate, 必须显式覆盖,
-            # 否则会"看起来 YAML 没生效".
-            # 同时, lr_scheduler 内部 base_lrs 也要同步, 否则 scheduler
-            # 会按旧 base 算 warmup/cosine, 后续 lr 还是错的.
+            #   - optimizer.param_groups[0]['lr'] / ['initial_lr']
+            #   - lr_scheduler.base_lrs / last_epoch
+            # 全部灌回来. 若你这次在 YAML 里改了 learning_rate, 必须显式覆盖,
+            # 否则 optimizer 仍是旧 LR, lr_scheduler.step() 也会按旧 base 重算.
+            #
+            # PyTorch LambdaLR 的 step() 真正读取的是:
+            #   group['lr'] = base_lrs[i] * lr_lambda(epoch)
+            # 其中 base_lrs 在 __init__ 时取自 group['initial_lr'].
+            # 所以必须同时覆盖 optimizer.param_groups 的 ['lr'] 和 ['initial_lr'],
+            # 以及 lr_scheduler.base_lrs, 缺一不可.
             # ============================================================
             for pg in optimizer.param_groups:
                 pg["lr"] = args.learning_rate
+                pg["initial_lr"] = args.learning_rate
+            # accelerate 可能包装 optimizer, 同步覆盖 scheduler 持有的那份
+            if hasattr(lr_scheduler, "optimizer") and lr_scheduler.optimizer is not optimizer:
+                for pg in lr_scheduler.optimizer.param_groups:
+                    pg["lr"] = args.learning_rate
+                    pg["initial_lr"] = args.learning_rate
+            # base_lrs 是 step() 真正用的, 必须覆盖
             if hasattr(lr_scheduler, "base_lrs"):
                 lr_scheduler.base_lrs = [args.learning_rate] * len(lr_scheduler.base_lrs)
             accelerator.print(
-                f"[LR] resume 后已强制覆盖为 args.learning_rate = {args.learning_rate}"
+                f"[LR] resume 后已强制覆盖为 args.learning_rate = {args.learning_rate} "
+                f"(param_groups[0].lr={optimizer.param_groups[0]['lr']}, "
+                f"base_lrs={getattr(lr_scheduler, 'base_lrs', None)})"
             )
 
             initial_global_step = global_step
