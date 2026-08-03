@@ -75,7 +75,8 @@ dataloader_num_workers: 0
 num_train_epochs: 1
 max_train_steps: 20000
 checkpointing_steps: 1000
-checkpoints_total_limit: null
+# 最多保存几个 checkpoint (旧的会被自动删除以节省磁盘)
+checkpoints_total_limit: 3
 
 # ==================== 优化器与梯度 ====================
 learning_rate: 1.0e-5
@@ -109,6 +110,21 @@ precondition_outputs: 1
 
 # T5 text encoder 最大序列长度
 max_sequence_length: 77
+
+# 重建/感知/边缘损失权重 (RGB 域, 替换旧 latent L1 / 频域 L1)
+# 要求 precondition_outputs=True; 否则这些项在训练启动时会被强制关闭, 仅保留 noise MSE.
+#   loss = loss_mse (flow matching)
+#        + pixel_charbonnier_weight * loss_pixel   # RGB Charbonnier 像素重建
+#        + edge_loss_weight         * loss_edge    # Sobel 边缘 L1 (RGB 域)
+#        + lpips_weight             * loss_lpips   # 感知损失 (需 VAE.decode, 较重)
+#
+# 三者均按 (1 - sigma) 在样本维加权, 自动仅在低噪声 timestep 起作用.
+# VAE.decode 由 --lpips_interval 控制频率.
+pixel_charbonnier_weight: 0.1
+edge_loss_weight: 0.02
+lpips_weight: 0.01                     # PSNR 敏感任务建议 ≤0.02
+lpips_interval: 4                      # 每 N 步算一次图像域损失, 其余步置 0
+lpips_net: "alex"                      # alex=快, vgg=准
 
 # dataset.map(compute_embeddings_fn) 的 batch_size (预计算 prompt embeddings 用)
 dataset_preprocess_batch_size: 1000
@@ -147,9 +163,11 @@ validation_steps: 100
 run_validation: true                  # 默认关闭 (与源 train.yaml:165 一致)
 run_validation_steps: 1000              # 每 N step 跑一次 (0 = 禁用)
 validation_num_samples: 4               # 每种天气采样数
-validation_inference_steps: 20         # pipeline 推理步数
-validation_guidance_scale: 5.5          # CFG
+validation_inference_steps: 30          # pipeline 推理步数
+validation_guidance_scale: 1.5          # 恢复任务使用低 CFG, 减少生成先验干扰
 validation_negative_prompt: null
+validation_use_image: 1                 # 使用 LQ latent 作为去噪起点
+validation_strength: 0.4                # 有效起始噪声强度, 建议 0.2~0.6
 
 # ==================== Hub 推送 (HF) ====================
 push_to_hub: false

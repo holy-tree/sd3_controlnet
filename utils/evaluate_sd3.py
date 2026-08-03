@@ -37,6 +37,7 @@ from typing import Dict, List, Tuple
 
 import torch
 import yaml
+import numpy as np
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
@@ -235,6 +236,36 @@ def maybe_make_prompt(weather: str, args_config: dict) -> str:
     return ""
 
 
+@torch.no_grad()
+def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_steps,
+                                      device, dtype, generator, height, width):
+    """Encode LQ images and initialize the flow trajectory at the requested noise level."""
+    if not 0.0 < strength <= 1.0:
+        raise ValueError(f"strength must be in (0, 1], got {strength}")
+    if pipeline.scheduler.config.use_dynamic_shifting:
+        raise ValueError("image-conditioned init currently requires use_dynamic_shifting=False")
+
+    image = pipeline.image_processor.preprocess(images, height=height, width=width)
+    image = image.to(device=device, dtype=pipeline.vae.dtype)
+    image_latents = pipeline.vae.encode(image).latent_dist.mode()
+    image_latents = (
+        image_latents - pipeline.vae.config.shift_factor
+    ) * pipeline.vae.config.scaling_factor
+    image_latents = image_latents.to(dtype=dtype)
+
+    shift = float(pipeline.scheduler.config.shift)
+    raw_start = strength / (shift - strength * (shift - 1.0))
+    raw_sigmas = np.linspace(
+        raw_start,
+        1.0 / pipeline.scheduler.config.num_train_timesteps,
+        num_inference_steps,
+        dtype=np.float32,
+    )
+    noise = torch.randn(image_latents.shape, generator=generator, device=device, dtype=dtype)
+    latents = (1.0 - strength) * image_latents + strength * noise
+    return latents, raw_sigmas.tolist()
+
+
 # ============================================================
 # 主评估流程
 # ============================================================
@@ -331,6 +362,9 @@ def evaluate(args_config: dict):
     if args_config.get("seed") is not None:
         random.seed(args_config["seed"])
         torch.manual_seed(args_config["seed"])
+        generator = torch.Generator(device=device).manual_seed(args_config["seed"])
+    else:
+        generator = None
 
     total_samples = sum(len(v) for v in by_sub.values())
     pbar = tqdm(total=total_samples, desc="Eval")
@@ -390,19 +424,35 @@ def evaluate(args_config: dict):
                 # prompts / negative_prompts 与 batch 等长
                 prompts = [prompt] * B
                 t0 = time.time()
-                with torch.autocast("cuda", enabled=(device.type == "cuda"), dtype=weight_dtype), torch.no_grad():
-                    neg_prompt = args_config["negative_prompt"]
+                # image-conditioned init: 把 LQ 同时作为 image 传给 pipeline,
+                #   内部 encode → 加 noise (强度由 strength 决定) → 从对应 timestep 起步去噪.
+                #   显著提高 PSNR / 纹理位置一致性, 避免 SD3 自由生成覆盖输入纹理.
+                pipeline_kwargs = dict(
+                    prompt=prompts,
+                    control_image=lq_pils,                  # list[B] of PIL
+                    num_inference_steps=args_config["num_inference_steps"],
+                    guidance_scale=args_config["guidance_scale"],
+                    height=args_config["resolution"],
+                    width=args_config["resolution"],
+                    num_images_per_prompt=1,
+                )
+                strength = float(args_config.get("strength", 1.0))
+                if strength < 1.0:
+                    latents, custom_sigmas = prepare_image_conditioned_latents(
+                        pipeline, lq_pils, strength, args_config["num_inference_steps"],
+                        device, weight_dtype, generator,
+                        args_config["resolution"], args_config["resolution"],
+                    )
+                    pipeline_kwargs["latents"] = latents
+                    pipeline_kwargs["sigmas"] = custom_sigmas
+                pipeline_kwargs["generator"] = generator
+                neg_prompt = args_config.get("negative_prompt")
+                if neg_prompt is not None:
                     neg_prompts = [neg_prompt] * B if isinstance(neg_prompt, str) else neg_prompt
-                    outs = pipeline(
-                        prompt=prompts,
-                        control_image=lq_pils,                  # list[B] of PIL
-                        num_inference_steps=args_config["num_inference_steps"],
-                        guidance_scale=args_config["guidance_scale"],
-                        negative_prompt=neg_prompts,
-                        height=args_config["resolution"],
-                        width=args_config["resolution"],
-                        num_images_per_prompt=1,
-                    ).images
+                    pipeline_kwargs["negative_prompt"] = neg_prompts
+
+                with torch.autocast("cuda", enabled=(device.type == "cuda"), dtype=weight_dtype), torch.no_grad():
+                    outs = pipeline(**pipeline_kwargs).images
                 infer_time_total = time.time() - t0
                 infer_time_avg = infer_time_total / B
 

@@ -29,12 +29,21 @@ splits: ["test"]
 # ==================== 推理参数 ====================
 # SD3 训练配置默认 512 (与源项目一致)
 resolution: 512
-num_inference_steps: 20
-# SD3 默认不需要高 CFG; SD2 训练用 5.5, SD3 收敛得更快可适当降低
-guidance_scale: 5.5
-negative_prompt: "dotted, noise, blur, lowres, smooth"
-mixed_precision: "fp16"
+num_inference_steps: 30
+# 图像恢复任务下, 高 CFG 会放大 SD3 的生成先验, 压坏纹理位置与色彩.
+# 建议范围 1.0~3.0, 1.0~1.5 是"低先验"模式, 更接近确定性恢复.
+guidance_scale: 1.5
+# 负向 prompt: 图像恢复任务下会过度惩罚纹理, 与 GT 偏离反而扣分.
+# 留 null 表示不传 negative_prompt (CFG 退化为单分支引导).
+negative_prompt: null
+mixed_precision: "bf16"
 seed: 42
+
+# ==================== image-conditioned init (img2img) ====================
+# strength: 起始噪声强度. 1.0=纯噪声 (默认 t2i ControlNet, 自由生成);
+#          <1.0=用 LQ 作为 image-conditioned init, 在 LQ latent 上加少量噪声起步去噪,
+#          大幅提升 PSNR 与纹理位置一致性. 建议范围 0.2~0.6.
+strength: 0.4
 
 # 推理时使用的 prompt (留空则全部使用空 prompt)
 use_prompt: false

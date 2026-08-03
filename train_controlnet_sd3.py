@@ -80,9 +80,71 @@ logger = get_logger(__name__)
 
 
 # ============================================================
-# 重建/感知/频域损失计算在主训练循环内联完成 (见下方),
-# 此处不再保留独立的频域 loss helper.
+# RGB 图像域损失辅助函数
 # ============================================================
+def sobel_edge_magnitude(x: torch.Tensor) -> torch.Tensor:
+    """
+    计算 Sobel 边缘幅值 (per-channel, depthwise conv).
+    Args:
+        x: [B, C, H, W] 张量, 任意范围 (内部使用 x.dtype/x.device)
+    Returns:
+        [B, C, H, W] 边缘幅值
+    """
+    B, C, H, W = x.shape
+    kx = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]],
+                      dtype=x.dtype, device=x.device)
+    ky = kx.transpose(0, 1)
+    kx = kx.view(1, 1, 3, 3).expand(C, 1, 3, 3)
+    ky = ky.view(1, 1, 3, 3).expand(C, 1, 3, 3)
+    grad_x = F.conv2d(x, kx, padding=1, groups=C)
+    grad_y = F.conv2d(x, ky, padding=1, groups=C)
+    return torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-12)
+
+
+def charbonnier_per_sample(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    """
+    Charbonnier 像素损失 (robust L1), 按样本返回 [B] 张量.
+    Args:
+        pred:   [B, C, H, W]
+        target: [B, C, H, W]
+    Returns:
+        [B] 每个样本的 Charbonnier 损失 (C/H/W 平均)
+    """
+    diff = pred - target
+    loss = torch.sqrt(diff ** 2 + eps ** 2)
+    return loss.mean(dim=[1, 2, 3])
+
+
+@torch.no_grad()
+def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_steps,
+                                      device, dtype, generator, height, width):
+    """Encode LQ images and initialize the flow trajectory at the requested noise level."""
+    if not 0.0 < strength <= 1.0:
+        raise ValueError(f"strength must be in (0, 1], got {strength}")
+    if pipeline.scheduler.config.use_dynamic_shifting:
+        raise ValueError("image-conditioned init currently requires use_dynamic_shifting=False")
+
+    image = pipeline.image_processor.preprocess(images, height=height, width=width)
+    image = image.to(device=device, dtype=pipeline.vae.dtype)
+    image_latents = pipeline.vae.encode(image).latent_dist.mode()
+    image_latents = (
+        image_latents - pipeline.vae.config.shift_factor
+    ) * pipeline.vae.config.scaling_factor
+    image_latents = image_latents.to(dtype=dtype)
+
+    # Convert the requested effective sigma to the scheduler's pre-shift space.
+    # This keeps `strength` intuitive even when SD3 uses shift=3.
+    shift = float(pipeline.scheduler.config.shift)
+    raw_start = strength / (shift - strength * (shift - 1.0))
+    raw_sigmas = np.linspace(
+        raw_start,
+        1.0 / pipeline.scheduler.config.num_train_timesteps,
+        num_inference_steps,
+        dtype=np.float32,
+    )
+    noise = torch.randn(image_latents.shape, generator=generator, device=device, dtype=dtype)
+    latents = (1.0 - strength) * image_latents + strength * noise
+    return latents, raw_sigmas.tolist()
 
 
 def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
@@ -353,16 +415,32 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
             # 注: torch.autocast("cuda") 默认 dtype=fp16, 会把 bf16 组件 (VAE/transformer/controlnet) 
             # 强制降到 fp16, fp16 数值范围窄, SD3 累积误差 → VAE decode 出 NaN → 图像全黑.
             # 修复: 显式指定 dtype=bf16 跟训练 mixed_precision 一致, 或者直接关掉 autocast.
+            #
+            # image-conditioned init: 把 LQ 同时作为 image+control_image 传入,
+            #   pipeline 内部 encode LQ → 加 noise → 从对应 timestep 起步去噪,
+            #   显著提升 PSNR 与纹理位置一致性 (避免 SD3 自由生成重建纹理).
+            pipeline_kwargs = dict(
+                prompt=prompt,
+                control_image=lq_pil,
+                num_inference_steps=args.validation_inference_steps,
+                guidance_scale=args.validation_guidance_scale,
+                negative_prompt=args.validation_negative_prompt,
+                height=args.resolution,
+                width=args.resolution,
+            )
+            if getattr(args, "validation_use_image", 1) and getattr(args, "validation_strength", 1.0) < 1.0:
+                generator = torch.Generator(device=accelerator.device).manual_seed(weather_seed + sample_idx)
+                latents, custom_sigmas = prepare_image_conditioned_latents(
+                    pipeline, [lq_pil], args.validation_strength,
+                    args.validation_inference_steps, accelerator.device, weight_dtype,
+                    generator, args.resolution, args.resolution,
+                )
+                pipeline_kwargs["latents"] = latents
+                pipeline_kwargs["sigmas"] = custom_sigmas
+                pipeline_kwargs["generator"] = generator
+
             with torch.autocast("cuda", enabled=autocast_enabled, dtype=weight_dtype):
-                pred_pil = pipeline(
-                    prompt=prompt,
-                    control_image=lq_pil,
-                    num_inference_steps=args.validation_inference_steps,
-                    guidance_scale=args.validation_guidance_scale,
-                    negative_prompt=args.validation_negative_prompt,
-                    height=args.resolution,
-                    width=args.resolution,
-                ).images[0]
+                pred_pil = pipeline(**pipeline_kwargs).images[0]
 
             # pred -> tensor [3, H, W] in [0, 1]
             pred_tensor = tvt.ToTensor()(pred_pil).to(accelerator.device).clamp(0, 1)
@@ -938,39 +1016,57 @@ def parse_args(input_args=None):
     )
 
 # ============================================================
-# 重建/感知/频域损失权重 (镜像 controlnet_file/train_controlnet.py 的四件套)
+# RGB 图像域损失权重 (替换旧 latent_l1 / freq)
 # 要求 precondition_outputs=True, 否则 model_pred 不是 x0 预测, 这些项会被强制关闭.
 #
-#   loss = loss_mse
-#        + latent_l1_weight * loss_l1      # latent L1 重建
-#        + freq_loss_weight  * loss_freq   # rFFT 幅值 L1, 保留高频
-#        + lpips_weight      * loss_lpips  # 感知损失 (需 VAE.decode, 较重)
+#   loss = loss_mse (flow matching)
+#        + pixel_charbonnier_weight * loss_pixel   # RGB Charbonnier 像素重建
+#        + edge_loss_weight         * loss_edge    # Sobel 边缘 L1 (RGB 域)
+#        + lpips_weight             * loss_lpips   # 感知损失 (需 VAE.decode, 较重)
 #
+# 共同点: 仅在低噪声 timestep 起作用, 权重 (1 - sigma) 由 sigma 反推;
+#        解码 pred 保留梯度 (反传到 ControlNet), GT 在 no_grad 下解码节省显存.
 # 0 = 关闭对应项
 # ============================================================
     parser.add_argument(
             "--latent_l1_weight",
             type=float,
-            default=0.1,
-            help="latent L1 重建权重: 在隐空间对齐 pred_x0 与 latents, 建议 0.05~0.3, 0=关闭",
+            default=0.0,
+            help="[deprecated] 旧 latent L1 重建权重, 已被 pixel_charbonnier_weight 取代, 保留仅为兼容旧 yaml",
 )
     parser.add_argument(
             "--freq_loss_weight",
             type=float,
+            default=0.0,
+            help="[deprecated] 旧 rFFT 频域 L1 权重, 已被 edge_loss_weight 取代, 保留仅为兼容旧 yaml",
+)
+    parser.add_argument(
+            "--pixel_charbonnier_weight",
+            type=float,
             default=0.1,
-            help="rFFT 频域 L1 权重: 在 rfft 幅值空间对齐, 保留高频细节, 建议 0.05~0.2, 0=关闭",
+            help="RGB Charbonnier 像素重建权重: 在 RGB 域对齐 decoded pred 与 GT, "
+                 "建议 0.05~0.3, 0=关闭. 仅在低噪声 timestep 起作用 (权重 1-sigma)",
+)
+    parser.add_argument(
+            "--edge_loss_weight",
+            type=float,
+            default=0.02,
+            help="Sobel 边缘 L1 权重 (RGB 域): 约束 decoded pred 与 GT 的边缘结构, "
+                 "建议 0.01~0.05, 0=关闭. 仅在低噪声 timestep 起作用",
 )
     parser.add_argument(
             "--lpips_weight",
             type=float,
-            default=0.05,
-            help="LPIPS 感知损失权重: 解码 pred_x0/latents 到 RGB 后算感知距离, 建议 0.03~0.1, 0=关闭",
+            default=0.01,
+            help="LPIPS 感知损失权重: decoded pred/GT 的感知距离, "
+                 "建议 0.005~0.05 (PSNR 敏感任务建议 ≤0.02), 0=关闭",
 )
     parser.add_argument(
             "--lpips_interval",
             type=int,
             default=4,
-            help="每隔 N 步算一次 LPIPS, 其余步置 0, 降低 VAE.decode 开销",
+            help="每隔 N 步算一次图像域损失 (Charbonnier/Edge/LPIPS 共用同一 VAE.decode), "
+                 "其余步置 0, 降低显存开销",
 )
     parser.add_argument(
         "--lpips_net",
@@ -978,6 +1074,19 @@ def parse_args(input_args=None):
         default="alex",
         choices=["alex", "vgg"],
         help="LPIPS backbone: alex (快) / vgg (准)",
+    )
+    parser.add_argument(
+        "--validation_strength",
+        type=float,
+        default=0.5,
+        help="按 step 验证的 img2img 起始强度 (1.0=纯噪声, 0.0=无噪声). "
+             "若 ControlNet 已训练稳定, 0.3~0.5 可显著提高 PSNR/纹理一致性",
+    )
+    parser.add_argument(
+        "--validation_use_image",
+        type=int,
+        default=1,
+        help="按 step 验证是否使用 image-conditioned init (1=启用, 0=关闭)",
     )
 
     if input_args is not None:
@@ -1866,13 +1975,17 @@ def main(args):
 
     # 非 precondition 模式下, 重建/感知/频域项无意义, 强制关闭以避免误用
     if not args.precondition_outputs:
-        if args.latent_l1_weight > 0.0 or args.freq_loss_weight > 0.0 or args.lpips_weight > 0.0:
+        if (args.latent_l1_weight > 0.0 or args.freq_loss_weight > 0.0
+                or args.pixel_charbonnier_weight > 0.0 or args.edge_loss_weight > 0.0
+                or args.lpips_weight > 0.0):
             logger.warning(
                 "[Loss] precondition_outputs=False 时 model_pred 为 velocity, "
-                "latent_l1 / freq / lpips 项强制关闭, 仅保留 noise MSE"
+                "latent_l1 / freq / charbornier / edge / lpips 项强制关闭, 仅保留 noise MSE"
             )
         args.latent_l1_weight = 0.0
         args.freq_loss_weight = 0.0
+        args.pixel_charbonnier_weight = 0.0
+        args.edge_loss_weight = 0.0
         args.lpips_weight = 0.0
         lpips_model = None
 
@@ -2067,51 +2180,83 @@ def main(args):
                 loss = loss_mse
 
                 # ============================================================
-                # 重建/感知/频域损失 (镜像 controlnet_file/train_controlnet.py)
-                #   precondition_outputs=True 时, model_pred = x0 预测,
-                #   可直接在隐空间与 latents 对齐; 否则 model_pred 为 velocity,
-                #   这些项在加载阶段已强制关闭.
+                # RGB 图像域重建损失 (Charbonnier + Edge + LPIPS)
+                #   - 仅在 timestep 噪声较低时贡献梯度 (time-varying weight = 1-sigma)
+                #   - pred_rgb 保留梯度 (反传到 ControlNet); GT 直接使用原始 RGB tensor
+                #   - VAE decoder 仅做 decode, VAE 自身参数已被 .requires_grad_(False) 冻结
+                #   - 由 --lpips_interval 控制 VAE.decode 频率, 避免每步 decode 显存爆炸
                 # ============================================================
                 pred_x0 = model_pred.float() if args.precondition_outputs else None
 
-                # latent L1 重建
-                if args.latent_l1_weight > 0.0 and pred_x0 is not None:
-                    pred_x0_clamped = pred_x0.clamp(-3.0, 3.0)
-                    loss_l1 = F.l1_loss(pred_x0_clamped, model_input.float(), reduction="mean")
-                    loss = loss + args.latent_l1_weight * loss_l1
-                else:
-                    loss_l1 = torch.tensor(0.0, device=model_pred.device)
-
-                # rFFT 频域 L1: 在频谱幅值上对齐, 保留高频细节
-                loss_freq = torch.tensor(0.0, device=model_pred.device)
-                if args.freq_loss_weight > 0.0 and pred_x0 is not None:
-                    pred_fft = torch.fft.rfft2(pred_x0_clamped, norm="ortho")
-                    tgt_fft = torch.fft.rfft2(model_input.float(), norm="ortho")
-                    loss_freq = F.l1_loss(pred_fft.abs(), tgt_fft.abs(), reduction="mean")
-                    loss = loss + args.freq_loss_weight * loss_freq
-
-                # LPIPS 感知损失: 每 N 步算一次, 解码 pred_x0/model_input 到 RGB
+                loss_pixel = torch.tensor(0.0, device=model_pred.device)
+                loss_edge = torch.tensor(0.0, device=model_pred.device)
                 loss_lpips = torch.tensor(0.0, device=model_pred.device)
-                if (lpips_model is not None
-                        and args.lpips_weight > 0.0
-                        and pred_x0 is not None
-                        and (global_step % args.lpips_interval == 0)):
+
+                # 时序权重: sigma=1 (纯噪声) → 0, sigma=0 (干净) → 1 (per-sample, 不参与梯度)
+                img_weight = (1.0 - sigmas.flatten().clamp(min=0.0, max=1.0)) \
+                                 .view(-1, 1, 1, 1).detach()
+
+                should_compute_img = (
+                    pred_x0 is not None
+                    and (global_step % args.lpips_interval == 0)
+                    and (
+                        args.pixel_charbonnier_weight > 0.0
+                        or args.edge_loss_weight > 0.0
+                        or (args.lpips_weight > 0.0 and lpips_model is not None)
+                    )
+                )
+
+                if should_compute_img:
                     try:
                         torch.cuda.empty_cache()
-                        with torch.no_grad():
-                            scaling = vae.config.scaling_factor
-                            pred_rgb = vae.decode(
-                                pred_x0_clamped.to(weight_dtype) / scaling
-                            ).sample.float().clamp(-1.0, 1.0)
-                            gt_rgb = vae.decode(
-                                model_input.to(weight_dtype) / scaling
-                            ).sample.float().clamp(-1.0, 1.0)
-                        d = lpips_model(pred_rgb, gt_rgb)
-                        loss_lpips = d.mean()
-                        loss = loss + args.lpips_weight * loss_lpips
+                        scaling = vae.config.scaling_factor
+                        shift = vae.config.shift_factor
+
+                        # pred: 保留梯度, 反传到 ControlNet (VAE 自身已冻结, 不会更新)
+                        pred_latent = pred_x0.to(weight_dtype) / scaling + shift
+                        pred_rgb = vae.decode(pred_latent).sample.float()
+                        pred_01 = (pred_rgb + 1.0) / 2.0
+
+                        # 直接使用原始 GT，避免随机 posterior latent 二次解码引入目标噪声。
+                        gt_rgb = pixel_values.float()
+                        gt_01 = (gt_rgb + 1.0) / 2.0
+
+                        image_loss = torch.tensor(0.0, device=model_pred.device)
+
+                        # Charbonnier 像素重建 (per-sample, 按 img_weight 加权)
+                        if args.pixel_charbonnier_weight > 0.0:
+                            loss_c = charbonnier_per_sample(pred_01, gt_01)
+                            loss_pixel = (loss_c * img_weight.flatten()).mean()
+                            image_loss = image_loss + args.pixel_charbonnier_weight * loss_pixel
+
+                        # Sobel 边缘 L1 (RGB 域)
+                        if args.edge_loss_weight > 0.0:
+                            pred_edge = sobel_edge_magnitude(pred_01)
+                            gt_edge = sobel_edge_magnitude(gt_01)
+                            edge_per_sample = F.l1_loss(pred_edge, gt_edge,
+                                                        reduction="none").mean(dim=[1, 2, 3])
+                            loss_edge = (edge_per_sample * img_weight.flatten()).mean()
+                            image_loss = image_loss + args.edge_loss_weight * loss_edge
+
+                        # LPIPS (pred 保留梯度, GT 已 no_grad)
+                        if args.lpips_weight > 0.0 and lpips_model is not None:
+                            d = lpips_model(pred_rgb.clamp(-1.0, 1.0), gt_rgb).view(-1)
+                            loss_lpips = (d * img_weight.flatten()).mean()
+                            image_loss = image_loss + args.lpips_weight * loss_lpips
+
+                        loss = loss + image_loss
+
+                        del pred_01, gt_01, pred_rgb, gt_rgb
+
                     except Exception as e:
-                        logger.warning(f"[LPIPS] 计算失败 ({e}), 跳过本步")
+                        logger.warning(f"[图像域损失] 计算失败 ({e}), 跳过本步")
+                        loss_pixel = torch.tensor(0.0, device=model_pred.device)
+                        loss_edge = torch.tensor(0.0, device=model_pred.device)
                         loss_lpips = torch.tensor(0.0, device=model_pred.device)
+
+                # 兼容旧日志字段: 旧 latent_l1/freq 现在默认 0, 不再写日志
+                loss_l1 = torch.tensor(0.0, device=model_pred.device)
+                loss_freq = torch.tensor(0.0, device=model_pred.device)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -2188,10 +2333,10 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             # 拆解各项, 便于 tensorboard 对照
             logs["loss_mse"] = loss_mse.detach().item()
-            if args.latent_l1_weight > 0.0:
-                logs["loss_l1"] = loss_l1.detach().item()
-            if args.freq_loss_weight > 0.0:
-                logs["loss_freq"] = loss_freq.detach().item()
+            if args.pixel_charbonnier_weight > 0.0:
+                logs["loss_pixel"] = loss_pixel.detach().item()
+            if args.edge_loss_weight > 0.0:
+                logs["loss_edge"] = loss_edge.detach().item()
             if args.lpips_weight > 0.0:
                 logs["loss_lpips"] = loss_lpips.detach().item()
             progress_bar.set_postfix(**logs)
