@@ -2141,6 +2141,10 @@ def main(args):
     if trainable_transformer_parameters:
         for param in trainable_transformer_parameters:
             param.data = param.data.float()
+    # RA 内部 forward 依赖 fp32 权重 dtype；显式 cast 一次避免 RAFusion.forward
+    # 内部用 .weight.dtype 推断 autocast 转换目标时拿到 bf16。
+    if args.use_ra_fusion:
+        transformer.set_ra_fusion_dtype(torch.float32)
     if not args.train_controlnet:
         controlnet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
@@ -2269,6 +2273,11 @@ def main(args):
             "可训练参数必须保持 FP32；发现非 FP32 optimizer 参数: "
             f"{non_fp32_optimizer_params[:10]}"
         )
+
+    if args.use_ra_fusion:
+        # accelerator.prepare 之后 .to() cast 可能再次覆盖 RA 权重 dtype，再次显式 cast
+        # 避免 RAFusion.forward 用 .weight.dtype 推断 autocast 目标时拿到 bf16。
+        transformer.set_ra_fusion_dtype(torch.float32)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2595,6 +2604,15 @@ def main(args):
                     and (global_step + 1) % args.ra_diagnostics_steps == 0
                     and accelerator.is_main_process
                 )
+                # 前 5 步始终收集 RA 诊断，确保首个 NaN 有内部上下文
+                if (
+                    ra_diagnostics_model is not None
+                    and not collect_ra_diagnostics
+                    and global_step < 5
+                    and accelerator.is_main_process
+                ):
+                    collect_ra_diagnostics = True
+                    args.ra_diagnostics_steps = max(args.ra_diagnostics_steps, 1)
                 if collect_ra_diagnostics:
                     ra_diagnostics_model.enable_ra_diagnostics(True)
                 try:

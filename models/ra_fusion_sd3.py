@@ -99,6 +99,15 @@ class RAFusionBlock(nn.Module):
             + condition
             + F.silu(self.time_proj(time_input)).unsqueeze(1)
         )
+        if not bool(torch.isfinite(fused.detach()).all()):
+            raise FloatingPointError(
+                f"[RAFusionBlock] fused non-finite: main={main_states.dtype} "
+                f"control={controlnet_feature.dtype} cond={condition_state.dtype} temb={temb.dtype} "
+                f"out={fused.dtype}, main_norm={bool(torch.isfinite(self.main_norm(main_states).detach()).all())} "
+                f"control_norm={bool(torch.isfinite(self.control_norm(controlnet_feature).detach()).all())} "
+                f"condition={bool(torch.isfinite(condition.detach()).all())} "
+                f"time_proj_input={bool(torch.isfinite(self.time_proj(time_input).detach()).all())}"
+            )
         if self.stabilize:
             # Four similarly scaled branches are summed above. Scaling by sqrt(4)
             # keeps the fusion RMS close to one instead of growing across stages.
@@ -359,10 +368,21 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         condition_state = None
         if restoration_cond is not None:
             condition_tokens = self.pos_embed(restoration_cond)
+            if self._ra_diagnostics_enabled:
+                if not bool(torch.isfinite(condition_tokens.detach()).all()):
+                    raise FloatingPointError(
+                        f"[RA forward] pos_embed(condition) produced non-finite values: "
+                        f"dtype={condition_tokens.dtype}, shape={tuple(condition_tokens.shape)}"
+                    )
             ra_dtype = self.ra_condition_proj.weight.dtype
             with torch.autocast(device_type=condition_tokens.device.type, enabled=False):
                 condition_state = self.ra_condition_proj(
                     self.ra_condition_norm(condition_tokens.to(dtype=ra_dtype))
+                )
+            if self._ra_diagnostics_enabled and not bool(torch.isfinite(condition_state.detach()).all()):
+                raise FloatingPointError(
+                    f"[RA forward] condition_state non-finite after ra_condition_proj: "
+                    f"dtype={condition_state.dtype}, shape={tuple(condition_state.shape)}"
                 )
 
         ra_diagnostics = [] if self._ra_diagnostics_enabled else None
