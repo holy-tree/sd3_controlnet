@@ -1854,9 +1854,14 @@ def main(args):
         variant=args.variant,
         **transformer_kwargs,
     )
-    if args.use_ra_fusion and args.ra_fusion_model_path:
-        transformer.load_ra_fusion(args.ra_fusion_model_path)
-        logger.info(f"[RA Fusion] 已加载权重: {args.ra_fusion_model_path}")
+    if args.use_ra_fusion:
+        if args.ra_fusion_model_path:
+            transformer.load_ra_fusion(args.ra_fusion_model_path)
+            transformer.set_ra_fusion_scale(args.ra_fusion_scale)
+            logger.info(f"[RA Fusion] 已加载权重: {args.ra_fusion_model_path}")
+        else:
+            logger.info("[RA Fusion] 已自动初始化 missing RA 参数并 zero-init 输出层")
+        transformer.validate_ra_fusion_parameters("base/checkpoint loading")
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
@@ -2135,16 +2140,18 @@ def main(args):
         vae.to(accelerator.device, dtype=torch.float32)
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
-    transformer.to(accelerator.device, dtype=weight_dtype)
-    # 冻结主干保持低精度，但可训练 RA/LoRA 参数维持 fp32。
-    trainable_transformer_parameters = [p for p in transformer.parameters() if p.requires_grad]
-    if trainable_transformer_parameters:
-        for param in trainable_transformer_parameters:
-            param.data = param.data.float()
-    # RA 内部 forward 依赖 fp32 权重 dtype；显式 cast 一次避免 RAFusion.forward
-    # 内部用 .weight.dtype 推断 autocast 转换目标时拿到 bf16。
+    transformer.to(accelerator.device)
+    # Cast only the frozen backbone. Trainable RA/LoRA parameters never pass
+    # through BF16, preserving initialized or loaded FP32 values exactly.
+    for parameter in transformer.parameters():
+        target_dtype = torch.float32 if parameter.requires_grad else weight_dtype
+        if parameter.is_floating_point() and parameter.dtype != target_dtype:
+            parameter.data = parameter.data.to(dtype=target_dtype)
+    for buffer in transformer.buffers():
+        if buffer.is_floating_point() and buffer.dtype != weight_dtype:
+            buffer.data = buffer.data.to(dtype=weight_dtype)
     if args.use_ra_fusion:
-        transformer.set_ra_fusion_dtype(torch.float32)
+        transformer.validate_ra_fusion_parameters("device/dtype conversion")
     if not args.train_controlnet:
         controlnet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
@@ -2274,10 +2281,36 @@ def main(args):
             f"{non_fp32_optimizer_params[:10]}"
         )
 
+    optimizer_parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    optimizer_parameter_ids = {id(parameter) for parameter in optimizer_parameters}
+    if len(optimizer_parameter_ids) != len(optimizer_parameters):
+        raise RuntimeError("An optimizer parameter appears in more than one parameter group")
+    expected_parameter_ids = set()
+    if args.train_controlnet:
+        expected_parameter_ids.update(
+            id(parameter)
+            for parameter in unwrap_model(controlnet).parameters()
+            if parameter.requires_grad
+        )
+    if transformer_is_trainable:
+        expected_parameter_ids.update(
+            id(parameter)
+            for parameter in unwrap_model(transformer).parameters()
+            if parameter.requires_grad
+        )
+    if optimizer_parameter_ids != expected_parameter_ids:
+        raise RuntimeError(
+            "Optimizer parameters no longer match trainable model parameters: "
+            f"optimizer_only={len(optimizer_parameter_ids - expected_parameter_ids)}, "
+            f"model_only={len(expected_parameter_ids - optimizer_parameter_ids)}"
+        )
+
     if args.use_ra_fusion:
-        # accelerator.prepare 之后 .to() cast 可能再次覆盖 RA 权重 dtype，再次显式 cast
-        # 避免 RAFusion.forward 用 .weight.dtype 推断 autocast 目标时拿到 bf16。
-        transformer.set_ra_fusion_dtype(torch.float32)
+        unwrap_model(transformer).validate_ra_fusion_parameters("Accelerate prepare")
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2360,6 +2393,20 @@ def main(args):
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(resume_path)
+            if args.use_ra_fusion:
+                resumed_transformer = unwrap_model(transformer)
+                resumed_transformer.set_ra_fusion_scale(args.ra_fusion_scale)
+                resumed_transformer.validate_ra_fusion_parameters("Accelerate resume")
+            invalid_optimizer_state = []
+            for parameter_state in optimizer.state.values():
+                for state_name, value in parameter_state.items():
+                    if torch.is_tensor(value) and not bool(torch.isfinite(value).all()):
+                        invalid_optimizer_state.append(state_name)
+            if invalid_optimizer_state:
+                raise FloatingPointError(
+                    "Optimizer checkpoint contains non-finite state tensors: "
+                    f"{invalid_optimizer_state[:20]}"
+                )
             global_step = int(path.split("-")[1])
 
             # ============================================================
@@ -2601,18 +2648,11 @@ def main(args):
                 collect_ra_diagnostics = bool(
                     ra_diagnostics_model is not None
                     and args.ra_diagnostics_steps > 0
-                    and (global_step + 1) % args.ra_diagnostics_steps == 0
-                    and accelerator.is_main_process
+                    and (
+                        global_step < 5
+                        or (global_step + 1) % args.ra_diagnostics_steps == 0
+                    )
                 )
-                # 前 5 步始终收集 RA 诊断，确保首个 NaN 有内部上下文
-                if (
-                    ra_diagnostics_model is not None
-                    and not collect_ra_diagnostics
-                    and global_step < 5
-                    and accelerator.is_main_process
-                ):
-                    collect_ra_diagnostics = True
-                    args.ra_diagnostics_steps = max(args.ra_diagnostics_steps, 1)
                 if collect_ra_diagnostics:
                     ra_diagnostics_model.enable_ra_diagnostics(True)
                 try:
@@ -2863,12 +2903,13 @@ def main(args):
                     logs[f"ra/block_{index}_delta_rms"] = delta_rms
                     logs[f"ra/block_{index}_delta_main_ratio"] = ratio
                     summaries.append(f"b{index}:delta/main={ratio:.3e}")
-                logger.info(
-                    f"[RA diagnostics][Step {global_step}] scale={ra_diagnostics['scale']}, "
-                    + ", ".join(summaries)
-                    + f", output_rms={output_stats['rms']:.3e}, "
-                    f"output_max={output_stats['abs_max']:.3e}"
-                )
+                if accelerator.is_main_process:
+                    logger.info(
+                        f"[RA diagnostics][Step {global_step}] scale={ra_diagnostics['scale']}, "
+                        + ", ".join(summaries)
+                        + f", output_rms={output_stats['rms']:.3e}, "
+                        f"output_max={output_stats['abs_max']:.3e}"
+                    )
             if args.pixel_charbonnier_weight > 0.0:
                 logs["loss_pixel"] = loss_pixel.detach().item()
             if args.edge_loss_weight > 0.0:

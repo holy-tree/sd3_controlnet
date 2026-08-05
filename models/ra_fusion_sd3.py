@@ -99,15 +99,6 @@ class RAFusionBlock(nn.Module):
             + condition
             + F.silu(self.time_proj(time_input)).unsqueeze(1)
         )
-        if not bool(torch.isfinite(fused.detach()).all()):
-            raise FloatingPointError(
-                f"[RAFusionBlock] fused non-finite: main={main_states.dtype} "
-                f"control={controlnet_feature.dtype} cond={condition_state.dtype} temb={temb.dtype} "
-                f"out={fused.dtype}, main_norm={bool(torch.isfinite(self.main_norm(main_states).detach()).all())} "
-                f"control_norm={bool(torch.isfinite(self.control_norm(controlnet_feature).detach()).all())} "
-                f"condition={bool(torch.isfinite(condition.detach()).all())} "
-                f"time_proj_input={bool(torch.isfinite(self.time_proj(time_input).detach()).all())}"
-            )
         if self.stabilize:
             # Four similarly scaled branches are summed above. Scaling by sqrt(4)
             # keeps the fusion RMS close to one instead of growing across stages.
@@ -210,6 +201,33 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         self._ra_diagnostics_enabled = False
         self._last_ra_diagnostics: dict[str, Any] | None = None
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """Load SD3 weights and explicitly initialize a wholly missing RA branch."""
+        output_loading_info = bool(kwargs.pop("output_loading_info", False))
+        model, loading_info = super().from_pretrained(
+            *args,
+            output_loading_info=True,
+            **kwargs,
+        )
+        expected_ra_keys = {
+            key for key in model.state_dict() if key.startswith("ra_")
+        }
+        missing_ra_keys = expected_ra_keys.intersection(loading_info.get("missing_keys", []))
+        if missing_ra_keys:
+            if missing_ra_keys != expected_ra_keys:
+                missing = sorted(missing_ra_keys)
+                loaded = sorted(expected_ra_keys - missing_ra_keys)
+                raise ValueError(
+                    "Partial RA Fusion state is not supported: "
+                    f"missing={missing[:20]}, loaded={loaded[:20]}"
+                )
+            model.reset_ra_fusion_parameters()
+        model.validate_ra_fusion_parameters("from_pretrained")
+        if output_loading_info:
+            return model, loading_info
+        return model
+
     def ra_fusion_parameters(self):
         for name, parameter in self.named_parameters():
             if name.startswith("ra_"):
@@ -219,9 +237,48 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         for parameter in self.ra_fusion_parameters():
             parameter.requires_grad_(trainable)
 
+    def reset_ra_fusion_parameters(self) -> None:
+        """Initialize RA layers after loading a base SD3 checkpoint.
+
+        Diffusers constructs models under ``no_init_weights()`` in
+        ``from_pretrained``. Since a base SD3 checkpoint has no RA keys, those
+        parameters must be initialized explicitly after loading.
+        """
+        self.ra_condition_proj.reset_parameters()
+        for fusion_block in self.ra_fusion_blocks.values():
+            for module in fusion_block.modules():
+                if module is fusion_block:
+                    continue
+                reset_parameters = getattr(module, "reset_parameters", None)
+                if reset_parameters is not None:
+                    reset_parameters()
+            nn.init.zeros_(fusion_block.output_proj.weight)
+            nn.init.zeros_(fusion_block.output_proj.bias)
+        self.validate_ra_fusion_parameters("explicit initialization")
+
+    def validate_ra_fusion_parameters(self, stage: str) -> None:
+        invalid = []
+        for name, parameter in self.named_parameters():
+            if not name.startswith("ra_"):
+                continue
+            if parameter.is_meta:
+                invalid.append(f"{name}: meta tensor")
+                continue
+            values = parameter.detach()
+            if not bool(torch.isfinite(values).all()):
+                invalid.append(
+                    f"{name}: nan={torch.isnan(values).sum().item()}, "
+                    f"inf={torch.isinf(values).sum().item()}, dtype={values.dtype}"
+                )
+        if invalid:
+            raise FloatingPointError(
+                f"RA Fusion parameters are invalid after {stage}: " + "; ".join(invalid[:20])
+            )
+
     def set_ra_fusion_dtype(self, dtype: torch.dtype) -> None:
-        for parameter in self.ra_fusion_parameters():
-            parameter.data = parameter.data.to(dtype=dtype)
+        self.ra_condition_proj.to(dtype=dtype)
+        self.ra_fusion_blocks.to(dtype=dtype)
+        self.validate_ra_fusion_parameters(f"dtype conversion to {dtype}")
 
     def set_ra_fusion_scale(self, scale: float) -> None:
         if not math.isfinite(scale) or scale < 0.0:
@@ -271,6 +328,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         )
 
     def save_ra_fusion(self, save_directory: str | os.PathLike) -> None:
+        self.validate_ra_fusion_parameters("checkpoint save")
         save_directory = Path(save_directory)
         save_directory.mkdir(parents=True, exist_ok=True)
         state = {
@@ -320,6 +378,15 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                 )
 
         state = load_file(str(weight_path))
+        invalid_state = [
+            key
+            for key, value in state.items()
+            if not bool(torch.isfinite(value).all())
+        ]
+        if invalid_state:
+            raise FloatingPointError(
+                f"RA Fusion checkpoint contains non-finite tensors: {invalid_state[:20]}"
+            )
         expected_keys = {key for key in self.state_dict() if key.startswith("ra_")}
         loaded_keys = set(state)
         if expected_keys != loaded_keys:
@@ -327,6 +394,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             unexpected = sorted(loaded_keys - expected_keys)
             raise ValueError(f"RA Fusion state mismatch: missing={missing}, unexpected={unexpected}")
         self.load_state_dict(state, strict=False)
+        self.validate_ra_fusion_parameters("checkpoint load")
         # Legacy checkpoints predate this field and were trained with an
         # implicit scale of 1.0.
         self.set_ra_fusion_scale(saved_config.get("ra_fusion_scale", 1.0))
@@ -353,8 +421,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             raise ValueError("RA Fusion is enabled but restoration_cond was not provided")
         if restoration_cond is not None:
             restoration_cond = self._align_condition_batch(restoration_cond, hidden_states.shape[0])
-            # 走主干 dtype 进入 pos_embed，避免 bf16 Conv2d 收到 fp32 input 时输出 NaN；
-            # RA 内部 norm/proj 收到后会在 with autocast(enabled=False) 段中显式 to(fp32)。
+            # pos_embed belongs to the low-precision frozen backbone. RA casts
+            # its resulting tokens to the trainable branch dtype below.
             restoration_cond = restoration_cond.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
         hidden_states = self.pos_embed(hidden_states)
@@ -370,32 +438,10 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         condition_state = None
         if restoration_cond is not None:
             condition_tokens = self.pos_embed(restoration_cond)
-            if self._ra_diagnostics_enabled:
-                if not bool(torch.isfinite(condition_tokens.detach()).all()):
-                    raise FloatingPointError(
-                        f"[RA forward] pos_embed(condition) produced non-finite values: "
-                        f"dtype={condition_tokens.dtype}, shape={tuple(condition_tokens.shape)}"
-                    )
             ra_dtype = self.ra_condition_proj.weight.dtype
             with torch.autocast(device_type=condition_tokens.device.type, enabled=False):
                 normed = self.ra_condition_norm(condition_tokens.to(dtype=ra_dtype))
-                if self._ra_diagnostics_enabled and not bool(torch.isfinite(normed.detach()).all()):
-                    raise FloatingPointError(
-                        f"[RA forward] ra_condition_norm non-finite: "
-                        f"dtype={normed.dtype}, shape={tuple(normed.shape)}, "
-                        f"input_dtype={condition_tokens.dtype}, "
-                        f"weight_dtype={self.ra_condition_norm.weight.dtype}, "
-                        f"input_mean={condition_tokens.float().abs().mean().item():.4e}, "
-                        f"input_std={condition_tokens.float().std().item():.4e}"
-                    )
                 condition_state = self.ra_condition_proj(normed)
-            if self._ra_diagnostics_enabled and not bool(torch.isfinite(condition_state.detach()).all()):
-                raise FloatingPointError(
-                    f"[RA forward] condition_state non-finite after ra_condition_proj: "
-                    f"dtype={condition_state.dtype}, shape={tuple(condition_state.shape)}, "
-                    f"weight_dtype={self.ra_condition_proj.weight.dtype}, "
-                    f"weight_abs_max={self.ra_condition_proj.weight.detach().abs().max().item():.4e}"
-                )
 
         ra_diagnostics = [] if self._ra_diagnostics_enabled else None
 
