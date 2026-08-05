@@ -63,6 +63,7 @@ from diffusers.training_utils import compute_density_for_timestep_sampling, comp
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
+from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
 
 try:
@@ -232,11 +233,26 @@ def log_validation(controlnet, transformer, args, accelerator, weight_dtype, ste
     for i, validation_image in enumerate(validation_images):
         validation_image = Image.open(validation_image).convert("RGB")
         validation_prompt = validation_prompts[i]
+        restoration_condition = None
+        if getattr(args, "use_ra_fusion", 0):
+            restoration_condition = encode_rss_condition(
+                pipeline,
+                [validation_image],
+                height=args.resolution,
+                width=args.resolution,
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
 
         images = []
 
         for _ in range(args.num_validation_images):
-            with inference_ctx:
+            ra_context = (
+                pipeline.transformer.restoration_condition_context(restoration_condition)
+                if getattr(args, "use_ra_fusion", 0)
+                else contextlib.nullcontext()
+            )
+            with ra_context, inference_ctx:
                 image = pipeline(
                     prompt_embeds=prompt_embeds[i].unsqueeze(0),
                     negative_prompt_embeds=negative_prompt_embeds[i].unsqueeze(0),
@@ -378,13 +394,7 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
-    try:
-        pipeline = pipeline.to(accelerator.device)
-    except (NotImplementedError, TypeError) as e:
-        logger.warning(f"[Step {step}] pipeline.to() 触发错误 ({e}), 回退 to_empty")
-        pipeline.to_empty(device=accelerator.device)
-        if weight_dtype != torch.float32:
-            pipeline = pipeline.to(dtype=weight_dtype)
+    pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
     # ---- 3. 取 train_dataset 的 samples (兼容 torch.Subset) ----
@@ -453,8 +463,9 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 width=args.resolution,
                 generator=generator,
             )
-            if use_rss:
-                rss_condition = encode_rss_condition(
+            restoration_condition = None
+            if use_rss or getattr(args, "use_ra_fusion", 0):
+                restoration_condition = encode_rss_condition(
                     pipeline,
                     [lq_pil],
                     height=args.resolution,
@@ -462,8 +473,9 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                     device=accelerator.device,
                     dtype=weight_dtype,
                 )
+            if use_rss:
                 pipeline_kwargs["callback_on_step_end"] = make_rss_callback(
-                    rss_condition,
+                    restoration_condition,
                     weight=rss_weight,
                     threshold=rss_threshold,
                 )
@@ -477,7 +489,12 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 pipeline_kwargs["latents"] = latents
                 pipeline_kwargs["sigmas"] = custom_sigmas
 
-            with torch.autocast("cuda", enabled=autocast_enabled, dtype=weight_dtype):
+            ra_context = (
+                pipeline.transformer.restoration_condition_context(restoration_condition)
+                if getattr(args, "use_ra_fusion", 0)
+                else contextlib.nullcontext()
+            )
+            with ra_context, torch.autocast("cuda", enabled=autocast_enabled, dtype=weight_dtype):
                 pred_pil = pipeline(**pipeline_kwargs).images[0]
 
             # pred -> tensor [3, H, W] in [0, 1]
@@ -781,9 +798,8 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--precondition_outputs",
         type=int,
-        default=1,
-        help="Flag indicating if we are preconditioning the model outputs or not as done in EDM. This affects how "
-        "model `target` is calculated.",
+        default=0,
+        help="Deprecated compatibility flag. Training now always supervises raw flow velocity.",
     )
     # ==================== Transformer LoRA (SD3 主干) ====================
     parser.add_argument(
@@ -826,6 +842,17 @@ def parse_args(input_args=None):
         default=1e-6,
         help="LoRA 参数使用的学习率. 强烈建议显著低于 ControlNet 学习率, 例如 1e-6~5e-6.",
     )
+    parser.add_argument("--train_controlnet", type=int, default=1, help="是否更新 ControlNet 参数.")
+    parser.add_argument("--train_transformer_lora", type=int, default=0, help="是否更新 Transformer LoRA 参数.")
+    parser.add_argument("--transformer_lora_model_path", type=str, default=None)
+    # ==================== RA-inspired ControlNet Fusion ====================
+    parser.add_argument("--use_ra_fusion", type=int, default=0)
+    parser.add_argument("--ra_fusion_interval", type=int, default=4)
+    parser.add_argument("--ra_fusion_hidden_dim", type=int, default=256)
+    parser.add_argument("--ra_fusion_num_res_blocks", type=int, default=2)
+    parser.add_argument("--ra_fusion_kernel_size", type=int, default=3)
+    parser.add_argument("--ra_fusion_learning_rate", type=float, default=1e-5)
+    parser.add_argument("--ra_fusion_model_path", type=str, default=None)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
@@ -1101,7 +1128,7 @@ def parse_args(input_args=None):
 
 # ============================================================
 # RGB 图像域损失权重 (替换旧 latent_l1 / freq)
-# 要求 precondition_outputs=True, 否则 model_pred 不是 x0 预测, 这些项会被强制关闭.
+# pred_x0 由 raw velocity 重建，因此这些项可直接反传到 RA/LoRA/ControlNet。
 #
 #   loss = loss_mse (flow matching)
 #        + pixel_charbonnier_weight * loss_pixel   # RGB Charbonnier 像素重建
@@ -1435,6 +1462,7 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
         ]
     )
 
@@ -1661,6 +1689,14 @@ def main(args):
         raise ValueError("Specify one of `--dataset_name`, `--train_data_dir`, or `--dataset_root`")
     if args.dataset_root is not None and (args.dataset_name is not None or args.train_data_dir is not None):
         raise ValueError("`--dataset_root` is mutually exclusive with `--dataset_name` and `--train_data_dir`")
+    if args.use_ra_fusion and not args.train_controlnet and not args.controlnet_model_name_or_path:
+        raise ValueError(
+            "RA 第一阶段冻结 ControlNet 时，必须通过 controlnet_model_name_or_path 提供已有权重."
+        )
+    if args.train_transformer_lora and not args.use_transformer_lora:
+        raise ValueError("train_transformer_lora=1 要求 use_transformer_lora=1")
+    if args.precondition_outputs:
+        logger.warning("precondition_outputs 已弃用；当前训练始终使用 raw velocity MSE")
 
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
@@ -1764,9 +1800,27 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
-    transformer = SD3Transformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+    transformer_cls = RAFusionSD3Transformer2DModel if args.use_ra_fusion else SD3Transformer2DModel
+    transformer_kwargs = {}
+    if args.use_ra_fusion:
+        transformer_kwargs.update(
+            ra_fusion_enabled=True,
+            ra_fusion_interval=args.ra_fusion_interval,
+            ra_fusion_hidden_dim=args.ra_fusion_hidden_dim,
+            ra_fusion_num_res_blocks=args.ra_fusion_num_res_blocks,
+            ra_fusion_kernel_size=args.ra_fusion_kernel_size,
+            low_cpu_mem_usage=False,
+        )
+    transformer = transformer_cls.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="transformer",
+        revision=args.revision,
+        variant=args.variant,
+        **transformer_kwargs,
     )
+    if args.use_ra_fusion and args.ra_fusion_model_path:
+        transformer.load_ra_fusion(args.ra_fusion_model_path)
+        logger.info(f"[RA Fusion] 已加载权重: {args.ra_fusion_model_path}")
 
     if args.controlnet_model_name_or_path:
         logger.info("Loading existing controlnet weights")
@@ -1776,6 +1830,12 @@ def main(args):
         controlnet = SD3ControlNetModel.from_transformer(
             transformer, num_extra_conditioning_channels=args.num_extra_conditioning_channels
         )
+    controlnet_force_zero_pooled = bool(
+        getattr(controlnet.config, "force_zeros_for_pooled_projection", False)
+    )
+    logger.info(
+        f"[ControlNet contract] force_zeros_for_pooled_projection={controlnet_force_zero_pooled}"
+    )
 
 
     transformer.requires_grad_(False)
@@ -1783,7 +1843,8 @@ def main(args):
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     text_encoder_three.requires_grad_(False)
-    controlnet.train()
+    controlnet.requires_grad_(bool(args.train_controlnet))
+    controlnet.train(bool(args.train_controlnet))
 
     # ============================================================
     # zero_module 校验: from_transformer 应把 controlnet_blocks 内
@@ -1840,49 +1901,66 @@ def main(args):
         # create custom saving & loading hooks so that `accelerate.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
+                unwrap_model(controlnet).save_pretrained(os.path.join(output_dir, "controlnet"))
                 # `models` 是 Accelerate 内部的 self._models，不可 pop；否则只有
                 # 第一个 checkpoint 能保存模型，后续只会剩 optimizer/scheduler。
                 for wrapped_model in models:
                     model = unwrap_model(wrapped_model)
-                    if isinstance(model, SD3ControlNetModel):
-                        model.save_pretrained(os.path.join(output_dir, "controlnet"))
-                    elif isinstance(model, SD3Transformer2DModel) and args.use_transformer_lora:
-                        model.save_lora_adapter(os.path.join(output_dir, "transformer_lora"))
-                # 模型已按自定义格式保存，阻止 Accelerate 再保存完整模型 state_dict。
-                weights.clear()
+                    if isinstance(model, SD3Transformer2DModel):
+                        if args.use_ra_fusion:
+                            model.save_ra_fusion(os.path.join(output_dir, "ra_fusion"))
+                        if args.use_transformer_lora:
+                            model.save_lora_adapter(os.path.join(output_dir, "transformer_lora"))
+            # 模型已按自定义格式保存，阻止 Accelerate 再保存完整模型 state_dict。
+            weights.clear()
 
         def load_model_hook(models, input_dir):
+            target_controlnet = unwrap_model(controlnet)
+            load_controlnet = SD3ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+            target_controlnet.register_to_config(**load_controlnet.config)
+            target_controlnet.load_state_dict(load_controlnet.state_dict())
+            del load_controlnet
             while len(models) > 0:
                 model = unwrap_model(models.pop())
-                if isinstance(model, SD3ControlNetModel):
-                    load_model = SD3ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
-                    model.register_to_config(**load_model.config)
-                    model.load_state_dict(load_model.state_dict())
-                    del load_model
-                elif isinstance(model, SD3Transformer2DModel) and args.use_transformer_lora:
-                    lora_path = os.path.join(
-                        input_dir, "transformer_lora", "pytorch_lora_weights.safetensors"
-                    )
-                    if not os.path.isfile(lora_path):
-                        raise FileNotFoundError(f"恢复训练时未找到 Transformer LoRA: {lora_path}")
-                    from peft import set_peft_model_state_dict
-                    from safetensors.torch import load_file as safe_load_file
+                if isinstance(model, SD3Transformer2DModel):
+                    if args.use_ra_fusion:
+                        model.load_ra_fusion(os.path.join(input_dir, "ra_fusion"))
+                    if args.use_transformer_lora:
+                        lora_path = os.path.join(
+                            input_dir, "transformer_lora", "pytorch_lora_weights.safetensors"
+                        )
+                        if not os.path.isfile(lora_path):
+                            raise FileNotFoundError(f"恢复训练时未找到 Transformer LoRA: {lora_path}")
+                        from peft import set_peft_model_state_dict
+                        from safetensors.torch import load_file as safe_load_file
 
-                    lora_state = safe_load_file(lora_path)
-                    incompatible = set_peft_model_state_dict(
-                        model, lora_state, adapter_name="default"
-                    )
-                    logger.info(
-                        f"[LoRA resume] 从 {lora_path} 恢复 {len(lora_state)} 个 LoRA 参数; "
-                        f"missing={len(incompatible.missing_keys)}, "
-                        f"unexpected={len(incompatible.unexpected_keys)}"
-                    )
+                        lora_state = safe_load_file(lora_path)
+                        incompatible = set_peft_model_state_dict(
+                            model, lora_state, adapter_name="default"
+                        )
+                        logger.info(
+                            f"[LoRA resume] 从 {lora_path} 恢复 {len(lora_state)} 个 LoRA 参数; "
+                            f"missing={len(incompatible.missing_keys)}, "
+                            f"unexpected={len(incompatible.unexpected_keys)}"
+                        )
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    if args.gradient_checkpointing:
+    if args.gradient_checkpointing and args.train_controlnet:
         controlnet.enable_gradient_checkpointing()
+
+    ra_fusion_layers = None
+    if args.use_ra_fusion:
+        transformer.set_ra_fusion_trainable(True)
+        ra_fusion_layers = list(transformer.ra_fusion_parameters())
+        if not ra_fusion_layers:
+            raise ValueError("RA Fusion 已启用，但没有找到可训练参数")
+        logger.info(
+            f"[RA Fusion] blocks={list(transformer.ra_fusion_indices)}, "
+            f"hidden_dim={args.ra_fusion_hidden_dim}, "
+            f"可训练参数={sum(p.numel() for p in ra_fusion_layers):,}"
+        )
 
     # ============================================================
     # 可选: 给 SD3 Transformer Attention 加 LoRA
@@ -1896,22 +1974,29 @@ def main(args):
             raise ImportError(
                 "use_transformer_lora=1 但未安装 peft. 请运行: pip install peft"
             )
-        # 先确保 transformer 冻结 (后续 LoRA 注入只增参数, 不解冻原有权重)
-        transformer.requires_grad_(False)
         # 标记 LoRA 注入的目标模块
         target_modules = list(args.lora_target_modules)
         # diffusers SD3 Attention 的 self-attn 与 cross-attn 都使用 JointAttnProcessor2_0,
         # 其中 self-attn 用 attn.to_q/to_k/to_v/to_out[0],
         #   context 分支使用 add_q_proj / add_k_proj / add_v_proj / to_add_out.
         # 默认 target_modules 已涵盖 self-attn.
-        lora_config = LoraConfig(
-            r=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            init_lora_weights="gaussian",
-        )
-        transformer.add_adapter(lora_config)
+        if args.transformer_lora_model_path:
+            transformer.load_lora_adapter(
+                args.transformer_lora_model_path,
+                prefix=None,
+                weight_name="pytorch_lora_weights.safetensors",
+                use_safetensors=True,
+            )
+            logger.info(f"[LoRA] 已加载权重: {args.transformer_lora_model_path}")
+        else:
+            lora_config = LoraConfig(
+                r=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                lora_dropout=args.lora_dropout,
+                target_modules=target_modules,
+                init_lora_weights="gaussian",
+            )
+            transformer.add_adapter(lora_config)
         transformer_lora_layers = [
             p for n, p in transformer.named_parameters() if "lora_" in n
         ]
@@ -1920,19 +2005,22 @@ def main(args):
                 f"LoRA 未匹配任何 Transformer 模块: {target_modules}. "
                 "请检查 lora_target_modules 与当前 diffusers 版本的模块命名."
             )
-        # 显式冻结非 LoRA 参数, 防止 LoRA 误触底层
+        # LoRA 与 RA 分别控制；不能用“冻结全部非 LoRA”误伤 RA 参数。
         for n, p in transformer.named_parameters():
-            if "lora_" not in n:
-                p.requires_grad_(False)
+            if "lora_" in n:
+                p.requires_grad_(bool(args.train_transformer_lora))
         n_lora = sum(p.numel() for p in transformer_lora_layers)
         logger.info(
             "[LoRA] 已为 SD3 Transformer Attention 注入 LoRA "
             f"(rank={args.lora_rank}, alpha={args.lora_alpha}, "
             f"target_modules={target_modules}), 可训练 LoRA 参数: {n_lora:,}"
         )
-        if args.gradient_checkpointing:
-            transformer.enable_gradient_checkpointing()
-        transformer.train()
+    transformer_is_trainable = bool(ra_fusion_layers) or (
+        bool(transformer_lora_layers) and bool(args.train_transformer_lora)
+    )
+    if transformer_is_trainable and args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+    transformer.train(transformer_is_trainable)
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -1940,7 +2028,7 @@ def main(args):
         " doing mixed precision training, copy of the weights should still be float32."
     )
 
-    if unwrap_model(controlnet).dtype != torch.float32:
+    if args.train_controlnet and unwrap_model(controlnet).dtype != torch.float32:
         raise ValueError(
             f"Controlnet loaded as datatype {unwrap_model(controlnet).dtype}. {low_precision_error_string}"
         )
@@ -1968,29 +2056,27 @@ def main(args):
     else:
         optimizer_class = torch.optim.AdamW
 
-    # Optimizer creation
-    # ControlNet 参数 + (可选) Transformer LoRA 参数联合训练
-    params_groups = [
-        {
-            "params": controlnet.parameters(),
-            "lr": args.learning_rate,
-        }
-    ]
-    if transformer_lora_layers is not None:
+    # Optimizer creation. Named groups make resume robust when RA/LoRA switches change.
+    params_groups = []
+    if args.train_controlnet:
+        params_groups.append(
+            {"name": "controlnet", "params": controlnet.parameters(), "lr": args.learning_rate}
+        )
+    if ra_fusion_layers is not None:
+        params_groups.append(
+            {"name": "ra_fusion", "params": ra_fusion_layers, "lr": args.ra_fusion_learning_rate}
+        )
+    if transformer_lora_layers is not None and args.train_transformer_lora:
         params_groups.append(
             {
+                "name": "transformer_lora",
                 "params": transformer_lora_layers,
                 "lr": args.lora_learning_rate,
             }
         )
-        logger.info(
-            f"[Optimizer] ControlNet LR={args.learning_rate}, "
-            f"Transformer LoRA LR={args.lora_learning_rate}"
-        )
-    else:
-        logger.info(
-            f"[Optimizer] 仅 ControlNet 可训练, LR={args.learning_rate}"
-        )
+    if not params_groups:
+        raise ValueError("没有可训练参数；请至少启用 ControlNet、RA Fusion 或 LoRA 之一")
+    logger.info(f"[Optimizer] 参数组: {[(g['name'], g['lr']) for g in params_groups]}")
 
     optimizer = optimizer_class(
         params_groups,
@@ -2013,10 +2099,13 @@ def main(args):
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
-    # 冻结主干保持低精度，但可训练 LoRA 参数维持 fp32 以保证优化稳定。
-    if transformer_lora_layers is not None:
-        for param in transformer_lora_layers:
+    # 冻结主干保持低精度，但可训练 RA/LoRA 参数维持 fp32。
+    trainable_transformer_parameters = [p for p in transformer.parameters() if p.requires_grad]
+    if trainable_transformer_parameters:
+        for param in trainable_transformer_parameters:
             param.data = param.data.float()
+    if not args.train_controlnet:
+        controlnet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
     text_encoder_three.to(accelerator.device, dtype=weight_dtype)
@@ -2117,9 +2206,13 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    if transformer_lora_layers is not None:
+    if transformer_is_trainable and args.train_controlnet:
         controlnet, transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             controlnet, transformer, optimizer, train_dataloader, lr_scheduler
+        )
+    elif transformer_is_trainable:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
         )
     else:
         controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -2153,7 +2246,7 @@ def main(args):
     #  - freeze 权重, 不参与 optimizer
     #  - LPIPS 内部把 [0,1] 映射到 [-1,1], 这里与源项目保持一致:
     #    decode 后 clamp(-1, 1) 直接送入
-    #  - precondition_outputs=False 时 LPIPS 不会使用 (model_pred 非 x0)
+    #  - pred_x0 由 raw velocity 重建，不依赖 precondition_outputs
     # ============================================================
     lpips_model = None
     if args.lpips_weight > 0.0:
@@ -2170,22 +2263,6 @@ def main(args):
             lpips_model = None
             args.lpips_weight = 0.0
 
-    # 非 precondition 模式下, 重建/感知/频域项无意义, 强制关闭以避免误用
-    if not args.precondition_outputs:
-        if (args.latent_l1_weight > 0.0 or args.freq_loss_weight > 0.0
-                or args.pixel_charbonnier_weight > 0.0 or args.edge_loss_weight > 0.0
-                or args.lpips_weight > 0.0):
-            logger.warning(
-                "[Loss] precondition_outputs=False 时 model_pred 为 velocity, "
-                "latent_l1 / freq / charbornier / edge / lpips 项强制关闭, 仅保留 noise MSE"
-            )
-        args.latent_l1_weight = 0.0
-        args.freq_loss_weight = 0.0
-        args.pixel_charbonnier_weight = 0.0
-        args.edge_loss_weight = 0.0
-        args.lpips_weight = 0.0
-        lpips_model = None
-
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
@@ -2199,17 +2276,20 @@ def main(args):
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
     first_epoch = 0
+    resume_step = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            resume_path = os.path.abspath(args.resume_from_checkpoint)
+            path = os.path.basename(os.path.normpath(resume_path))
         else:
             # Get the most recent checkpoint
             dirs = os.listdir(args.output_dir)
             dirs = [d for d in dirs if d.startswith("checkpoint")]
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1] if len(dirs) > 0 else None
+            resume_path = os.path.join(args.output_dir, path) if path is not None else None
 
         if path is None:
             accelerator.print(
@@ -2219,7 +2299,7 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            accelerator.load_state(resume_path)
             global_step = int(path.split("-")[1])
 
             # ============================================================
@@ -2256,33 +2336,46 @@ def main(args):
             for opt in opts_to_fix:
                 if opt is None:
                     continue
-                for group_index, pg in enumerate(opt.param_groups):
-                    group_lr = (
-                        args.lora_learning_rate
-                        if args.use_transformer_lora and group_index == 1
-                        else args.learning_rate
-                    )
+                lr_by_group = {
+                    "controlnet": args.learning_rate,
+                    "ra_fusion": args.ra_fusion_learning_rate,
+                    "transformer_lora": args.lora_learning_rate,
+                }
+                for pg in opt.param_groups:
+                    group_name = pg.get("name")
+                    if group_name not in lr_by_group:
+                        raise ValueError(
+                            f"checkpoint optimizer 参数组缺少有效 name: {group_name}. "
+                            "启用 RA 后不能从旧结构 optimizer 直接 resume."
+                        )
+                    group_lr = lr_by_group[group_name]
                     pg["lr"] = group_lr
                     pg["initial_lr"] = group_lr
 
             # 2) 穿透 wrapper 改 base_lrs (step() 真正用的)
             if hasattr(sched, "base_lrs"):
                 sched.base_lrs = [
-                    args.lora_learning_rate
-                    if args.use_transformer_lora and group_index == 1
-                    else args.learning_rate
-                    for group_index in range(len(sched.base_lrs))
+                    {
+                        "controlnet": args.learning_rate,
+                        "ra_fusion": args.ra_fusion_learning_rate,
+                        "transformer_lora": args.lora_learning_rate,
+                    }[pg["name"]]
+                    for pg in optimizer.param_groups
                 ]
 
             accelerator.print(
                 f"[LR] resume 后已恢复参数组学习率: "
-                f"controlnet={args.learning_rate}, lora={args.lora_learning_rate if args.use_transformer_lora else 'off'} "
+                f"controlnet={args.learning_rate}, ra={args.ra_fusion_learning_rate}, "
+                f"lora={args.lora_learning_rate if args.use_transformer_lora else 'off'} "
                 f"(param_group_lrs={[pg['lr'] for pg in optimizer.param_groups]}, "
                 f"inner.base_lrs={getattr(sched, 'base_lrs', None)})"
             )
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
+            resume_step = (
+                global_step % num_update_steps_per_epoch
+            ) * args.gradient_accumulation_steps
     else:
         initial_global_step = 0
 
@@ -2308,7 +2401,13 @@ def main(args):
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            models_to_accumulate = (controlnet, transformer) if transformer_lora_layers is not None else (controlnet,)
+            if epoch == first_epoch and step < resume_step:
+                continue
+            models_to_accumulate = []
+            if args.train_controlnet:
+                models_to_accumulate.append(controlnet)
+            if transformer_is_trainable:
+                models_to_accumulate.append(transformer)
             with accelerator.accumulate(*models_to_accumulate):
                 # Convert images to latent space
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
@@ -2341,21 +2440,34 @@ def main(args):
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
 
                 # controlnet(s) inference
-                controlnet_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
-                controlnet_image = vae.encode(controlnet_image).latent_dist.sample()
-                controlnet_image = (controlnet_image - vae.config.shift_factor) * vae.config.scaling_factor
+                conditioning_pixels = batch["conditioning_pixel_values"].to(dtype=vae.dtype)
+                lq_posterior = vae.encode(conditioning_pixels).latent_dist
+                controlnet_image = lq_posterior.sample()
+                controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
+                controlnet_image = (controlnet_image - controlnet_shift) * vae.config.scaling_factor
+                restoration_condition = lq_posterior.mode()
+                restoration_condition = (
+                    restoration_condition - vae.config.shift_factor
+                ) * vae.config.scaling_factor
 
                 control_block_res_samples = controlnet(
                     hidden_states=noisy_model_input,
                     timestep=timesteps,
                     encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
+                    pooled_projections=(
+                        torch.zeros_like(pooled_prompt_embeds)
+                        if controlnet_force_zero_pooled
+                        else pooled_prompt_embeds
+                    ),
                     controlnet_cond=controlnet_image,
                     return_dict=False,
                 )[0]
                 control_block_res_samples = [sample.to(dtype=weight_dtype) for sample in control_block_res_samples]
 
                 # Predict the noise residual
+                transformer_extra_kwargs = {}
+                if args.use_ra_fusion:
+                    transformer_extra_kwargs["restoration_cond"] = restoration_condition
                 model_pred = transformer(
                     hidden_states=noisy_model_input,
                     timestep=timesteps,
@@ -2363,22 +2475,16 @@ def main(args):
                     pooled_projections=pooled_prompt_embeds,
                     block_controlnet_hidden_states=control_block_res_samples,
                     return_dict=False,
+                    **transformer_extra_kwargs,
                 )[0]
-
-                # Follow: Section 5 of https://huggingface.co/papers/2206.00364.
-                # Preconditioning of the model outputs.
-                if args.precondition_outputs:
-                    model_pred = model_pred * (-sigmas) + noisy_model_input
 
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # flow matching loss
-                if args.precondition_outputs:
-                    target = model_input
-                else:
-                    target = noise - model_input
+                # Raw velocity flow-matching loss. This avoids the implicit sigma^2
+                # attenuation introduced by supervising preconditioned x0 directly.
+                target = noise - model_input
 
                 # Compute regular loss.
                 loss_mse = torch.mean(
@@ -2395,7 +2501,7 @@ def main(args):
                 #   - VAE decoder 仅做 decode, VAE 自身参数已被 .requires_grad_(False) 冻结
                 #   - 由 --lpips_interval 控制 VAE.decode 频率, 避免每步 decode 显存爆炸
                 # ============================================================
-                pred_x0 = model_pred.float() if args.precondition_outputs else None
+                pred_x0 = noisy_model_input.float() - sigmas.float() * model_pred.float()
 
                 loss_pixel = torch.tensor(0.0, device=model_pred.device)
                 loss_edge = torch.tensor(0.0, device=model_pred.device)
@@ -2406,8 +2512,7 @@ def main(args):
                                  .view(-1, 1, 1, 1).detach()
 
                 should_compute_img = (
-                    pred_x0 is not None
-                    and (global_step % args.lpips_interval == 0)
+                    global_step % args.lpips_interval == 0
                     and (
                         args.pixel_charbonnier_weight > 0.0
                         or args.edge_loss_weight > 0.0
@@ -2422,7 +2527,7 @@ def main(args):
                         shift = vae.config.shift_factor
 
                         # pred: 保留梯度, 反传到 ControlNet (VAE 自身已冻结, 不会更新)
-                        pred_latent = pred_x0.to(weight_dtype) / scaling + shift
+                        pred_latent = pred_x0.to(vae.dtype) / scaling + shift
                         pred_rgb = vae.decode(pred_latent).sample.float()
                         pred_01 = (pred_rgb + 1.0) / 2.0
 
@@ -2457,11 +2562,16 @@ def main(args):
 
                         del pred_01, gt_01, pred_rgb, gt_rgb
 
-                    except Exception as e:
-                        logger.warning(f"[图像域损失] 计算失败 ({e}), 跳过本步")
+                    except torch.OutOfMemoryError as e:
+                        logger.warning(f"[图像域损失] CUDA OOM ({e}), 跳过本步图像损失")
                         loss_pixel = torch.tensor(0.0, device=model_pred.device)
                         loss_edge = torch.tensor(0.0, device=model_pred.device)
                         loss_lpips = torch.tensor(0.0, device=model_pred.device)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        logger.exception("[图像域损失] 非 OOM 异常，终止训练以避免静默失效")
+                        raise
 
                 # 兼容旧日志字段: 旧 latent_l1/freq 现在默认 0, 不再写日志
                 loss_l1 = torch.tensor(0.0, device=model_pred.device)
@@ -2469,9 +2579,11 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = list(controlnet.parameters())
-                    if transformer_lora_layers is not None:
-                        params_to_clip.extend(p for p in transformer.parameters() if p.requires_grad)
+                    params_to_clip = [
+                        parameter
+                        for group in optimizer.param_groups
+                        for parameter in group["params"]
+                    ]
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -2482,35 +2594,39 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                if accelerator.is_main_process:
-                    if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            # 严格匹配 checkpoint-<整数>, 过滤掉 checkpoint-test_90000 之类非法目录
-                            checkpoints = [d for d in checkpoints
-                                           if re.match(r"^checkpoint-\d+$", d)]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process and args.checkpoints_total_limit is not None:
+                        checkpoints = os.listdir(args.output_dir)
+                        checkpoints = [d for d in checkpoints if re.match(r"^checkpoint-\d+$", d)]
+                        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                        if len(checkpoints) >= args.checkpoints_total_limit:
+                            num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                            removing_checkpoints = checkpoints[:num_to_remove]
+                            logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+                            for removing_checkpoint in removing_checkpoints:
+                                shutil.rmtree(os.path.join(args.output_dir, removing_checkpoint))
+                    accelerator.wait_for_everyone()
+                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                    accelerator.save_state(save_path)
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
                         logger.info(f"Saved state to {save_path}")
 
-                    if args.validation_prompt is not None and global_step % args.validation_steps == 0:
+                should_validate_images = (
+                    args.validation_prompt is not None
+                    and global_step % args.validation_steps == 0
+                )
+                should_validate_metrics = (
+                    args.run_validation
+                    and args.run_validation_steps > 0
+                    and global_step > 0
+                    and global_step % args.run_validation_steps == 0
+                )
+                if should_validate_images or should_validate_metrics:
+                    accelerator.wait_for_everyone()
+
+                if accelerator.is_main_process:
+                    if should_validate_images:
                         controlnet.eval()
                         transformer.eval()
                         try:
@@ -2523,17 +2639,13 @@ def main(args):
                                 global_step,
                             )
                         finally:
-                            controlnet.train()
-                            if args.use_transformer_lora:
-                                transformer.train()
+                            controlnet.train(bool(args.train_controlnet))
+                            transformer.train(transformer_is_trainable)
 
                     # ===== 按 step 评估 PSNR/SSIM (与现有 log_validation 并行, 不互斥) =====
                     # 训练时 n=4 验证只是"相对参考", 不可作为 best 依据.
                     # 真实 best 必须靠手动跑 utils/evaluate_sd3.py 全量评估决定.
-                    if (args.run_validation
-                            and args.run_validation_steps > 0
-                            and global_step > 0
-                            and global_step % args.run_validation_steps == 0):
+                    if should_validate_metrics:
                         controlnet.eval()
                         transformer.eval()
                         try:
@@ -2548,14 +2660,16 @@ def main(args):
                         except Exception as e:
                             logger.warning(f"[Step {global_step}] run_step_validation 失败: {e}")
                         finally:
-                            controlnet.train()
-                            if args.use_transformer_lora:
-                                transformer.train()
+                            controlnet.train(bool(args.train_controlnet))
+                            transformer.train(transformer_is_trainable)
+
+                if should_validate_images or should_validate_metrics:
+                    accelerator.wait_for_everyone()
 
             current_lrs = lr_scheduler.get_last_lr()
             logs = {"loss": loss.detach().item(), "lr": current_lrs[0]}
-            if args.use_transformer_lora and len(current_lrs) > 1:
-                logs["lora_lr"] = current_lrs[1]
+            for group, group_lr in zip(optimizer.param_groups, current_lrs):
+                logs[f"{group.get('name', 'group')}_lr"] = group_lr
             # 拆解各项, 便于 tensorboard 对照
             logs["loss_mse"] = loss_mse.detach().item()
             if args.pixel_charbonnier_weight > 0.0:
@@ -2576,6 +2690,8 @@ def main(args):
         controlnet = unwrap_model(controlnet)
         controlnet.save_pretrained(args.output_dir)
         transformer = unwrap_model(transformer)
+        if args.use_ra_fusion:
+            transformer.save_ra_fusion(os.path.join(args.output_dir, "ra_fusion"))
         if args.use_transformer_lora:
             transformer.save_lora_adapter(os.path.join(args.output_dir, "transformer_lora"))
 

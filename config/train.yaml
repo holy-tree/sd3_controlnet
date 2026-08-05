@@ -16,7 +16,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: null
+controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet/checkpoint-92000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
@@ -26,7 +26,7 @@ revision: null
 variant: null
 
 # ==================== 输出与缓存 ====================
-output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet"
+output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion"
 cache_dir: null
 
 # 接续训练 (从 checkpoint 恢复 optimizer / scheduler / global_step):
@@ -105,13 +105,15 @@ logit_mean: 0.0
 logit_std: 1.0
 mode_scale: 1.29
 
-# EDM preconditioning: 1=启用 (推荐), 0=关闭
-precondition_outputs: 1
+# 已改为直接监督 raw velocity；保留字段仅用于旧配置兼容。
+precondition_outputs: 0
 
 # ==================== Transformer LoRA (SD3 主干) ====================
 # 在 SD3 Transformer Attention 上插入 LoRA, 配合 ControlNet 联合训练.
 # 不需要 LoRA 时把 use_transformer_lora 置 0, 训练脚本会跳过所有相关逻辑.
-use_transformer_lora: 1
+use_transformer_lora: 0                 # 第一阶段仅训练 RA；已有 LoRA 时可改为 1 并填写路径
+train_transformer_lora: 0              # 第一阶段冻结 LoRA，只归因于 RA Fusion
+transformer_lora_model_path: null       # 可填已有 transformer_lora 目录
 lora_rank: 16
 lora_alpha: 16
 lora_dropout: 0.0
@@ -122,11 +124,22 @@ lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
 # LoRA 学习率. 强烈建议远低于 ControlNet 的 learning_rate, 例如 1e-6 ~ 5e-6.
 lora_learning_rate: 1.0e-6
 
+# ==================== RA-inspired ControlNet Fusion ====================
+# 第一阶段加载已有 ControlNet 并冻结，只训练零初始化 RA Fusion。
+train_controlnet: 0
+use_ra_fusion: 1
+ra_fusion_interval: 4
+ra_fusion_hidden_dim: 256
+ra_fusion_num_res_blocks: 2
+ra_fusion_kernel_size: 3
+ra_fusion_learning_rate: 1.0e-5
+ra_fusion_model_path: null              # 仅继续已有 RA 权重时填写；新训练保持 null
+
 # T5 text encoder 最大序列长度
 max_sequence_length: 77
 
 # 重建/感知/边缘损失权重 (RGB 域, 替换旧 latent L1 / 频域 L1)
-# 要求 precondition_outputs=True; 否则这些项在训练启动时会被强制关闭, 仅保留 noise MSE.
+# pred_x0 由 raw velocity 重建，因此不依赖 precondition_outputs。
 #   loss = loss_mse (flow matching)
 #        + pixel_charbonnier_weight * loss_pixel   # RGB Charbonnier 像素重建
 #        + edge_loss_weight         * loss_edge    # Sobel 边缘 L1 (RGB 域)
@@ -151,7 +164,7 @@ mixed_precision: "bf16"
 upcast_vae: false
 
 # 梯度检查点 (用时间换显存)
-gradient_checkpointing: false
+gradient_checkpointing: true
 
 # TF32 (Ampere+)
 allow_tf32: false

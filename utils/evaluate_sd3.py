@@ -23,6 +23,7 @@ SD3 ControlNet 多天气图像恢复 - 独立评估脚本
 """
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -45,6 +46,7 @@ from tqdm import tqdm
 from diffusers import StableDiffusion3ControlNetPipeline, SD3ControlNetModel
 
 from dataloaders.paired_dataset import DEFAULT_WEATHER_PROMPTS
+from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.metrics import (
     fid as calc_fid,
     lpips as calc_lpips_scalar,
@@ -159,7 +161,15 @@ def resolve_controlnet_path(raw_path: str) -> str:
         return str(p)
     if (p / "controlnet" / "config.json").is_file():
         return str(p / "controlnet")
-    candidates = sorted(p.glob("checkpoint-*/controlnet/config.json"))
+    candidates = [
+        path
+        for path in p.glob("checkpoint-*/controlnet/config.json")
+        if path.parent.parent.name.removeprefix("checkpoint-").isdigit()
+    ]
+    candidates = sorted(
+        candidates,
+        key=lambda path: int(path.parent.parent.name.split("-")[1]),
+    )
     if candidates:
         latest = candidates[-1]
         print(f"[resolve] 在 {p} 下发现多个 checkpoint, 使用最新的: {latest.parent.parent.name}")
@@ -186,14 +196,8 @@ def _load_controlnet_smart(cn_path: str):
               f"尝试按 SD3 加载...")
         model = SD3ControlNetModel.from_pretrained(cn_path)
 
-    # 防御 meta device
-    try:
-        has_meta = any(getattr(p, "is_meta", False) for _, p in model.named_parameters())
-        if has_meta:
-            print("[load] 检测到 meta device, 触发 to_empty")
-            model.to_empty(device="cpu")
-    except Exception:
-        pass
+    if any(getattr(parameter, "is_meta", False) for parameter in model.parameters()):
+        raise RuntimeError("ControlNet 加载后仍含 meta 参数，请检查 checkpoint 和 device_map")
     return model
 
 
@@ -205,27 +209,66 @@ def build_pipeline(args_config: dict, device, dtype):
     print(f"[eval] ControlNet 路径: {cn_path}")
     controlnet = _load_controlnet_smart(cn_path)
 
+    transformer = None
+    if args_config.get("use_ra_fusion", False):
+        ra_path = args_config.get("ra_fusion_path")
+        if ra_path:
+            ra_path = Path(ra_path)
+            if not ra_path.is_absolute():
+                ra_path = Path.cwd() / ra_path
+        else:
+            cn_dir = Path(cn_path)
+            candidates = [cn_dir / "ra_fusion", cn_dir.parent / "ra_fusion"]
+            ra_path = next((p for p in candidates if (p / "ra_fusion.safetensors").is_file()), None)
+        if ra_path is None:
+            raise FileNotFoundError("use_ra_fusion=true，但未找到 ra_fusion/ 权重目录")
+        config_path = ra_path / "config.json"
+        if not config_path.is_file():
+            raise FileNotFoundError(f"未找到 RA Fusion 配置: {config_path}")
+        with open(config_path, "r", encoding="utf-8") as file:
+            ra_config = json.load(file)
+        transformer = RAFusionSD3Transformer2DModel.from_pretrained(
+            args_config["pretrained_model_name_or_path"],
+            subfolder="transformer",
+            torch_dtype=dtype,
+            low_cpu_mem_usage=False,
+            ra_fusion_enabled=True,
+            ra_fusion_interval=ra_config["ra_fusion_interval"],
+            ra_fusion_hidden_dim=ra_config["ra_fusion_hidden_dim"],
+            ra_fusion_num_res_blocks=ra_config["ra_fusion_num_res_blocks"],
+            ra_fusion_kernel_size=ra_config["ra_fusion_kernel_size"],
+        )
+        transformer.load_ra_fusion(ra_path)
+        print(f"[eval] 加载 RA Fusion: {ra_path}")
+
+    pipeline_components = {
+        "controlnet": controlnet,
+        "safety_checker": None,
+        "torch_dtype": dtype,
+    }
+    if transformer is not None:
+        pipeline_components["transformer"] = transformer
     pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
         args_config["pretrained_model_name_or_path"],
-        controlnet=controlnet,
-        safety_checker=None,
-        torch_dtype=dtype,
+        **pipeline_components,
     )
 
     # 显式配置优先；未配置时自动查找 checkpoint/controlnet 的同级目录，
     # 或最终输出目录下的 transformer_lora。
-    lora_path = args_config.get("transformer_lora_path")
-    if lora_path:
-        lora_path = Path(lora_path)
-        if not lora_path.is_absolute():
-            lora_path = Path.cwd() / lora_path
-    else:
-        cn_dir = Path(cn_path)
-        candidates = [cn_dir / "transformer_lora", cn_dir.parent / "transformer_lora"]
-        lora_path = next(
-            (p for p in candidates if (p / "pytorch_lora_weights.safetensors").is_file()),
-            None,
-        )
+    lora_path = None
+    if args_config.get("load_transformer_lora", True):
+        lora_path = args_config.get("transformer_lora_path")
+        if lora_path:
+            lora_path = Path(lora_path)
+            if not lora_path.is_absolute():
+                lora_path = Path.cwd() / lora_path
+        else:
+            cn_dir = Path(cn_path)
+            candidates = [cn_dir / "transformer_lora", cn_dir.parent / "transformer_lora"]
+            lora_path = next(
+                (p for p in candidates if (p / "pytorch_lora_weights.safetensors").is_file()),
+                None,
+            )
 
     if lora_path is not None:
         weight_path = lora_path / "pytorch_lora_weights.safetensors"
@@ -238,16 +281,12 @@ def build_pipeline(args_config: dict, device, dtype):
             weight_name="pytorch_lora_weights.safetensors",
             use_safetensors=True,
         )
-    else:
+    elif args_config.get("load_transformer_lora", True):
         print("[eval] 未发现 Transformer LoRA，使用基础 SD3 Transformer")
+    else:
+        print("[eval] Transformer LoRA 已显式关闭")
 
-    try:
-        pipeline = pipeline.to(device)
-    except (NotImplementedError, TypeError) as e:
-        print(f"[build_pipeline] .to() 触发错误 ({e}), 回退到 to_empty")
-        pipeline.to_empty(device=device)
-        if dtype != torch.float32:
-            pipeline = pipeline.to(dtype=dtype)
+    pipeline = pipeline.to(device)
 
     pipeline.set_progress_bar_config(disable=True)
 
@@ -478,8 +517,9 @@ def evaluate(args_config: dict):
                     width=args_config["resolution"],
                     num_images_per_prompt=1,
                 )
-                if use_rss:
-                    rss_condition = encode_rss_condition(
+                restoration_condition = None
+                if use_rss or args_config.get("use_ra_fusion", False):
+                    restoration_condition = encode_rss_condition(
                         pipeline,
                         lq_pils,
                         height=args_config["resolution"],
@@ -487,8 +527,9 @@ def evaluate(args_config: dict):
                         device=device,
                         dtype=weight_dtype,
                     )
+                if use_rss:
                     pipeline_kwargs["callback_on_step_end"] = make_rss_callback(
-                        rss_condition,
+                        restoration_condition,
                         weight=rss_weight,
                         threshold=rss_threshold,
                     )
@@ -508,7 +549,14 @@ def evaluate(args_config: dict):
                     neg_prompts = [neg_prompt] * B if isinstance(neg_prompt, str) else neg_prompt
                     pipeline_kwargs["negative_prompt"] = neg_prompts
 
-                with torch.autocast("cuda", enabled=(device.type == "cuda"), dtype=weight_dtype), torch.no_grad():
+                ra_context = (
+                    pipeline.transformer.restoration_condition_context(restoration_condition)
+                    if args_config.get("use_ra_fusion", False)
+                    else contextlib.nullcontext()
+                )
+                with ra_context, torch.autocast(
+                    "cuda", enabled=(device.type == "cuda"), dtype=weight_dtype
+                ), torch.no_grad():
                     outs = pipeline(**pipeline_kwargs).images
                 infer_time_total = time.time() - t0
                 infer_time_avg = infer_time_total / B
@@ -691,6 +739,7 @@ def evaluate(args_config: dict):
         f.write(f"Inference steps:  {args_config['num_inference_steps']}\n")
         f.write(f"Guidance scale:   {args_config['guidance_scale']}\n")
         f.write(f"Strength:         {args_config.get('strength', 1.0)}\n")
+        f.write(f"RA Fusion:        {args_config.get('use_ra_fusion', False)}\n")
         f.write(f"RSS enabled:      {use_rss}\n")
         if use_rss:
             f.write(f"RSS weight:       {rss_weight}\n")
