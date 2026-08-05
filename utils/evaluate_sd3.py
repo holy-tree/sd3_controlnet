@@ -261,6 +261,7 @@ def build_pipeline(args_config: dict, device, dtype):
             ra_fusion_scale=effective_scale,
             ra_fusion_stabilize=bool(ra_config.get("ra_fusion_stabilize", False)),
         )
+        transformer.set_ra_fusion_dtype(torch.float32)
         transformer.load_ra_fusion(ra_path)
         if configured_scale is not None:
             transformer.set_ra_fusion_scale(configured_scale)
@@ -313,6 +314,8 @@ def build_pipeline(args_config: dict, device, dtype):
         print("[eval] Transformer LoRA 已显式关闭")
 
     pipeline = pipeline.to(device)
+    if isinstance(pipeline.transformer, RAFusionSD3Transformer2DModel):
+        pipeline.transformer.set_ra_fusion_dtype(torch.float32)
 
     pipeline.set_progress_bar_config(disable=True)
 

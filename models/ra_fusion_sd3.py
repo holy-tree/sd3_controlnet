@@ -210,6 +210,10 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         for parameter in self.ra_fusion_parameters():
             parameter.requires_grad_(trainable)
 
+    def set_ra_fusion_dtype(self, dtype: torch.dtype) -> None:
+        for parameter in self.ra_fusion_parameters():
+            parameter.data = parameter.data.to(dtype=dtype)
+
     def set_ra_fusion_scale(self, scale: float) -> None:
         if not math.isfinite(scale) or scale < 0.0:
             raise ValueError("RA Fusion scale must be finite and non-negative")
@@ -355,7 +359,11 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         condition_state = None
         if restoration_cond is not None:
             condition_tokens = self.pos_embed(restoration_cond)
-            condition_state = self.ra_condition_proj(self.ra_condition_norm(condition_tokens))
+            ra_dtype = self.ra_condition_proj.weight.dtype
+            with torch.autocast(device_type=condition_tokens.device.type, enabled=False):
+                condition_state = self.ra_condition_proj(
+                    self.ra_condition_norm(condition_tokens.to(dtype=ra_dtype))
+                )
 
         ra_diagnostics = [] if self._ra_diagnostics_enabled else None
 
@@ -389,15 +397,18 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                 fusion_control = controlnet_feature
                 if fusion_control is None:
                     fusion_control = torch.zeros_like(main_states)
-                ra_delta, condition_state = self.ra_fusion_blocks[str(index_block)](
-                    main_states,
-                    fusion_control,
-                    condition_state,
-                    temb,
-                    token_height,
-                    token_width,
-                    self._ra_fusion_scale,
-                )
+                fusion_block = self.ra_fusion_blocks[str(index_block)]
+                ra_dtype = fusion_block.output_proj.weight.dtype
+                with torch.autocast(device_type=main_states.device.type, enabled=False):
+                    ra_delta, condition_state = fusion_block(
+                        main_states.to(dtype=ra_dtype),
+                        fusion_control.to(dtype=ra_dtype),
+                        condition_state.to(dtype=ra_dtype),
+                        temb.to(dtype=ra_dtype),
+                        token_height,
+                        token_width,
+                        self._ra_fusion_scale,
+                    )
                 if ra_diagnostics is not None:
                     ra_diagnostics.append(
                         {
@@ -413,7 +424,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             if controlnet_feature is not None:
                 hidden_states = hidden_states + controlnet_feature
             if ra_delta is not None:
-                hidden_states = hidden_states + ra_delta
+                hidden_states = hidden_states + ra_delta.to(dtype=hidden_states.dtype)
 
         hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = self.proj_out(hidden_states)

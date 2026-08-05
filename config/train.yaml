@@ -93,7 +93,7 @@ max_grad_norm: 1.0
 use_8bit_adam: false
 
 # ==================== LR Scheduler ====================
-lr_scheduler: "constant"               # linear / cosine / cosine_with_restarts / polynomial / constant / constant_with_warmup
+lr_scheduler: "constant_with_warmup"   # linear / cosine / cosine_with_restarts / polynomial / constant / constant_with_warmup
 lr_warmup_steps: 500
 lr_num_cycles: 1                       # 仅 cosine_with_restarts 生效
 lr_power: 1.0                          # 仅 polynomial 生效
@@ -150,10 +150,11 @@ max_sequence_length: 77
 #
 # 三者均按 (1 - sigma) 在样本维加权, 自动仅在低噪声 timestep 起作用.
 # VAE.decode 由 --lpips_interval 控制频率.
-pixel_charbonnier_weight: 0.3
-edge_loss_weight: 0.02
-lpips_weight: 0.01                     # PSNR 敏感任务建议 ≤0.02
+pixel_charbonnier_weight: 0.0            # RA 稳定后再逐项启用图像域损失
+edge_loss_weight: 0.0
+lpips_weight: 0.0                       # PSNR 敏感任务建议 ≤0.02
 lpips_interval: 4                      # 每 N 步算一次图像域损失, 其余步置 0
+image_loss_start_step: 1000             # 避免 zero-init RA 的首次更新经过 VAE decoder backward
 lpips_net: "alex"                      # alex=快, vgg=准
 
 # dataset.map(compute_embeddings_fn) 的 batch_size (预计算 prompt embeddings 用)
@@ -164,7 +165,7 @@ dataset_preprocess_batch_size: 1000
 mixed_precision: "bf16"
 
 # 是否 upcast VAE 到 fp32 (避免显存压力但牺牲精度)
-upcast_vae: false
+upcast_vae: true
 
 # 梯度检查点 (用时间换显存)
 gradient_checkpointing: true

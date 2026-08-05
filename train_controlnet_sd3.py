@@ -1194,8 +1194,14 @@ def parse_args(input_args=None):
             type=int,
             default=4,
             help="每隔 N 步算一次图像域损失 (Charbonnier/Edge/LPIPS 共用同一 VAE.decode), "
-                 "其余步置 0, 降低显存开销",
-)
+                  "其余步置 0, 降低显存开销",
+    )
+    parser.add_argument(
+        "--image_loss_start_step",
+        type=int,
+        default=0,
+        help="从指定 optimizer step 开始启用图像域损失，避免 zero-init 模块首步经过 VAE backward.",
+    )
     parser.add_argument(
         "--lpips_net",
         type=str,
@@ -1515,8 +1521,14 @@ def collate_fn(examples):
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
-    prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
-    pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples])
+    prompt_embeds = torch.stack([
+        value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+        for value in (example["prompt_embeds"] for example in examples)
+    ])
+    pooled_prompt_embeds = torch.stack([
+        value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+        for value in (example["pooled_prompt_embeds"] for example in examples)
+    ])
 
     return {
         "pixel_values": pixel_values,
@@ -2246,6 +2258,18 @@ def main(args):
             controlnet, optimizer, train_dataloader, lr_scheduler
         )
 
+    non_fp32_optimizer_params = [
+        (group.get("name", "group"), parameter.dtype)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+        if parameter.dtype != torch.float32
+    ]
+    if non_fp32_optimizer_params:
+        raise TypeError(
+            "可训练参数必须保持 FP32；发现非 FP32 optimizer 参数: "
+            f"{non_fp32_optimizer_params[:10]}"
+        )
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -2425,6 +2449,62 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
+    def raise_if_nonfinite(name: str, tensor: torch.Tensor, step_number: int) -> None:
+        finite = torch.isfinite(tensor.detach())
+        local_bad = (~finite).any().to(device=accelerator.device, dtype=torch.int32)
+        global_bad = accelerator.reduce(local_bad, reduction="sum")
+        if global_bad.item() == 0:
+            return
+        if local_bad.item() == 0:
+            raise FloatingPointError(
+                f"[Step {step_number}] {name} 在其他 rank 出现非有限值"
+            )
+        values = tensor.detach().float()
+        finite_values = values[finite]
+        finite_min = finite_values.min().item() if finite_values.numel() else float("nan")
+        finite_max = finite_values.max().item() if finite_values.numel() else float("nan")
+        raise FloatingPointError(
+            f"[Step {step_number}] {name} 出现非有限值: "
+            f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+            f"nan={torch.isnan(values).sum().item()}, inf={torch.isinf(values).sum().item()}, "
+            f"finite_range=[{finite_min:.4e}, {finite_max:.4e}]"
+        )
+
+    def find_nonfinite_gradient_names() -> list[str]:
+        bad = []
+        models = []
+        if args.train_controlnet:
+            models.append(("controlnet", unwrap_model(controlnet)))
+        if transformer_is_trainable:
+            models.append(("transformer", unwrap_model(transformer)))
+        for prefix, model in models:
+            for name, parameter in model.named_parameters():
+                if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all()):
+                    bad.append(f"{prefix}.{name}")
+        return bad
+
+    def check_trainable_parameters(step_number: int) -> None:
+        bad_detail = None
+        for group in optimizer.param_groups:
+            group_name = group.get("name", "group")
+            for index, parameter in enumerate(group["params"]):
+                if not bool(torch.isfinite(parameter).all()):
+                    bad_detail = (
+                        f"group={group_name}, index={index}, shape={tuple(parameter.shape)}"
+                    )
+                    break
+            if bad_detail is not None:
+                break
+        local_bad = torch.tensor(
+            int(bad_detail is not None), device=accelerator.device, dtype=torch.int32
+        )
+        global_bad = accelerator.reduce(local_bad, reduction="sum")
+        if global_bad.item() > 0:
+            raise FloatingPointError(
+                f"[Step {step_number}] optimizer.step 后参数出现非有限值: "
+                f"{bad_detail or '发生在其他 rank'}"
+            )
+
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -2441,6 +2521,9 @@ def main(args):
                 model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
+                check_source_tensors = global_step < 10
+                if check_source_tensors:
+                    raise_if_nonfinite("GT latent", model_input, global_step + 1)
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -2472,10 +2555,13 @@ def main(args):
                 controlnet_image = lq_posterior.sample()
                 controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
                 controlnet_image = (controlnet_image - controlnet_shift) * vae.config.scaling_factor
+                controlnet_image = controlnet_image.to(dtype=weight_dtype)
                 restoration_condition = lq_posterior.mode()
                 restoration_condition = (
                     restoration_condition - vae.config.shift_factor
                 ) * vae.config.scaling_factor
+                if check_source_tensors:
+                    raise_if_nonfinite("LQ restoration latent", restoration_condition, global_step + 1)
 
                 control_block_res_samples = controlnet(
                     hidden_states=noisy_model_input,
@@ -2490,6 +2576,13 @@ def main(args):
                     return_dict=False,
                 )[0]
                 control_block_res_samples = [sample.to(dtype=weight_dtype) for sample in control_block_res_samples]
+                if check_source_tensors:
+                    for control_index, control_sample in enumerate(control_block_res_samples):
+                        raise_if_nonfinite(
+                            f"ControlNet residual[{control_index}]",
+                            control_sample,
+                            global_step + 1,
+                        )
 
                 # Predict the noise residual
                 transformer_extra_kwargs = {}
@@ -2517,6 +2610,7 @@ def main(args):
                 finally:
                     if collect_ra_diagnostics:
                         ra_diagnostics_model.enable_ra_diagnostics(False)
+                raise_if_nonfinite("Transformer model_pred", model_pred, global_step + 1)
                 ra_diagnostics = (
                     ra_diagnostics_model.get_last_ra_diagnostics()
                     if collect_ra_diagnostics
@@ -2538,6 +2632,7 @@ def main(args):
                 )
                 loss_mse = loss_mse.mean()
                 loss = loss_mse
+                raise_if_nonfinite("flow MSE loss", loss_mse, global_step + 1)
 
                 # ============================================================
                 # RGB 图像域重建损失 (Charbonnier + Edge + LPIPS)
@@ -2557,7 +2652,8 @@ def main(args):
                                  .view(-1, 1, 1, 1).detach()
 
                 should_compute_img = (
-                    global_step % args.lpips_interval == 0
+                    global_step >= args.image_loss_start_step
+                    and global_step % args.lpips_interval == 0
                     and (
                         args.pixel_charbonnier_weight > 0.0
                         or args.edge_loss_weight > 0.0
@@ -2604,6 +2700,7 @@ def main(args):
                             image_loss = image_loss + args.lpips_weight * loss_lpips
 
                         loss = loss + image_loss
+                        raise_if_nonfinite("image-domain loss", image_loss, global_step + 1)
 
                         del pred_01, gt_01, pred_rgb, gt_rgb
 
@@ -2629,8 +2726,26 @@ def main(args):
                         for group in optimizer.param_groups
                         for parameter in group["params"]
                     ]
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    accelerator.unscale_gradients(optimizer)
+                    try:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            params_to_clip,
+                            args.max_grad_norm,
+                            error_if_nonfinite=True,
+                        )
+                    except RuntimeError as error:
+                        bad_gradients = find_nonfinite_gradient_names()
+                        raise FloatingPointError(
+                            f"[Step {global_step + 1}] backward 产生非有限梯度; "
+                            f"首批参数={bad_gradients[:20]}"
+                        ) from error
+                    if not bool(torch.isfinite(grad_norm)):
+                        raise FloatingPointError(
+                            f"[Step {global_step + 1}] gradient norm 非有限: {grad_norm}"
+                        )
                 optimizer.step()
+                if global_step < 10:
+                    check_trainable_parameters(global_step + 1)
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
 
