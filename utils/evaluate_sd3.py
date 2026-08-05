@@ -55,6 +55,7 @@ from utils.metrics import (
     lpips_batch,
     _get_lpips_model,
 )
+from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
 
 
 # ============================================================
@@ -374,6 +375,18 @@ def evaluate(args_config: dict):
     # ===== 构建 pipeline =====
     pipeline = build_pipeline(args_config, device, weight_dtype)
 
+    use_rss = bool(args_config.get("use_rss", False))
+    rss_weight = float(args_config.get("rss_weight", 0.01))
+    rss_threshold = float(args_config.get("rss_threshold", 0.8))
+    if use_rss:
+        validate_rss_config(rss_weight, rss_threshold)
+        print(
+            f"[eval] RSS 已启用: weight={rss_weight}, threshold={rss_threshold}, "
+            "sigma=post-step effective sigma"
+        )
+    else:
+        print("[eval] RSS 已关闭")
+
     # ===== 图像预处理 (LQ 给 pipeline, GT 仅用于算指标) =====
     preprocess = transforms.Compose([
         transforms.Resize(args_config["resolution"], interpolation=transforms.InterpolationMode.BILINEAR),
@@ -465,6 +478,21 @@ def evaluate(args_config: dict):
                     width=args_config["resolution"],
                     num_images_per_prompt=1,
                 )
+                if use_rss:
+                    rss_condition = encode_rss_condition(
+                        pipeline,
+                        lq_pils,
+                        height=args_config["resolution"],
+                        width=args_config["resolution"],
+                        device=device,
+                        dtype=weight_dtype,
+                    )
+                    pipeline_kwargs["callback_on_step_end"] = make_rss_callback(
+                        rss_condition,
+                        weight=rss_weight,
+                        threshold=rss_threshold,
+                    )
+                    pipeline_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
                 strength = float(args_config.get("strength", 1.0))
                 if strength < 1.0:
                     latents, custom_sigmas = prepare_image_conditioned_latents(
@@ -662,6 +690,11 @@ def evaluate(args_config: dict):
         f.write(f"Resolution:       {args_config['resolution']}\n")
         f.write(f"Inference steps:  {args_config['num_inference_steps']}\n")
         f.write(f"Guidance scale:   {args_config['guidance_scale']}\n")
+        f.write(f"Strength:         {args_config.get('strength', 1.0)}\n")
+        f.write(f"RSS enabled:      {use_rss}\n")
+        if use_rss:
+            f.write(f"RSS weight:       {rss_weight}\n")
+            f.write(f"RSS threshold:    {rss_threshold}\n")
         f.write(f"Use prompt:       {args_config.get('use_prompt', False)}\n")
         f.write(f"LPIPS backbone:   {lpips_net}\n")
         f.write(f"FID enabled:      {enable_fid}\n")

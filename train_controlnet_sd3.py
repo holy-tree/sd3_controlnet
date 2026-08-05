@@ -63,6 +63,7 @@ from diffusers.training_utils import compute_density_for_timestep_sampling, comp
 from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
+from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
 
 try:
     from peft import LoraConfig
@@ -340,6 +341,16 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
 
     logger.info(f"[Step {step}] 开始 PSNR/SSIM 验证 ...")
 
+    use_rss = bool(getattr(args, "validation_use_rss", 0))
+    rss_weight = float(getattr(args, "validation_rss_weight", 0.01))
+    rss_threshold = float(getattr(args, "validation_rss_threshold", 0.8))
+    if use_rss:
+        validate_rss_config(rss_weight, rss_threshold)
+        logger.info(
+            f"[Step {step}] RSS 已启用: weight={rss_weight}, "
+            f"threshold={rss_threshold}, sigma=post-step effective sigma"
+        )
+
     from diffusers import StableDiffusion3ControlNetPipeline
     from torchvision import transforms as tvt
 
@@ -442,6 +453,21 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 width=args.resolution,
                 generator=generator,
             )
+            if use_rss:
+                rss_condition = encode_rss_condition(
+                    pipeline,
+                    [lq_pil],
+                    height=args.resolution,
+                    width=args.resolution,
+                    device=accelerator.device,
+                    dtype=weight_dtype,
+                )
+                pipeline_kwargs["callback_on_step_end"] = make_rss_callback(
+                    rss_condition,
+                    weight=rss_weight,
+                    threshold=rss_threshold,
+                )
+                pipeline_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
             if getattr(args, "validation_use_image", 1) and getattr(args, "validation_strength", 1.0) < 1.0:
                 latents, custom_sigmas = prepare_image_conditioned_latents(
                     pipeline, [lq_pil], args.validation_strength,
@@ -486,6 +512,11 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
         f.write(f"Num samples per weather: {num_samples}\n")
         f.write(f"Inference steps: {args.validation_inference_steps}\n")
         f.write(f"Guidance scale: {args.validation_guidance_scale}\n\n")
+        f.write(f"RSS enabled: {use_rss}\n")
+        if use_rss:
+            f.write(f"RSS weight: {rss_weight}\n")
+            f.write(f"RSS threshold: {rss_threshold}\n")
+        f.write("\n")
         f.write("Per-weather metrics:\n")
         for weather, m in weather_metrics.items():
             f.write(f"  {weather:8s}  PSNR={m['psnr']:.3f} dB  SSIM={m['ssim']:.4f}\n")
@@ -1141,6 +1172,24 @@ def parse_args(input_args=None):
         default=1,
         help="按 step 验证是否使用 image-conditioned init (1=启用, 0=关闭)",
     )
+    parser.add_argument(
+        "--validation_use_rss",
+        type=int,
+        default=0,
+        help="按 step 验证是否启用 Restoration Sampling Strategy (1=启用, 0=关闭)",
+    )
+    parser.add_argument(
+        "--validation_rss_weight",
+        type=float,
+        default=0.01,
+        help="按 step 验证的 RSS 引导权重.",
+    )
+    parser.add_argument(
+        "--validation_rss_threshold",
+        type=float,
+        default=0.8,
+        help="按 step 验证的 RSS sigma 阈值, 范围 [0, 1).",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1791,13 +1840,16 @@ def main(args):
         # create custom saving & loading hooks so that `accelerate.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                while len(models) > 0:
-                    weights.pop()
-                    model = unwrap_model(models.pop())
+                # `models` 是 Accelerate 内部的 self._models，不可 pop；否则只有
+                # 第一个 checkpoint 能保存模型，后续只会剩 optimizer/scheduler。
+                for wrapped_model in models:
+                    model = unwrap_model(wrapped_model)
                     if isinstance(model, SD3ControlNetModel):
                         model.save_pretrained(os.path.join(output_dir, "controlnet"))
                     elif isinstance(model, SD3Transformer2DModel) and args.use_transformer_lora:
                         model.save_lora_adapter(os.path.join(output_dir, "transformer_lora"))
+                # 模型已按自定义格式保存，阻止 Accelerate 再保存完整模型 state_dict。
+                weights.clear()
 
         def load_model_hook(models, input_dir):
             while len(models) > 0:
@@ -2204,17 +2256,28 @@ def main(args):
             for opt in opts_to_fix:
                 if opt is None:
                     continue
-                for pg in opt.param_groups:
-                    pg["lr"] = args.learning_rate
-                    pg["initial_lr"] = args.learning_rate
+                for group_index, pg in enumerate(opt.param_groups):
+                    group_lr = (
+                        args.lora_learning_rate
+                        if args.use_transformer_lora and group_index == 1
+                        else args.learning_rate
+                    )
+                    pg["lr"] = group_lr
+                    pg["initial_lr"] = group_lr
 
             # 2) 穿透 wrapper 改 base_lrs (step() 真正用的)
             if hasattr(sched, "base_lrs"):
-                sched.base_lrs = [args.learning_rate] * len(sched.base_lrs)
+                sched.base_lrs = [
+                    args.lora_learning_rate
+                    if args.use_transformer_lora and group_index == 1
+                    else args.learning_rate
+                    for group_index in range(len(sched.base_lrs))
+                ]
 
             accelerator.print(
-                f"[LR] resume 后已强制覆盖为 args.learning_rate = {args.learning_rate} "
-                f"(wrapper.param_groups[0].lr={optimizer.param_groups[0]['lr']}, "
+                f"[LR] resume 后已恢复参数组学习率: "
+                f"controlnet={args.learning_rate}, lora={args.lora_learning_rate if args.use_transformer_lora else 'off'} "
+                f"(param_group_lrs={[pg['lr'] for pg in optimizer.param_groups]}, "
                 f"inner.base_lrs={getattr(sched, 'base_lrs', None)})"
             )
 
@@ -2489,7 +2552,10 @@ def main(args):
                             if args.use_transformer_lora:
                                 transformer.train()
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            current_lrs = lr_scheduler.get_last_lr()
+            logs = {"loss": loss.detach().item(), "lr": current_lrs[0]}
+            if args.use_transformer_lora and len(current_lrs) > 1:
+                logs["lora_lr"] = current_lrs[1]
             # 拆解各项, 便于 tensorboard 对照
             logs["loss_mse"] = loss_mse.detach().item()
             if args.pixel_charbonnier_weight > 0.0:

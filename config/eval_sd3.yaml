@@ -1,3 +1,4 @@
+# python -m utils.evaluate_sd3 --config ./config/eval_sd3.yaml
 # ==================== 模型与输出 ====================
 # SD3 基础模型 (gated, 需 `hf auth login`)
 # 也可改为本地路径, 如 D:/models/stable-diffusion-3-medium-diffusers
@@ -8,7 +9,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 #   1) <path>/controlnet/config.json
 #   2) <path>/config.json
 #   3) <path>/checkpoint-N/controlnet/config.json  (accelerate save_state 输出)
-controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet/checkpoint-90000"
+controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet/checkpoint-90000/controlnet"
 # null 时自动查找 controlnet checkpoint 同级的 transformer_lora/；
 # 也可显式填写，例如 "./experiment/SD3ControlNet/checkpoint-50000/transformer_lora"。
 transformer_lora_path: null
@@ -47,6 +48,13 @@ seed: 42
 #          <1.0=用 LQ 作为 image-conditioned init, 在 LQ latent 上加少量噪声起步去噪,
 #          大幅提升 PSNR 与纹理位置一致性. 建议范围 0.2~0.6.
 strength: 1.0
+
+# ==================== Restoration Sampling Strategy (RSS) ====================
+# 每次 scheduler.step 后，在高 sigma 阶段将生成 latent 轻微拉向 LQ latent。
+# rain/snow/haze 会把退化也带回输出，因此从较小 weight 开始做消融。
+use_rss: true
+rss_weight: 0.01
+rss_threshold: 0.8
 
 # 推理时使用的 prompt (留空则全部使用空 prompt)
 use_prompt: false

@@ -73,7 +73,7 @@ dataloader_num_workers: 0
 
 # ==================== 训练步数 ====================
 num_train_epochs: 1
-max_train_steps: 120000
+max_train_steps: 20000
 checkpointing_steps: 1000
 # 最多保存几个 checkpoint (旧的会被自动删除以节省磁盘)
 checkpoints_total_limit: 3
@@ -182,6 +182,9 @@ validation_guidance_scale: 1.5          # 恢复任务使用低 CFG, 减少生�
 validation_negative_prompt: null
 validation_use_image: 1                 # 使用 LQ latent 作为去噪起点
 validation_strength: 1.0                # 有效起始噪声强度, 建议 0.2~0.6
+validation_use_rss: 0                   # 保持现有验证曲线口径；RSS 消融时改为 1
+validation_rss_weight: 0.01
+validation_rss_threshold: 0.8
 
 # ==================== Hub 推送 (HF) ====================
 push_to_hub: false
