@@ -353,9 +353,9 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             raise ValueError("RA Fusion is enabled but restoration_cond was not provided")
         if restoration_cond is not None:
             restoration_cond = self._align_condition_batch(restoration_cond, hidden_states.shape[0])
-            # RA condition 路径必须全程 FP32，否则主干 BF16 autocast 会在 pos_embed/Linear 中
-            # 引入累计舍入误差，导致 ra_condition_proj 输出 NaN。
-            restoration_cond = restoration_cond.to(device=hidden_states.device, dtype=torch.float32)
+            # 走主干 dtype 进入 pos_embed，避免 bf16 Conv2d 收到 fp32 input 时输出 NaN；
+            # RA 内部 norm/proj 收到后会在 with autocast(enabled=False) 段中显式 to(fp32)。
+            restoration_cond = restoration_cond.to(device=hidden_states.device, dtype=hidden_states.dtype)
 
         hidden_states = self.pos_embed(hidden_states)
         temb = self.time_text_embed(timestep, pooled_projections)
@@ -378,13 +378,23 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                     )
             ra_dtype = self.ra_condition_proj.weight.dtype
             with torch.autocast(device_type=condition_tokens.device.type, enabled=False):
-                condition_state = self.ra_condition_proj(
-                    self.ra_condition_norm(condition_tokens.to(dtype=ra_dtype))
-                )
+                normed = self.ra_condition_norm(condition_tokens.to(dtype=ra_dtype))
+                if self._ra_diagnostics_enabled and not bool(torch.isfinite(normed.detach()).all()):
+                    raise FloatingPointError(
+                        f"[RA forward] ra_condition_norm non-finite: "
+                        f"dtype={normed.dtype}, shape={tuple(normed.shape)}, "
+                        f"input_dtype={condition_tokens.dtype}, "
+                        f"weight_dtype={self.ra_condition_norm.weight.dtype}, "
+                        f"input_mean={condition_tokens.float().abs().mean().item():.4e}, "
+                        f"input_std={condition_tokens.float().std().item():.4e}"
+                    )
+                condition_state = self.ra_condition_proj(normed)
             if self._ra_diagnostics_enabled and not bool(torch.isfinite(condition_state.detach()).all()):
                 raise FloatingPointError(
                     f"[RA forward] condition_state non-finite after ra_condition_proj: "
-                    f"dtype={condition_state.dtype}, shape={tuple(condition_state.shape)}"
+                    f"dtype={condition_state.dtype}, shape={tuple(condition_state.shape)}, "
+                    f"weight_dtype={self.ra_condition_proj.weight.dtype}, "
+                    f"weight_abs_max={self.ra_condition_proj.weight.detach().abs().max().item():.4e}"
                 )
 
         ra_diagnostics = [] if self._ra_diagnostics_enabled else None
