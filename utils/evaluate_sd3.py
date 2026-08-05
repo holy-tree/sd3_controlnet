@@ -67,6 +67,21 @@ def parse_args():
     parser = argparse.ArgumentParser(description="SD3 ControlNet 多天气图像恢复评估")
     parser.add_argument("--config", type=str, default="./config/eval_sd3.yaml",
                         help="YAML 配置文件路径")
+    parser.add_argument(
+        "--ra_fusion_scale",
+        type=float,
+        default=None,
+        help="临时覆盖 RA 输出尺度，用于 0/0.01/0.1/1 消融，不修改 YAML.",
+    )
+    parser.add_argument(
+        "--use_ra_fusion",
+        action="store_true",
+        help="临时启用 RA Fusion，不修改 YAML.",
+    )
+    parser.add_argument("--controlnet_model_path", type=str, default=None)
+    parser.add_argument("--ra_fusion_path", type=str, default=None)
+    parser.add_argument("--max_samples_per_weather", type=int, default=None)
+    parser.add_argument("--disable_fid", action="store_true")
     return parser.parse_args()
 
 
@@ -227,6 +242,12 @@ def build_pipeline(args_config: dict, device, dtype):
             raise FileNotFoundError(f"未找到 RA Fusion 配置: {config_path}")
         with open(config_path, "r", encoding="utf-8") as file:
             ra_config = json.load(file)
+        configured_scale = args_config.get("ra_fusion_scale")
+        effective_scale = (
+            float(configured_scale)
+            if configured_scale is not None
+            else float(ra_config.get("ra_fusion_scale", 1.0))
+        )
         transformer = RAFusionSD3Transformer2DModel.from_pretrained(
             args_config["pretrained_model_name_or_path"],
             subfolder="transformer",
@@ -237,9 +258,14 @@ def build_pipeline(args_config: dict, device, dtype):
             ra_fusion_hidden_dim=ra_config["ra_fusion_hidden_dim"],
             ra_fusion_num_res_blocks=ra_config["ra_fusion_num_res_blocks"],
             ra_fusion_kernel_size=ra_config["ra_fusion_kernel_size"],
+            ra_fusion_scale=effective_scale,
+            ra_fusion_stabilize=bool(ra_config.get("ra_fusion_stabilize", False)),
         )
         transformer.load_ra_fusion(ra_path)
+        if configured_scale is not None:
+            transformer.set_ra_fusion_scale(configured_scale)
         print(f"[eval] 加载 RA Fusion: {ra_path}")
+        print(f"[eval] RA Fusion scale: {transformer.ra_fusion_scale}")
 
     pipeline_components = {
         "controlnet": controlnet,
@@ -817,4 +843,16 @@ def evaluate(args_config: dict):
 if __name__ == "__main__":
     args = parse_args()
     cfg = load_config(args.config)
+    if args.use_ra_fusion:
+        cfg["use_ra_fusion"] = True
+    if args.ra_fusion_scale is not None:
+        cfg["ra_fusion_scale"] = args.ra_fusion_scale
+    if args.controlnet_model_path is not None:
+        cfg["controlnet_model_path"] = args.controlnet_model_path
+    if args.ra_fusion_path is not None:
+        cfg["ra_fusion_path"] = args.ra_fusion_path
+    if args.max_samples_per_weather is not None:
+        cfg["max_samples_per_weather"] = args.max_samples_per_weather
+    if args.disable_fid:
+        cfg["enable_fid"] = False
     evaluate(cfg)

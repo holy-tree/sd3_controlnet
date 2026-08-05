@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -32,7 +33,13 @@ class LocalTokenAdapterBlock(nn.Module):
             groups=hidden_dim,
         )
 
-    def forward(self, states: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    def forward(
+        self,
+        states: torch.Tensor,
+        height: int,
+        width: int,
+        residual_scale: float = 1.0,
+    ) -> torch.Tensor:
         residual = states
         states = F.silu(self.channel_proj(self.norm(states)))
         batch, tokens, channels = states.shape
@@ -43,16 +50,26 @@ class LocalTokenAdapterBlock(nn.Module):
         local = states.transpose(1, 2).reshape(batch, channels, height, width)
         local = F.silu(self.local_conv(local))
         local = local.flatten(2).transpose(1, 2)
-        return residual + states + local
+        return residual + residual_scale * (states + local)
 
 
 class RAFusionBlock(nn.Module):
     """Fuse untouched main states, ControlNet residual, LQ state, and timestep."""
 
-    def __init__(self, model_dim: int, hidden_dim: int, num_res_blocks: int, kernel_size: int):
+    def __init__(
+        self,
+        model_dim: int,
+        hidden_dim: int,
+        num_res_blocks: int,
+        kernel_size: int,
+        stabilize: bool,
+    ):
         super().__init__()
         self.main_norm = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
         self.control_norm = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
+        self.condition_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
+        self.time_norm = nn.LayerNorm(model_dim, elementwise_affine=False, eps=1e-6)
+        self.output_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False, eps=1e-6)
         self.main_proj = nn.Linear(model_dim, hidden_dim)
         self.control_proj = nn.Linear(model_dim, hidden_dim)
         self.time_proj = nn.Linear(model_dim, hidden_dim)
@@ -62,6 +79,7 @@ class RAFusionBlock(nn.Module):
         self.output_proj = nn.Linear(hidden_dim, model_dim)
         nn.init.zeros_(self.output_proj.weight)
         nn.init.zeros_(self.output_proj.bias)
+        self.stabilize = bool(stabilize)
 
     def forward(
         self,
@@ -71,16 +89,29 @@ class RAFusionBlock(nn.Module):
         temb: torch.Tensor,
         height: int,
         width: int,
+        output_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        condition = self.condition_norm(condition_state) if self.stabilize else condition_state
+        time_input = self.time_norm(temb) if self.stabilize else temb
         fused = (
             self.main_proj(self.main_norm(main_states))
             + self.control_proj(self.control_norm(controlnet_feature))
-            + condition_state
-            + F.silu(self.time_proj(temb)).unsqueeze(1)
+            + condition
+            + F.silu(self.time_proj(time_input)).unsqueeze(1)
         )
+        if self.stabilize:
+            # Four similarly scaled branches are summed above. Scaling by sqrt(4)
+            # keeps the fusion RMS close to one instead of growing across stages.
+            fused = fused * 0.5
         for block in self.blocks:
-            fused = block(fused, height, width)
-        return self.output_proj(fused), fused
+            fused = block(
+                fused,
+                height,
+                width,
+                residual_scale=0.5 if self.stabilize else 1.0,
+            )
+        output_input = self.output_norm(fused) if self.stabilize else fused
+        return self.output_proj(output_input) * output_scale, fused
 
 
 class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
@@ -106,6 +137,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         ra_fusion_hidden_dim: int = 256,
         ra_fusion_num_res_blocks: int = 2,
         ra_fusion_kernel_size: int = 3,
+        ra_fusion_scale: float = 1.0,
+        ra_fusion_stabilize: bool = False,
     ):
         super().__init__(
             sample_size=sample_size,
@@ -130,6 +163,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             raise ValueError("ra_fusion_num_res_blocks must be positive")
         if ra_fusion_kernel_size <= 0 or ra_fusion_kernel_size % 2 == 0:
             raise ValueError("ra_fusion_kernel_size must be a positive odd integer")
+        if not math.isfinite(ra_fusion_scale) or ra_fusion_scale < 0.0:
+            raise ValueError("ra_fusion_scale must be finite and non-negative")
 
         self.register_to_config(
             ra_fusion_enabled=ra_fusion_enabled,
@@ -137,6 +172,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             ra_fusion_hidden_dim=ra_fusion_hidden_dim,
             ra_fusion_num_res_blocks=ra_fusion_num_res_blocks,
             ra_fusion_kernel_size=ra_fusion_kernel_size,
+            ra_fusion_scale=ra_fusion_scale,
+            ra_fusion_stabilize=ra_fusion_stabilize,
         )
         self.ra_fusion_enabled = bool(ra_fusion_enabled)
         # Exclude the final context_pre_only block to avoid perturbing the output boundary.
@@ -154,11 +191,15 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                     ra_fusion_hidden_dim,
                     ra_fusion_num_res_blocks,
                     ra_fusion_kernel_size,
+                    ra_fusion_stabilize,
                 )
                 for index in self.ra_fusion_indices
             }
         )
         self._runtime_restoration_condition: torch.Tensor | None = None
+        self._ra_fusion_scale = float(ra_fusion_scale)
+        self._ra_diagnostics_enabled = False
+        self._last_ra_diagnostics: dict[str, Any] | None = None
 
     def ra_fusion_parameters(self):
         for name, parameter in self.named_parameters():
@@ -168,6 +209,31 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
     def set_ra_fusion_trainable(self, trainable: bool = True) -> None:
         for parameter in self.ra_fusion_parameters():
             parameter.requires_grad_(trainable)
+
+    def set_ra_fusion_scale(self, scale: float) -> None:
+        if not math.isfinite(scale) or scale < 0.0:
+            raise ValueError("RA Fusion scale must be finite and non-negative")
+        self._ra_fusion_scale = float(scale)
+
+    @property
+    def ra_fusion_scale(self) -> float:
+        return self._ra_fusion_scale
+
+    def enable_ra_diagnostics(self, enabled: bool = True) -> None:
+        self._ra_diagnostics_enabled = bool(enabled)
+        if enabled:
+            self._last_ra_diagnostics = None
+
+    def get_last_ra_diagnostics(self) -> dict[str, Any] | None:
+        return self._last_ra_diagnostics
+
+    @staticmethod
+    def _tensor_diagnostics(tensor: torch.Tensor) -> dict[str, float]:
+        values = tensor.detach().float()
+        return {
+            "rms": values.square().mean().sqrt().item(),
+            "abs_max": values.abs().max().item(),
+        }
 
     @contextmanager
     def restoration_condition_context(self, condition: torch.Tensor):
@@ -205,6 +271,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             "ra_fusion_hidden_dim": self.config.ra_fusion_hidden_dim,
             "ra_fusion_num_res_blocks": self.config.ra_fusion_num_res_blocks,
             "ra_fusion_kernel_size": self.config.ra_fusion_kernel_size,
+            "ra_fusion_scale": self._ra_fusion_scale,
+            "ra_fusion_stabilize": self.config.ra_fusion_stabilize,
             "ra_fusion_indices": list(self.ra_fusion_indices),
             "num_layers": self.config.num_layers,
             "inner_dim": self.inner_dim,
@@ -225,14 +293,17 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             "ra_fusion_hidden_dim": self.config.ra_fusion_hidden_dim,
             "ra_fusion_num_res_blocks": self.config.ra_fusion_num_res_blocks,
             "ra_fusion_kernel_size": self.config.ra_fusion_kernel_size,
+            "ra_fusion_stabilize": self.config.ra_fusion_stabilize,
             "ra_fusion_indices": list(self.ra_fusion_indices),
             "num_layers": self.config.num_layers,
             "inner_dim": self.inner_dim,
         }
         for key, expected in expected_config.items():
-            if saved_config.get(key) != expected:
+            # Checkpoints created before stabilization used the legacy path.
+            saved = saved_config.get(key, False) if key == "ra_fusion_stabilize" else saved_config.get(key)
+            if saved != expected:
                 raise ValueError(
-                    f"RA Fusion config mismatch for {key}: saved={saved_config.get(key)}, expected={expected}"
+                    f"RA Fusion config mismatch for {key}: saved={saved}, expected={expected}"
                 )
 
         state = load_file(str(weight_path))
@@ -243,6 +314,9 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             unexpected = sorted(loaded_keys - expected_keys)
             raise ValueError(f"RA Fusion state mismatch: missing={missing}, unexpected={unexpected}")
         self.load_state_dict(state, strict=False)
+        # Legacy checkpoints predate this field and were trained with an
+        # implicit scale of 1.0.
+        self.set_ra_fusion_scale(saved_config.get("ra_fusion_scale", 1.0))
 
     @apply_lora_scale("joint_attention_kwargs")
     def forward(
@@ -283,6 +357,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             condition_tokens = self.pos_embed(restoration_cond)
             condition_state = self.ra_condition_proj(self.ra_condition_norm(condition_tokens))
 
+        ra_diagnostics = [] if self._ra_diagnostics_enabled else None
+
         for index_block, block in enumerate(self.transformer_blocks):
             is_skip = skip_layers is not None and index_block in skip_layers
             if torch.is_grad_enabled() and self.gradient_checkpointing and not is_skip:
@@ -320,7 +396,18 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                     temb,
                     token_height,
                     token_width,
+                    self._ra_fusion_scale,
                 )
+                if ra_diagnostics is not None:
+                    ra_diagnostics.append(
+                        {
+                            "block": index_block,
+                            "main": self._tensor_diagnostics(main_states),
+                            "control": self._tensor_diagnostics(fusion_control),
+                            "condition": self._tensor_diagnostics(condition_state),
+                            "delta": self._tensor_diagnostics(ra_delta),
+                        }
+                    )
 
             hidden_states = main_states
             if controlnet_feature is not None:
@@ -341,6 +428,13 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         output = hidden_states.reshape(
             shape=(hidden_states.shape[0], self.out_channels, height * patch_size, width * patch_size)
         )
+
+        if ra_diagnostics is not None:
+            self._last_ra_diagnostics = {
+                "scale": self._ra_fusion_scale,
+                "blocks": ra_diagnostics,
+                "output": self._tensor_diagnostics(output),
+            }
 
         if not return_dict:
             return (output,)

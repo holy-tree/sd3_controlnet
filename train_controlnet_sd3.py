@@ -25,6 +25,7 @@ import os
 import random
 import re
 import shutil
+import sys
 from datetime import datetime
 from typing import Dict, List
 
@@ -366,6 +367,12 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
             f"[Step {step}] RSS 已启用: weight={rss_weight}, "
             f"threshold={rss_threshold}, sigma=post-step effective sigma"
         )
+    if getattr(args, "use_ra_fusion", 0):
+        ra_model = accelerator.unwrap_model(transformer)
+        logger.info(
+            f"[Step {step}] RA Fusion 验证: scale={ra_model.ra_fusion_scale}, "
+            f"stabilize={ra_model.config.ra_fusion_stabilize}"
+        )
 
     from diffusers import StableDiffusion3ControlNetPipeline
     from torchvision import transforms as tvt
@@ -528,7 +535,14 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
         f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Num samples per weather: {num_samples}\n")
         f.write(f"Inference steps: {args.validation_inference_steps}\n")
-        f.write(f"Guidance scale: {args.validation_guidance_scale}\n\n")
+        f.write(f"Guidance scale: {args.validation_guidance_scale}\n")
+        f.write(f"Negative prompt: {args.validation_negative_prompt!r}\n")
+        f.write(f"Validation strength: {args.validation_strength}\n")
+        f.write(f"RA Fusion enabled: {bool(getattr(args, 'use_ra_fusion', 0))}\n")
+        if getattr(args, "use_ra_fusion", 0):
+            ra_model = accelerator.unwrap_model(transformer)
+            f.write(f"RA Fusion scale: {ra_model.ra_fusion_scale}\n")
+            f.write(f"RA Fusion stabilize: {ra_model.config.ra_fusion_stabilize}\n")
         f.write(f"RSS enabled: {use_rss}\n")
         if use_rss:
             f.write(f"RSS weight: {rss_weight}\n")
@@ -852,6 +866,9 @@ def parse_args(input_args=None):
     parser.add_argument("--ra_fusion_num_res_blocks", type=int, default=2)
     parser.add_argument("--ra_fusion_kernel_size", type=int, default=3)
     parser.add_argument("--ra_fusion_learning_rate", type=float, default=1e-5)
+    parser.add_argument("--ra_fusion_scale", type=float, default=1.0)
+    parser.add_argument("--ra_fusion_stabilize", type=int, default=0)
+    parser.add_argument("--ra_diagnostics_steps", type=int, default=100)
     parser.add_argument("--ra_fusion_model_path", type=str, default=None)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
@@ -1059,8 +1076,8 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_negative_prompt",
         type=str,
-        default="dotted, noise, blur, lowres, smooth",
-        help="验证时的 negative prompt (默认 'dotted, noise, blur, lowres, smooth')",
+        default=None,
+        help="验证时的 negative prompt；默认不使用.",
     )
     parser.add_argument(
         "--max_sequence_length",
@@ -1218,10 +1235,13 @@ def parse_args(input_args=None):
         help="按 step 验证的 RSS sigma 阈值, 范围 [0, 1).",
     )
 
-    if input_args is not None:
-        args = parser.parse_args(input_args)
-    else:
-        args = parser.parse_args()
+    raw_args = list(input_args) if input_args is not None else sys.argv[1:]
+    args = parser.parse_args(input_args)
+    args._explicit_cli_args = {
+        token[2:].split("=", 1)[0].replace("-", "_")
+        for token in raw_args
+        if token.startswith("--")
+    }
 
     if args.dataset_name is not None and args.train_data_dir is not None:
         raise ValueError("Specify only one of `--dataset_name` or `--train_data_dir`")
@@ -1650,6 +1670,8 @@ def main(args):
         with open(args.config, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
         for key, value in cfg.items():
+            if key in args._explicit_cli_args:
+                continue
             if hasattr(args, key):
                 current = getattr(args, key)
                 # YAML 中 None 表示"未设置", 不覆盖
@@ -1809,6 +1831,8 @@ def main(args):
             ra_fusion_hidden_dim=args.ra_fusion_hidden_dim,
             ra_fusion_num_res_blocks=args.ra_fusion_num_res_blocks,
             ra_fusion_kernel_size=args.ra_fusion_kernel_size,
+            ra_fusion_scale=args.ra_fusion_scale,
+            ra_fusion_stabilize=bool(args.ra_fusion_stabilize),
             low_cpu_mem_usage=False,
         )
     transformer = transformer_cls.from_pretrained(
@@ -1959,6 +1983,7 @@ def main(args):
         logger.info(
             f"[RA Fusion] blocks={list(transformer.ra_fusion_indices)}, "
             f"hidden_dim={args.ra_fusion_hidden_dim}, "
+            f"scale={transformer.ra_fusion_scale}, stabilize={bool(args.ra_fusion_stabilize)}, "
             f"可训练参数={sum(p.numel() for p in ra_fusion_layers):,}"
         )
 
@@ -2138,7 +2163,9 @@ def main(args):
     if args.run_validation:
         logger.info(
             f"[验证] 下半段 run_step_validation 已启用: 每 {args.run_validation_steps} step, "
-            f"每 weather 采 {args.validation_num_samples} 张, 算 PSNR/SSIM 写 metrics.txt"
+            f"每 weather 采 {args.validation_num_samples} 张, 算 PSNR/SSIM 写 metrics.txt; "
+            f"strength={args.validation_strength}, guidance={args.validation_guidance_scale}, "
+            f"negative_prompt={args.validation_negative_prompt!r}"
         )
     else:
         logger.info("[验证] 下半段 run_step_validation 未启用 (run_validation=false)")
@@ -2468,15 +2495,33 @@ def main(args):
                 transformer_extra_kwargs = {}
                 if args.use_ra_fusion:
                     transformer_extra_kwargs["restoration_cond"] = restoration_condition
-                model_pred = transformer(
-                    hidden_states=noisy_model_input,
-                    timestep=timesteps,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    block_controlnet_hidden_states=control_block_res_samples,
-                    return_dict=False,
-                    **transformer_extra_kwargs,
-                )[0]
+                ra_diagnostics_model = unwrap_model(transformer) if args.use_ra_fusion else None
+                collect_ra_diagnostics = bool(
+                    ra_diagnostics_model is not None
+                    and args.ra_diagnostics_steps > 0
+                    and (global_step + 1) % args.ra_diagnostics_steps == 0
+                    and accelerator.is_main_process
+                )
+                if collect_ra_diagnostics:
+                    ra_diagnostics_model.enable_ra_diagnostics(True)
+                try:
+                    model_pred = transformer(
+                        hidden_states=noisy_model_input,
+                        timestep=timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_prompt_embeds,
+                        block_controlnet_hidden_states=control_block_res_samples,
+                        return_dict=False,
+                        **transformer_extra_kwargs,
+                    )[0]
+                finally:
+                    if collect_ra_diagnostics:
+                        ra_diagnostics_model.enable_ra_diagnostics(False)
+                ra_diagnostics = (
+                    ra_diagnostics_model.get_last_ra_diagnostics()
+                    if collect_ra_diagnostics
+                    else None
+                )
 
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
@@ -2672,6 +2717,25 @@ def main(args):
                 logs[f"{group.get('name', 'group')}_lr"] = group_lr
             # 拆解各项, 便于 tensorboard 对照
             logs["loss_mse"] = loss_mse.detach().item()
+            if ra_diagnostics is not None:
+                output_stats = ra_diagnostics["output"]
+                logs["ra/output_rms"] = output_stats["rms"]
+                logs["ra/output_abs_max"] = output_stats["abs_max"]
+                summaries = []
+                for block_stats in ra_diagnostics["blocks"]:
+                    index = block_stats["block"]
+                    delta_rms = block_stats["delta"]["rms"]
+                    main_rms = block_stats["main"]["rms"]
+                    ratio = delta_rms / max(main_rms, 1e-8)
+                    logs[f"ra/block_{index}_delta_rms"] = delta_rms
+                    logs[f"ra/block_{index}_delta_main_ratio"] = ratio
+                    summaries.append(f"b{index}:delta/main={ratio:.3e}")
+                logger.info(
+                    f"[RA diagnostics][Step {global_step}] scale={ra_diagnostics['scale']}, "
+                    + ", ".join(summaries)
+                    + f", output_rms={output_stats['rms']:.3e}, "
+                    f"output_max={output_stats['abs_max']:.3e}"
+                )
             if args.pixel_charbonnier_weight > 0.0:
                 logs["loss_pixel"] = loss_pixel.detach().item()
             if args.edge_loss_weight > 0.0:

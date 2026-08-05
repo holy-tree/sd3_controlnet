@@ -133,6 +133,9 @@ ra_fusion_hidden_dim: 256
 ra_fusion_num_res_blocks: 2
 ra_fusion_kernel_size: 3
 ra_fusion_learning_rate: 1.0e-5
+ra_fusion_scale: 0.1                    # 限制 RA 增量，避免在多步采样中压过冻结主干
+ra_fusion_stabilize: 1                  # 对递归 condition、timestep 和输出做无参数归一化
+ra_diagnostics_steps: 100               # 定期记录每个 RA block 的 delta/main RMS 比值
 ra_fusion_model_path: null              # 仅继续已有 RA 权重时填写；新训练保持 null
 
 # T5 text encoder 最大序列长度

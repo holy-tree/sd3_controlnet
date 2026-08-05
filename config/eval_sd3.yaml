@@ -17,6 +17,8 @@ load_transformer_lora: false            # 第一阶段单独评估 RA，不混�
 # RA Fusion 训练完成后改为 true；null 时自动查找 checkpoint 同级 ra_fusion/。
 use_ra_fusion: false
 ra_fusion_path: null
+# 可覆盖 checkpoint 保存的 RA 输出尺度。排查色块时依次测试 0.0 / 0.01 / 0.1 / 1.0。
+ra_fusion_scale: null
 
 # 评估结果输出目录
 output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3"
