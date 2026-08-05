@@ -353,7 +353,9 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             raise ValueError("RA Fusion is enabled but restoration_cond was not provided")
         if restoration_cond is not None:
             restoration_cond = self._align_condition_batch(restoration_cond, hidden_states.shape[0])
-            restoration_cond = restoration_cond.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            # RA condition 路径必须全程 FP32，否则主干 BF16 autocast 会在 pos_embed/Linear 中
+            # 引入累计舍入误差，导致 ra_condition_proj 输出 NaN。
+            restoration_cond = restoration_cond.to(device=hidden_states.device, dtype=torch.float32)
 
         hidden_states = self.pos_embed(hidden_states)
         temb = self.time_text_embed(timestep, pooled_projections)
