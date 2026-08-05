@@ -64,6 +64,12 @@ from diffusers.utils import check_min_version, is_wandb_available, make_image_gr
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
 
+try:
+    from peft import LoraConfig
+    _PEFT_AVAILABLE = True
+except ImportError:
+    _PEFT_AVAILABLE = False
+
 
 if is_wandb_available():
     import wandb
@@ -147,13 +153,15 @@ def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_
     return latents, raw_sigmas.tolist()
 
 
-def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_validation=False):
+def log_validation(controlnet, transformer, args, accelerator, weight_dtype, step, is_final_validation=False):
     logger.info("Running validation... ")
 
     if not is_final_validation:
         controlnet = accelerator.unwrap_model(controlnet)
+        transformer = accelerator.unwrap_model(transformer)
     else:
         controlnet = SD3ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
+        transformer = accelerator.unwrap_model(transformer)
 
     pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -205,6 +213,7 @@ def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_v
     pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
         args.pretrained_model_name_or_path,
         controlnet=controlnet,
+        transformer=transformer,
         safety_checker=None,
         text_encoder=None,
         text_encoder_2=None,
@@ -213,7 +222,7 @@ def log_validation(controlnet, args, accelerator, weight_dtype, step, is_final_v
         variant=args.variant,
         torch_dtype=weight_dtype,
     )
-    pipeline.enable_model_cpu_offload(device=accelerator.device.type)
+    pipeline = pipeline.to(accelerator.device)
     pipeline.set_progress_bar_config(disable=True)
 
     image_logs = []
@@ -316,7 +325,7 @@ def load_text_encoders(class_one, class_two, class_three):
 @torch.no_grad()
 def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_three,
                         tokenizer_one, tokenizer_two, tokenizer_three,
-                        controlnet, accelerator, weight_dtype, args, step, train_dataset):
+                        controlnet, transformer, accelerator, weight_dtype, args, step, train_dataset):
     """
     每个 --run_validation_steps step 触发:
       1. 对 args.weather_types 中每个天气, 各抽 --validation_num_samples 个 GT/LQ 对
@@ -352,6 +361,7 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
         tokenizer_2=tokenizer_two,
         tokenizer_3=tokenizer_three,
         controlnet=accelerator.unwrap_model(controlnet),
+        transformer=accelerator.unwrap_model(transformer),
         safety_checker=None,
         revision=args.revision,
         variant=args.variant,
@@ -419,6 +429,9 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
             # image-conditioned init: 把 LQ 同时作为 image+control_image 传入,
             #   pipeline 内部 encode LQ → 加 noise → 从对应 timestep 起步去噪,
             #   显著提升 PSNR 与纹理位置一致性 (避免 SD3 自由生成重建纹理).
+            # 每个样本跨 checkpoint 使用同一噪声，保证 PSNR 曲线可比较。
+            # strength=1.0 时同样必须传 generator，否则每次验证都会换随机起点。
+            generator = torch.Generator(device=accelerator.device).manual_seed(weather_seed + sample_idx)
             pipeline_kwargs = dict(
                 prompt=prompt,
                 control_image=lq_pil,
@@ -427,9 +440,9 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 negative_prompt=args.validation_negative_prompt,
                 height=args.resolution,
                 width=args.resolution,
+                generator=generator,
             )
             if getattr(args, "validation_use_image", 1) and getattr(args, "validation_strength", 1.0) < 1.0:
-                generator = torch.Generator(device=accelerator.device).manual_seed(weather_seed + sample_idx)
                 latents, custom_sigmas = prepare_image_conditioned_latents(
                     pipeline, [lq_pil], args.validation_strength,
                     args.validation_inference_steps, accelerator.device, weight_dtype,
@@ -437,7 +450,6 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 )
                 pipeline_kwargs["latents"] = latents
                 pipeline_kwargs["sigmas"] = custom_sigmas
-                pipeline_kwargs["generator"] = generator
 
             with torch.autocast("cuda", enabled=autocast_enabled, dtype=weight_dtype):
                 pred_pil = pipeline(**pipeline_kwargs).images[0]
@@ -741,6 +753,47 @@ def parse_args(input_args=None):
         default=1,
         help="Flag indicating if we are preconditioning the model outputs or not as done in EDM. This affects how "
         "model `target` is calculated.",
+    )
+    # ==================== Transformer LoRA (SD3 主干) ====================
+    parser.add_argument(
+        "--use_transformer_lora",
+        type=int,
+        default=0,
+        help="是否对 SD3 Transformer Attention 启用 LoRA 微调. 1=启用, 0=关闭.",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=16,
+        help="LoRA rank.",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="LoRA alpha. 习惯上等于 rank, 或 rank*2.",
+    )
+    parser.add_argument(
+        "--lora_dropout",
+        type=float,
+        default=0.0,
+        help="LoRA dropout.",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        nargs="+",
+        default=["to_q", "to_k", "to_v", "to_out.0"],
+        help="要插入 LoRA 的 attention 子模块名称 (按字符串匹配). "
+             "SD3 JointTransformerBlock 含 attn.to_q / to_k / to_v / to_out.0 "
+             "(后者是 Attention.to_out[0]). 若需文本分支也可加 "
+             "'add_q_proj', 'add_k_proj', 'add_v_proj', 'to_add_out'.",
+    )
+    parser.add_argument(
+        "--lora_learning_rate",
+        type=float,
+        default=1e-6,
+        help="LoRA 参数使用的学习率. 强烈建议显著低于 ControlNet 学习率, 例如 1e-6~5e-6.",
     )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
@@ -1735,37 +1788,99 @@ def main(args):
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        # create custom saving & loading hooks so that `accelerate.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                i = len(weights) - 1
-
-                while len(weights) > 0:
+                while len(models) > 0:
                     weights.pop()
-                    model = models[i]
-
-                    sub_dir = "controlnet"
-                    model.save_pretrained(os.path.join(output_dir, sub_dir))
-
-                    i -= 1
+                    model = unwrap_model(models.pop())
+                    if isinstance(model, SD3ControlNetModel):
+                        model.save_pretrained(os.path.join(output_dir, "controlnet"))
+                    elif isinstance(model, SD3Transformer2DModel) and args.use_transformer_lora:
+                        model.save_lora_adapter(os.path.join(output_dir, "transformer_lora"))
 
         def load_model_hook(models, input_dir):
             while len(models) > 0:
-                # pop models so that they are not loaded again
-                model = models.pop()
+                model = unwrap_model(models.pop())
+                if isinstance(model, SD3ControlNetModel):
+                    load_model = SD3ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
+                elif isinstance(model, SD3Transformer2DModel) and args.use_transformer_lora:
+                    lora_path = os.path.join(
+                        input_dir, "transformer_lora", "pytorch_lora_weights.safetensors"
+                    )
+                    if not os.path.isfile(lora_path):
+                        raise FileNotFoundError(f"恢复训练时未找到 Transformer LoRA: {lora_path}")
+                    from peft import set_peft_model_state_dict
+                    from safetensors.torch import load_file as safe_load_file
 
-                # load diffusers style into model
-                load_model = SD3ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
-                model.register_to_config(**load_model.config)
-
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                    lora_state = safe_load_file(lora_path)
+                    incompatible = set_peft_model_state_dict(
+                        model, lora_state, adapter_name="default"
+                    )
+                    logger.info(
+                        f"[LoRA resume] 从 {lora_path} 恢复 {len(lora_state)} 个 LoRA 参数; "
+                        f"missing={len(incompatible.missing_keys)}, "
+                        f"unexpected={len(incompatible.unexpected_keys)}"
+                    )
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
     if args.gradient_checkpointing:
         controlnet.enable_gradient_checkpointing()
+
+    # ============================================================
+    # 可选: 给 SD3 Transformer Attention 加 LoRA
+    #  - 仅在 use_transformer_lora=1 时启用, 需 peft
+    #  - 冻结 transformer 全部原参数, 只训练 LoRA, 配合 ControlNet 联合训练
+    #  - LoRA 参数会以 "lora_learning_rate" 单独学习率加入 optimizer
+    # ============================================================
+    transformer_lora_layers = None
+    if args.use_transformer_lora:
+        if not _PEFT_AVAILABLE:
+            raise ImportError(
+                "use_transformer_lora=1 但未安装 peft. 请运行: pip install peft"
+            )
+        # 先确保 transformer 冻结 (后续 LoRA 注入只增参数, 不解冻原有权重)
+        transformer.requires_grad_(False)
+        # 标记 LoRA 注入的目标模块
+        target_modules = list(args.lora_target_modules)
+        # diffusers SD3 Attention 的 self-attn 与 cross-attn 都使用 JointAttnProcessor2_0,
+        # 其中 self-attn 用 attn.to_q/to_k/to_v/to_out[0],
+        #   context 分支使用 add_q_proj / add_k_proj / add_v_proj / to_add_out.
+        # 默认 target_modules 已涵盖 self-attn.
+        lora_config = LoraConfig(
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            init_lora_weights="gaussian",
+        )
+        transformer.add_adapter(lora_config)
+        transformer_lora_layers = [
+            p for n, p in transformer.named_parameters() if "lora_" in n
+        ]
+        if not transformer_lora_layers:
+            raise ValueError(
+                f"LoRA 未匹配任何 Transformer 模块: {target_modules}. "
+                "请检查 lora_target_modules 与当前 diffusers 版本的模块命名."
+            )
+        # 显式冻结非 LoRA 参数, 防止 LoRA 误触底层
+        for n, p in transformer.named_parameters():
+            if "lora_" not in n:
+                p.requires_grad_(False)
+        n_lora = sum(p.numel() for p in transformer_lora_layers)
+        logger.info(
+            "[LoRA] 已为 SD3 Transformer Attention 注入 LoRA "
+            f"(rank={args.lora_rank}, alpha={args.lora_alpha}, "
+            f"target_modules={target_modules}), 可训练 LoRA 参数: {n_lora:,}"
+        )
+        if args.gradient_checkpointing:
+            transformer.enable_gradient_checkpointing()
+        transformer.train()
 
     # Check that all trainable models are in full precision
     low_precision_error_string = (
@@ -1802,10 +1917,31 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = controlnet.parameters()
+    # ControlNet 参数 + (可选) Transformer LoRA 参数联合训练
+    params_groups = [
+        {
+            "params": controlnet.parameters(),
+            "lr": args.learning_rate,
+        }
+    ]
+    if transformer_lora_layers is not None:
+        params_groups.append(
+            {
+                "params": transformer_lora_layers,
+                "lr": args.lora_learning_rate,
+            }
+        )
+        logger.info(
+            f"[Optimizer] ControlNet LR={args.learning_rate}, "
+            f"Transformer LoRA LR={args.lora_learning_rate}"
+        )
+    else:
+        logger.info(
+            f"[Optimizer] 仅 ControlNet 可训练, LR={args.learning_rate}"
+        )
+
     optimizer = optimizer_class(
-        params_to_optimize,
-        lr=args.learning_rate,
+        params_groups,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
@@ -1825,6 +1961,10 @@ def main(args):
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
+    # 冻结主干保持低精度，但可训练 LoRA 参数维持 fp32 以保证优化稳定。
+    if transformer_lora_layers is not None:
+        for param in transformer_lora_layers:
+            param.data = param.data.float()
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
     text_encoder_three.to(accelerator.device, dtype=weight_dtype)
@@ -1925,9 +2065,14 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        controlnet, optimizer, train_dataloader, lr_scheduler
-    )
+    if transformer_lora_layers is not None:
+        controlnet, transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            controlnet, transformer, optimizer, train_dataloader, lr_scheduler
+        )
+    else:
+        controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            controlnet, optimizer, train_dataloader, lr_scheduler
+        )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -2100,7 +2245,8 @@ def main(args):
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(controlnet):
+            models_to_accumulate = (controlnet, transformer) if transformer_lora_layers is not None else (controlnet,)
+            with accelerator.accumulate(*models_to_accumulate):
                 # Convert images to latent space
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -2260,7 +2406,9 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = controlnet.parameters()
+                    params_to_clip = list(controlnet.parameters())
+                    if transformer_lora_layers is not None:
+                        params_to_clip.extend(p for p in transformer.parameters() if p.requires_grad)
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
@@ -2300,13 +2448,21 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
                     if args.validation_prompt is not None and global_step % args.validation_steps == 0:
-                        image_logs = log_validation(
-                            controlnet,
-                            args,
-                            accelerator,
-                            weight_dtype,
-                            global_step,
-                        )
+                        controlnet.eval()
+                        transformer.eval()
+                        try:
+                            image_logs = log_validation(
+                                controlnet,
+                                transformer,
+                                args,
+                                accelerator,
+                                weight_dtype,
+                                global_step,
+                            )
+                        finally:
+                            controlnet.train()
+                            if args.use_transformer_lora:
+                                transformer.train()
 
                     # ===== 按 step 评估 PSNR/SSIM (与现有 log_validation 并行, 不互斥) =====
                     # 训练时 n=4 验证只是"相对参考", 不可作为 best 依据.
@@ -2316,12 +2472,13 @@ def main(args):
                             and global_step > 0
                             and global_step % args.run_validation_steps == 0):
                         controlnet.eval()
+                        transformer.eval()
                         try:
                             run_step_validation(
                                 vae,
                                 text_encoder_one, text_encoder_two, text_encoder_three,
                                 tokenizer_one, tokenizer_two, tokenizer_three,
-                                controlnet,
+                                controlnet, transformer,
                                 accelerator, weight_dtype, args,
                                 global_step, train_dataset,
                             )
@@ -2329,6 +2486,8 @@ def main(args):
                             logger.warning(f"[Step {global_step}] run_step_validation 失败: {e}")
                         finally:
                             controlnet.train()
+                            if args.use_transformer_lora:
+                                transformer.train()
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             # 拆解各项, 便于 tensorboard 对照
@@ -2350,12 +2509,16 @@ def main(args):
     if accelerator.is_main_process:
         controlnet = unwrap_model(controlnet)
         controlnet.save_pretrained(args.output_dir)
+        transformer = unwrap_model(transformer)
+        if args.use_transformer_lora:
+            transformer.save_lora_adapter(os.path.join(args.output_dir, "transformer_lora"))
 
         # Run a final round of validation.
         image_logs = None
         if args.validation_prompt is not None:
             image_logs = log_validation(
                 controlnet=None,
+                transformer=transformer,
                 args=args,
                 accelerator=accelerator,
                 weight_dtype=weight_dtype,

@@ -211,6 +211,35 @@ def build_pipeline(args_config: dict, device, dtype):
         torch_dtype=dtype,
     )
 
+    # 显式配置优先；未配置时自动查找 checkpoint/controlnet 的同级目录，
+    # 或最终输出目录下的 transformer_lora。
+    lora_path = args_config.get("transformer_lora_path")
+    if lora_path:
+        lora_path = Path(lora_path)
+        if not lora_path.is_absolute():
+            lora_path = Path.cwd() / lora_path
+    else:
+        cn_dir = Path(cn_path)
+        candidates = [cn_dir / "transformer_lora", cn_dir.parent / "transformer_lora"]
+        lora_path = next(
+            (p for p in candidates if (p / "pytorch_lora_weights.safetensors").is_file()),
+            None,
+        )
+
+    if lora_path is not None:
+        weight_path = lora_path / "pytorch_lora_weights.safetensors"
+        if not weight_path.is_file():
+            raise FileNotFoundError(f"未找到 Transformer LoRA 权重: {weight_path}")
+        print(f"[eval] 加载 Transformer LoRA: {lora_path}")
+        pipeline.transformer.load_lora_adapter(
+            str(lora_path),
+            prefix=None,
+            weight_name="pytorch_lora_weights.safetensors",
+            use_safetensors=True,
+        )
+    else:
+        print("[eval] 未发现 Transformer LoRA，使用基础 SD3 Transformer")
+
     try:
         pipeline = pipeline.to(device)
     except (NotImplementedError, TypeError) as e:

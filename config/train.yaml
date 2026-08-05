@@ -67,13 +67,13 @@ max_train_samples: null
 
 # ==================== 分辨率与 batch ====================
 resolution: 512
-train_batch_size: 1
-gradient_accumulation_steps: 4
+train_batch_size: 8
+gradient_accumulation_steps: 1
 dataloader_num_workers: 0
 
 # ==================== 训练步数 ====================
 num_train_epochs: 1
-max_train_steps: 20000
+max_train_steps: 120000
 checkpointing_steps: 1000
 # 最多保存几个 checkpoint (旧的会被自动删除以节省磁盘)
 checkpoints_total_limit: 3
@@ -108,6 +108,20 @@ mode_scale: 1.29
 # EDM preconditioning: 1=启用 (推荐), 0=关闭
 precondition_outputs: 1
 
+# ==================== Transformer LoRA (SD3 主干) ====================
+# 在 SD3 Transformer Attention 上插入 LoRA, 配合 ControlNet 联合训练.
+# 不需要 LoRA 时把 use_transformer_lora 置 0, 训练脚本会跳过所有相关逻辑.
+use_transformer_lora: 1
+lora_rank: 16
+lora_alpha: 16
+lora_dropout: 0.0
+# 目标模块: SD3 JointTransformerBlock 的 self-attn 含 attn.to_q / to_k / to_v / to_out.0
+# (Attention.to_out 是 ModuleList, to_out.0 为 Linear). 也可追加:
+#   "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out"  (文本 context 分支)
+lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
+# LoRA 学习率. 强烈建议远低于 ControlNet 的 learning_rate, 例如 1e-6 ~ 5e-6.
+lora_learning_rate: 1.0e-6
+
 # T5 text encoder 最大序列长度
 max_sequence_length: 77
 
@@ -120,7 +134,7 @@ max_sequence_length: 77
 #
 # 三者均按 (1 - sigma) 在样本维加权, 自动仅在低噪声 timestep 起作用.
 # VAE.decode 由 --lpips_interval 控制频率.
-pixel_charbonnier_weight: 0.1
+pixel_charbonnier_weight: 0.3
 edge_loss_weight: 0.02
 lpips_weight: 0.01                     # PSNR 敏感任务建议 ≤0.02
 lpips_interval: 4                      # 每 N 步算一次图像域损失, 其余步置 0
@@ -167,7 +181,7 @@ validation_inference_steps: 30          # pipeline 推理步数
 validation_guidance_scale: 1.5          # 恢复任务使用低 CFG, 减少生成先验干扰
 validation_negative_prompt: null
 validation_use_image: 1                 # 使用 LQ latent 作为去噪起点
-validation_strength: 0.4                # 有效起始噪声强度, 建议 0.2~0.6
+validation_strength: 1.0                # 有效起始噪声强度, 建议 0.2~0.6
 
 # ==================== Hub 推送 (HF) ====================
 push_to_hub: false
