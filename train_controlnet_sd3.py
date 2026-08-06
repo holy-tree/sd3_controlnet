@@ -1144,10 +1144,11 @@ def parse_args(input_args=None):
     )
 
 # ============================================================
-# RGB 图像域损失权重 (替换旧 latent_l1 / freq)
+# Latent/RGB reconstruction loss weights
 # pred_x0 由 raw velocity 重建，因此这些项可直接反传到 RA/LoRA/ControlNet。
 #
 #   loss = loss_mse (flow matching)
+#        + latent_l1_weight          * loss_latent  # latent x0 L1 reconstruction
 #        + pixel_charbonnier_weight * loss_pixel   # RGB Charbonnier 像素重建
 #        + edge_loss_weight         * loss_edge    # Sobel 边缘 L1 (RGB 域)
 #        + lpips_weight             * loss_lpips   # 感知损失 (需 VAE.decode, 较重)
@@ -1160,7 +1161,7 @@ def parse_args(input_args=None):
             "--latent_l1_weight",
             type=float,
             default=0.0,
-            help="[deprecated] 旧 latent L1 重建权重, 已被 pixel_charbonnier_weight 取代, 保留仅为兼容旧 yaml",
+            help="Latent x0 L1 重建权重；使用 (1-sigma) 时序加权，0=关闭.",
 )
     parser.add_argument(
             "--freq_loss_weight",
@@ -2717,6 +2718,7 @@ def main(args):
                 # ============================================================
                 pred_x0 = noisy_model_input.float() - sigmas.float() * model_pred.float()
 
+                loss_l1 = torch.tensor(0.0, device=model_pred.device)
                 loss_pixel = torch.tensor(0.0, device=model_pred.device)
                 loss_edge = torch.tensor(0.0, device=model_pred.device)
                 loss_lpips = torch.tensor(0.0, device=model_pred.device)
@@ -2724,6 +2726,18 @@ def main(args):
                 # 时序权重: sigma=1 (纯噪声) → 0, sigma=0 (干净) → 1 (per-sample, 不参与梯度)
                 img_weight = (1.0 - sigmas.flatten().clamp(min=0.0, max=1.0)) \
                                  .view(-1, 1, 1, 1).detach()
+
+                if args.latent_l1_weight > 0.0:
+                    latent_l1_per_sample = F.l1_loss(
+                        pred_x0,
+                        model_input.float(),
+                        reduction="none",
+                    ).mean(dim=(1, 2, 3))
+                    loss_l1 = (
+                        latent_l1_per_sample * img_weight.flatten()
+                    ).mean()
+                    loss = loss + args.latent_l1_weight * loss_l1
+                    raise_if_nonfinite("latent x0 L1 loss", loss_l1, global_step + 1)
 
                 should_compute_img = (
                     global_step >= args.image_loss_start_step
@@ -2789,8 +2803,7 @@ def main(args):
                         logger.exception("[图像域损失] 非 OOM 异常，终止训练以避免静默失效")
                         raise
 
-                # 兼容旧日志字段: 旧 latent_l1/freq 现在默认 0, 不再写日志
-                loss_l1 = torch.tensor(0.0, device=model_pred.device)
+                # Deprecated frequency loss remains disabled.
                 loss_freq = torch.tensor(0.0, device=model_pred.device)
 
                 accelerator.backward(loss)
@@ -2906,6 +2919,8 @@ def main(args):
                 logs[f"{group.get('name', 'group')}_lr"] = group_lr
             # 拆解各项, 便于 tensorboard 对照
             logs["loss_mse"] = loss_mse.detach().item()
+            if args.latent_l1_weight > 0.0:
+                logs["loss_latent_l1"] = loss_l1.detach().item()
             if ra_diagnostics is not None:
                 output_stats = ra_diagnostics["output"]
                 logs["ra/output_rms"] = output_stats["rms"]

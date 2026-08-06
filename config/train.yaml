@@ -3,6 +3,7 @@
 # ============================================================
 # 启动:
 #   accelerate launch train_controlnet_sd3.py --config config/train.yaml
+#   source /root/controlnet2/.venv/bin/activate
 #
 # 优先级: CLI 参数 > 本 YAML > argparse 默认值
 #   - YAML 中值为 null 的字段会被跳过 (视为"未设置")
@@ -16,7 +17,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet/checkpoint-92000/controlnet"
+controlnet_model_name_or_path: " /root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-20000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
@@ -33,7 +34,7 @@ cache_dir: null
 #   null      = 不接续, 从头训
 #   "latest"  = 自动选 output_dir 里最新的 checkpoint
 #   "/path/to/checkpoint-N" = 指定具体 checkpoint
-resume_from_checkpoint: null
+resume_from_checkpoint:  "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000"
 
 # ==================== 数据集 (源项目布局, 与 --dataset_root 配合) ====================
 # 数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/
@@ -144,13 +145,15 @@ max_sequence_length: 77
 # 重建/感知/边缘损失权重 (RGB 域, 替换旧 latent L1 / 频域 L1)
 # pred_x0 由 raw velocity 重建，因此不依赖 precondition_outputs。
 #   loss = loss_mse (flow matching)
+#        + latent_l1_weight          * loss_latent  # latent x0 L1 reconstruction
 #        + pixel_charbonnier_weight * loss_pixel   # RGB Charbonnier 像素重建
 #        + edge_loss_weight         * loss_edge    # Sobel 边缘 L1 (RGB 域)
 #        + lpips_weight             * loss_lpips   # 感知损失 (需 VAE.decode, 较重)
 #
-# 三者均按 (1 - sigma) 在样本维加权, 自动仅在低噪声 timestep 起作用.
+# 各重建损失均按 (1 - sigma) 在样本维加权, 自动侧重低噪声 timestep.
 # VAE.decode 由 --lpips_interval 控制频率.
-pixel_charbonnier_weight: 0.0            # RA 稳定后再逐项启用图像域损失
+latent_l1_weight: 0.1                   # 第二阶段建议从 0.05 开始
+pixel_charbonnier_weight: 0.05            # RA 稳定后再逐项启用图像域损失
 edge_loss_weight: 0.0
 lpips_weight: 0.0                       # PSNR 敏感任务建议 ≤0.02
 lpips_interval: 4                      # 每 N 步算一次图像域损失, 其余步置 0
