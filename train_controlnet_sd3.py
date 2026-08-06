@@ -2483,8 +2483,19 @@ def main(args):
             resume_step = (
                 global_step % num_update_steps_per_epoch
             ) * args.gradient_accumulation_steps
+            # Use Accelerate's skip_first_batches so the prepared dataloader jumps
+            # over already-trained microbatches without materializing each sample.
+            if resume_step > 0:
+                train_dataloader = accelerator.skip_first_batches(
+                    train_dataloader, resume_step
+                )
+                logger.info(
+                    f"[Resume] skip_first_batches={resume_step} at first epoch"
+                )
+                first_epoch_microbatches = 0
     else:
         initial_global_step = 0
+        first_epoch_microbatches = None
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -2563,9 +2574,14 @@ def main(args):
 
     image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
-        for step, batch in enumerate(train_dataloader):
-            if epoch == first_epoch and step < resume_step:
-                continue
+        epoch_train_dataloader = (
+            train_dataloader
+            if first_epoch_microbatches is None or epoch != first_epoch
+            else accelerator.skip_first_batches(
+                train_dataloader, first_epoch_microbatches
+            )
+        )
+        for step, batch in enumerate(epoch_train_dataloader):
             models_to_accumulate = []
             if args.train_controlnet:
                 models_to_accumulate.append(controlnet)
