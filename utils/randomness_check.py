@@ -80,9 +80,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_pipeline(args_config: dict, dtype, device, ra_scale_override):
+def setup_pipeline(args_config: dict, dtype, device, ra_scale_override, use_ra_fusion: bool):
     args_config = dict(args_config)
-    args_config["use_ra_fusion"] = args.use_ra_fusion
+    args_config["use_ra_fusion"] = bool(use_ra_fusion)
     args_config["ra_fusion_scale"] = ra_scale_override
     args_config["mixed_precision"] = args_config.get("mixed_precision", "bf16")
     pipeline = build_pipeline(args_config, device, dtype)
@@ -90,13 +90,13 @@ def setup_pipeline(args_config: dict, dtype, device, ra_scale_override):
 
 
 def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, gt_tensors,
-                          seed: int) -> torch.Tensor:
+                          weather: str, seed: int) -> torch.Tensor:
     """Run the pipeline once for every LQ image using the supplied seed.
 
     Returns a stacked ``(N, 3, H, W)`` tensor of [0, 1] predictions on GPU.
     """
     n = len(lq_pils)
-    prompt = maybe_make_prompt(args_config.get("weather", ""), args_config)
+    prompt = maybe_make_prompt(weather, args_config)
 
     generator = torch.Generator(device=device).manual_seed(seed)
     preds: List[torch.Tensor] = []
@@ -209,7 +209,9 @@ def main() -> None:
         }
 
     # Build pipeline
-    pipeline = setup_pipeline(args_config, weight_dtype, device, args.ra_fusion_scale)
+    pipeline = setup_pipeline(
+        args_config, weight_dtype, device, args.ra_fusion_scale, args.use_ra_fusion
+    )
     print(f"[random] Pipeline loaded. RA scale = {args.ra_fusion_scale}")
 
     # LPIPS backbone for perceptual diversity checks
@@ -233,7 +235,8 @@ def main() -> None:
         for seed in args.seeds:
             t0 = time.time()
             preds = run_pipeline_for_seed(
-                pipeline, args_config, device, weight_dtype, lq_pils, gt_batch, seed
+                pipeline, args_config, device, weight_dtype, lq_pils, gt_batch,
+                weather, seed,
             )
             psnrs = psnr_batch(preds, gt_batch)
             ssims = ssim_batch(preds, gt_batch)
