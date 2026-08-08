@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_inference_steps", type=int, default=30,
                         help="推理步数，默认与评估一致")
     parser.add_argument("--save_predictions", action="store_true",
-                        help="是否保存每个 seed 的预测 PNG（默认否，节省磁盘）")
+                        help="按 LQ 样本分组保存 LQ、GT 和所有 seed 的预测 PNG")
     parser.add_argument("--use_prompt", action="store_true",
                         help="启用 weather-aware prompt；默认 False")
     parser.add_argument("--controlnet_model_path", type=str, default=None,
@@ -99,6 +99,11 @@ def setup_pipeline(args_config: dict, dtype, device, ra_scale_override, use_ra_f
     args_config["mixed_precision"] = args_config.get("mixed_precision", "bf16")
     pipeline = build_pipeline(args_config, device, dtype)
     return pipeline
+
+
+def tensor_to_pil(image: torch.Tensor) -> Image.Image:
+    array = (image.detach().float().cpu().clamp(0, 1).numpy() * 255).round().astype("uint8")
+    return Image.fromarray(array.transpose(1, 2, 0))
 
 
 def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, gt_tensors,
@@ -201,8 +206,9 @@ def main() -> None:
 
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
-    per_seed_root = output_root / "per_seed"
-    per_seed_root.mkdir(parents=True, exist_ok=True)
+    predictions_root = output_root / "predictions"
+    if args.save_predictions:
+        predictions_root.mkdir(parents=True, exist_ok=True)
 
     # Build dataset and group by weather
     samples = build_dataset_for_eval(args_config)
@@ -280,6 +286,16 @@ def main() -> None:
         gt_batch = data["gt_batch"]
         lq_batch = data["lq_batch"]
 
+        group_dirs: List[Path] = []
+        if args.save_predictions:
+            for image_idx, (gt_path, lq_path) in enumerate(selected_pairs[sub_name]):
+                sample_name = Path(lq_path).stem
+                group_dir = predictions_root / sub_name / f"group_{image_idx:04d}_{sample_name}"
+                group_dir.mkdir(parents=True, exist_ok=True)
+                tensor_to_pil(lq_batch[image_idx]).save(group_dir / "lq.png")
+                tensor_to_pil(gt_batch[image_idx]).save(group_dir / "gt.png")
+                group_dirs.append(group_dir)
+
         seed_records: List[Dict] = []
         for seed in args.seeds:
             t0 = time.time()
@@ -345,13 +361,9 @@ def main() -> None:
                 f"divLPIPS={mean_div:.3f} ({elapsed:.1f}s)"
             )
 
-            # Persist first prediction image for the first 3 seeds as visual anchor
-            if args.save_predictions and seed < 3:
-                out_dir = per_seed_root / sub_name / f"seed_{seed:03d}"
-                out_dir.mkdir(parents=True, exist_ok=True)
-                for idx in range(min(4, preds.shape[0])):
-                    Image.fromarray((preds[idx].cpu().clamp(0, 1).numpy() * 255).astype("uint8").transpose(1, 2, 0)) \
-                        .save(out_dir / f"{idx:03d}_pred.png")
+            if args.save_predictions:
+                for image_idx, pred in enumerate(preds):
+                    tensor_to_pil(pred).save(group_dirs[image_idx] / f"seed_{seed:03d}.png")
 
             record["pred_tensor"] = preds.detach()  # keep on GPU for diversity on next seeds
 
