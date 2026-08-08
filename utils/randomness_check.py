@@ -46,6 +46,7 @@ from utils.evaluate_sd3 import (  # noqa: E402
     lpips_batch,
     _get_lpips_model,
 )
+from utils.rss import encode_rss_condition  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,10 +66,14 @@ def parse_args() -> argparse.Namespace:
                         help="要评估的 seed 列表")
     parser.add_argument("--samples_per_weather", type=int, default=3,
                         help="每种天气随机抽几张")
-    parser.add_argument("--use_ra_fusion", action="store_true",
-                        help="加载 RA Fusion (评估最终模型时打开)")
-    parser.add_argument("--ra_fusion_scale", type=float, default=0.1,
-                        help="RA Fusion 输出缩放；CLI 覆盖 YAML")
+    parser.add_argument(
+        "--use_ra_fusion",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="覆盖 YAML 的 RA Fusion 开关；未指定时沿用 YAML",
+    )
+    parser.add_argument("--ra_fusion_scale", type=float, default=None,
+                        help="RA Fusion 输出缩放；未指定时沿用 YAML")
     parser.add_argument("--disable_fid", action="store_true",
                         help="本脚本默认不计算 FID")
     parser.add_argument("--max_inference_steps", type=int, default=30,
@@ -89,7 +94,8 @@ def parse_args() -> argparse.Namespace:
 def setup_pipeline(args_config: dict, dtype, device, ra_scale_override, use_ra_fusion: bool):
     args_config = dict(args_config)
     args_config["use_ra_fusion"] = bool(use_ra_fusion)
-    args_config["ra_fusion_scale"] = ra_scale_override
+    if ra_scale_override is not None:
+        args_config["ra_fusion_scale"] = ra_scale_override
     args_config["mixed_precision"] = args_config.get("mixed_precision", "bf16")
     pipeline = build_pipeline(args_config, device, dtype)
     return pipeline
@@ -138,7 +144,17 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
         kwargs["generator"] = generator
 
         if use_ra_fusion:
-            ra_context = pipeline.transformer.restoration_condition_context(None)
+            restoration_condition = encode_rss_condition(
+                pipeline,
+                items,
+                height=args_config["resolution"],
+                width=args_config["resolution"],
+                device=device,
+                dtype=dtype,
+            )
+            ra_context = pipeline.transformer.restoration_condition_context(
+                restoration_condition
+            )
         else:
             ra_context = contextlib.nullcontext()
         with ra_context, torch.autocast(
@@ -160,6 +176,16 @@ def main() -> None:
         args_config["controlnet_model_path"] = args.controlnet_model_path
     if args.ra_fusion_path is not None:
         args_config["ra_fusion_path"] = args.ra_fusion_path
+    use_ra_fusion = (
+        bool(args_config.get("use_ra_fusion", False))
+        if args.use_ra_fusion is None
+        else args.use_ra_fusion
+    )
+    ra_fusion_scale = (
+        float(args_config.get("ra_fusion_scale", 0.1))
+        if args.ra_fusion_scale is None
+        else args.ra_fusion_scale
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = torch.float32
@@ -168,6 +194,10 @@ def main() -> None:
     elif args_config.get("mixed_precision") == "bf16":
         weight_dtype = torch.bfloat16
     print(f"[random] device={device}, dtype={weight_dtype}, seeds={args.seeds}")
+    print(
+        f"[random] 每 LQ × {len(args.seeds)} seeds; "
+        f"samples_per_weather={args.samples_per_weather}, batch_size={args.batch_size}"
+    )
 
     output_root = Path(args.output_dir)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -222,13 +252,15 @@ def main() -> None:
 
     # Build pipeline
     pipeline = setup_pipeline(
-        args_config, weight_dtype, device, args.ra_fusion_scale, args.use_ra_fusion
+        args_config, weight_dtype, device, ra_fusion_scale, use_ra_fusion
     )
-    print(f"[random] Pipeline loaded. RA scale = {args.ra_fusion_scale}")
+    print(f"[random] Pipeline loaded. RA scale = {ra_fusion_scale}")
     print(
-        f"[random] use_ra_fusion={args.use_ra_fusion}, "
+        f"[random] use_ra_fusion={use_ra_fusion}, "
         f"transformer type={type(pipeline.transformer).__name__}"
     )
+    if use_ra_fusion and type(pipeline.transformer).__name__ != "RAFusionSD3Transformer2DModel":
+        raise RuntimeError("RA Fusion is enabled, but the loaded transformer is not RA-aware")
 
     # LPIPS backbone for perceptual diversity checks
     lpips_model = None
@@ -240,6 +272,7 @@ def main() -> None:
 
     # Run each seed once per weather
     rows: List[Dict] = []
+    per_image_rows: List[Dict] = []
     summary: Dict[str, Dict] = {}
     for sub_name, data in sub_data.items():
         weather = data["weather"]
@@ -253,7 +286,7 @@ def main() -> None:
             preds = run_pipeline_for_seed(
                 pipeline, args_config, device, weight_dtype, lq_pils, gt_batch,
                 weather, seed,
-                args.max_inference_steps, args.use_ra_fusion,
+                args.max_inference_steps, use_ra_fusion,
                 args.batch_size,
             )
             psnrs = psnr_batch(preds, gt_batch)
@@ -304,6 +337,7 @@ def main() -> None:
             }
             seed_records.append(record)
             rows.append({"subdataset": sub_name, **record})
+            record.update({"psnrs": psnrs, "ssims": ssims, "lpipses": lpipses})
 
             print(
                 f"[random] {sub_name} seed={seed:>3d} "
@@ -321,6 +355,33 @@ def main() -> None:
 
             record["pred_tensor"] = preds.detach()  # keep on GPU for diversity on next seeds
 
+        for image_idx, (gt_path, lq_path) in enumerate(selected_pairs[sub_name]):
+            image_psnrs = np.asarray([r["psnrs"][image_idx] for r in seed_records])
+            image_ssims = np.asarray([r["ssims"][image_idx] for r in seed_records])
+            image_lpips = np.asarray([r["lpipses"][image_idx] for r in seed_records])
+            best_idx = int(np.nanargmax(image_psnrs))
+            worst_idx = int(np.nanargmin(image_psnrs))
+            per_image_rows.append({
+                "subdataset": sub_name,
+                "weather": weather,
+                "image_index": image_idx,
+                "lq_path": lq_path,
+                "gt_path": gt_path,
+                "psnr_mean": float(np.mean(image_psnrs)),
+                "psnr_std": float(np.std(image_psnrs)),
+                "psnr_range": float(np.ptp(image_psnrs)),
+                "ssim_std": float(np.std(image_ssims)),
+                "ssim_range": float(np.ptp(image_ssims)),
+                "lpips_std": float(np.nanstd(image_lpips)),
+                "lpips_range": float(np.nanmax(image_lpips) - np.nanmin(image_lpips)),
+                "best_psnr_seed": args.seeds[best_idx],
+                "worst_psnr_seed": args.seeds[worst_idx],
+                "best_psnr": float(image_psnrs[best_idx]),
+                "worst_psnr": float(image_psnrs[worst_idx]),
+                "oracle_psnr_gain": float(image_psnrs[best_idx] - np.mean(image_psnrs)),
+            })
+
+        sub_image_rows = [r for r in per_image_rows if r["subdataset"] == sub_name]
         summary[sub_name] = {
             "weather": weather,
             "n_samples": len(lq_pils),
@@ -335,6 +396,11 @@ def main() -> None:
             "lq_mean_psnr": float(np.mean([r["lq_mean_psnr"] for r in seed_records])),
             "lq_mean_ssim": float(np.mean([r["lq_mean_ssim"] for r in seed_records])),
             "lq_mean_lpips": float(np.mean([r["lq_mean_lpips"] for r in seed_records])),
+            "per_image_psnr_range_mean": float(np.mean([r["psnr_range"] for r in sub_image_rows])),
+            "per_image_oracle_psnr_gain_mean": float(np.mean([r["oracle_psnr_gain"] for r in sub_image_rows])),
+            "images_with_psnr_range_ge_0_5_pct": float(np.mean([
+                r["psnr_range"] >= 0.5 for r in sub_image_rows
+            ]) * 100.0),
         }
 
     # Write CSV summary across all seeds
@@ -351,6 +417,13 @@ def main() -> None:
             writer.writerow(row)
     print(f"[random] per-seed CSV -> {csv_path}")
 
+    per_image_path = output_root / "per_image_summary.csv"
+    with per_image_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(per_image_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(per_image_rows)
+    print(f"[random] per-image CSV -> {per_image_path}")
+
     # Aggregate per subdataset
     agg_path = output_root / "per_subdataset_summary.csv"
     with agg_path.open("w", newline="", encoding="utf-8") as fh:
@@ -361,6 +434,8 @@ def main() -> None:
             "lpips_mean", "lpips_std",
             "diversity_lpips_mean", "diversity_lpips_max",
             "lq_mean_psnr", "lq_mean_ssim", "lq_mean_lpips",
+            "per_image_psnr_range_mean", "per_image_oracle_psnr_gain_mean",
+            "images_with_psnr_range_ge_0_5_pct",
         ])
         writer.writeheader()
         for sub_name, stats in summary.items():
@@ -384,6 +459,9 @@ def main() -> None:
             f"SSIM={stats['ssim_mean']:.4f}±{stats['ssim_std']:.4f}  "
             f"LPIPS={stats['lpips_mean']:.3f}±{stats['lpips_std']:.3f}  "
             f"divLPIPS vs seed0 mean={stats['diversity_lpips_mean']:.3f} max={stats['diversity_lpips_max']:.3f}  "
+            f"per-image PSNR range={stats['per_image_psnr_range_mean']:.3f} "
+            f"oracle gain={stats['per_image_oracle_psnr_gain_mean']:.3f} "
+            f"range>=0.5dB={stats['images_with_psnr_range_ge_0_5_pct']:.1f}%  "
             f"| LQ baseline PSNR={stats['lq_mean_psnr']:.3f}"
         )
 
