@@ -77,6 +77,10 @@ def parse_args() -> argparse.Namespace:
                         help="是否保存每个 seed 的预测 PNG（默认否，节省磁盘）")
     parser.add_argument("--use_prompt", action="store_true",
                         help="启用 weather-aware prompt；默认 False")
+    parser.add_argument("--controlnet_model_path", type=str, default=None,
+                        help="覆盖 YAML 中的 ControlNet 路径")
+    parser.add_argument("--ra_fusion_path", type=str, default=None,
+                        help="覆盖 YAML 中的 RA Fusion 路径")
     return parser.parse_args()
 
 
@@ -130,11 +134,10 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
             kwargs["sigmas"] = custom_sigmas
         kwargs["generator"] = generator
 
-        ra_context = (
-            pipeline.transformer.restoration_condition_context(None)
-            if not use_ra_fusion
-            else contextlib.nullcontext()
-        )
+        if use_ra_fusion:
+            ra_context = pipeline.transformer.restoration_condition_context(None)
+        else:
+            ra_context = contextlib.nullcontext()
         with ra_context, torch.autocast(
             "cuda", enabled=(device.type == "cuda"), dtype=dtype
         ), torch.no_grad():
@@ -150,6 +153,10 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
 def main() -> None:
     args = parse_args()
     args_config = load_config(args.config)
+    if args.controlnet_model_path is not None:
+        args_config["controlnet_model_path"] = args.controlnet_model_path
+    if args.ra_fusion_path is not None:
+        args_config["ra_fusion_path"] = args.ra_fusion_path
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     weight_dtype = torch.float32
@@ -215,6 +222,10 @@ def main() -> None:
         args_config, weight_dtype, device, args.ra_fusion_scale, args.use_ra_fusion
     )
     print(f"[random] Pipeline loaded. RA scale = {args.ra_fusion_scale}")
+    print(
+        f"[random] use_ra_fusion={args.use_ra_fusion}, "
+        f"transformer type={type(pipeline.transformer).__name__}"
+    )
 
     # LPIPS backbone for perceptual diversity checks
     lpips_model = None
