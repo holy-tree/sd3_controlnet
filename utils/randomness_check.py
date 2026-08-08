@@ -90,7 +90,9 @@ def setup_pipeline(args_config: dict, dtype, device, ra_scale_override, use_ra_f
 
 
 def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, gt_tensors,
-                          weather: str, seed: int) -> torch.Tensor:
+                          weather: str, seed: int,
+                          num_inference_steps: int,
+                          use_ra_fusion: bool) -> torch.Tensor:
     """Run the pipeline once for every LQ image using the supplied seed.
 
     Returns a stacked ``(N, 3, H, W)`` tensor of [0, 1] predictions on GPU.
@@ -110,7 +112,7 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
         kwargs = dict(
             prompt=prompts,
             control_image=items,
-            num_inference_steps=args.max_inference_steps,
+            num_inference_steps=num_inference_steps,
             guidance_scale=args_config.get("guidance_scale", 1.5),
             negative_prompt=args_config.get("negative_prompt"),
             height=args_config.get("resolution", 512),
@@ -120,7 +122,7 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
         strength = float(args_config.get("strength", 1.0))
         if strength < 1.0:
             latents, custom_sigmas = prepare_image_conditioned_latents(
-                pipeline, items, strength, args.max_inference_steps,
+                pipeline, items, strength, num_inference_steps,
                 device, dtype, generator,
                 args_config["resolution"], args_config["resolution"],
             )
@@ -130,7 +132,7 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
 
         ra_context = (
             pipeline.transformer.restoration_condition_context(None)
-            if not args.use_ra_fusion
+            if not use_ra_fusion
             else contextlib.nullcontext()
         )
         with ra_context, torch.autocast(
@@ -237,6 +239,7 @@ def main() -> None:
             preds = run_pipeline_for_seed(
                 pipeline, args_config, device, weight_dtype, lq_pils, gt_batch,
                 weather, seed,
+                args.max_inference_steps, args.use_ra_fusion,
             )
             psnrs = psnr_batch(preds, gt_batch)
             ssims = ssim_batch(preds, gt_batch)
