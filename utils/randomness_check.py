@@ -81,6 +81,8 @@ def parse_args() -> argparse.Namespace:
                         help="覆盖 YAML 中的 ControlNet 路径")
     parser.add_argument("--ra_fusion_path", type=str, default=None,
                         help="覆盖 YAML 中的 RA Fusion 路径")
+    parser.add_argument("--batch_size", type=int, default=4,
+                        help="每次 pipeline() 调用的 LQ 数量 (默认 4)")
     return parser.parse_args()
 
 
@@ -96,7 +98,8 @@ def setup_pipeline(args_config: dict, dtype, device, ra_scale_override, use_ra_f
 def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, gt_tensors,
                           weather: str, seed: int,
                           num_inference_steps: int,
-                          use_ra_fusion: bool) -> torch.Tensor:
+                          use_ra_fusion: bool,
+                          batch_size: int = 4) -> torch.Tensor:
     """Run the pipeline once for every LQ image using the supplied seed.
 
     Returns a stacked ``(N, 3, H, W)`` tensor of [0, 1] predictions on GPU.
@@ -107,8 +110,8 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
     generator = torch.Generator(device=device).manual_seed(seed)
     preds: List[torch.Tensor] = []
 
-    for start in range(0, n, 1):
-        items = lq_pils[start:start + 1]
+    for start in range(0, n, batch_size):
+        items = lq_pils[start:start + batch_size]
         if not items:
             continue
         B = len(items)
@@ -251,6 +254,7 @@ def main() -> None:
                 pipeline, args_config, device, weight_dtype, lq_pils, gt_batch,
                 weather, seed,
                 args.max_inference_steps, args.use_ra_fusion,
+                args.batch_size,
             )
             psnrs = psnr_batch(preds, gt_batch)
             ssims = ssim_batch(preds, gt_batch)
