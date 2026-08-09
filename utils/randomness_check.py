@@ -137,6 +137,9 @@ def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, g
             width=args_config.get("resolution", 512),
             num_images_per_prompt=1,
         )
+        controlnet_scale = args_config.get("controlnet_conditioning_scale", None)
+        if controlnet_scale is not None:
+            kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
         strength = float(args_config.get("strength", 1.0))
         if strength < 1.0:
             latents, custom_sigmas = prepare_image_conditioned_latents(

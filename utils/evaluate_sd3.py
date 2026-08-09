@@ -546,6 +546,9 @@ def evaluate(args_config: dict):
                     width=args_config["resolution"],
                     num_images_per_prompt=1,
                 )
+                controlnet_scale = args_config.get("controlnet_conditioning_scale", None)
+                if controlnet_scale is not None:
+                    pipeline_kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
                 restoration_condition = None
                 if use_rss or args_config.get("use_ra_fusion", False):
                     restoration_condition = encode_rss_condition(
