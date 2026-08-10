@@ -336,7 +336,8 @@ def maybe_make_prompt(weather: str, args_config: dict) -> str:
 
 @torch.no_grad()
 def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_steps,
-                                      device, dtype, generator, height, width):
+                                      device, dtype, generator, height, width,
+                                      initial_noise=None, return_noise=False):
     """Encode LQ images and initialize the flow trajectory at the requested noise level."""
     if not 0.0 < strength <= 1.0:
         raise ValueError(f"strength must be in (0, 1], got {strength}")
@@ -359,9 +360,19 @@ def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_
         num_inference_steps,
         dtype=np.float32,
     )
-    noise = torch.randn(image_latents.shape, generator=generator, device=device, dtype=dtype)
-    latents = (1.0 - strength) * image_latents + strength * noise
-    return latents, raw_sigmas.tolist()
+    if initial_noise is None:
+        initial_noise = torch.randn(
+            image_latents.shape, generator=generator, device=device, dtype=dtype
+        )
+    elif initial_noise.shape != image_latents.shape:
+        raise ValueError(
+            f"initial_noise shape {tuple(initial_noise.shape)} does not match latent shape "
+            f"{tuple(image_latents.shape)}"
+        )
+    initial_noise = initial_noise.to(device=device, dtype=dtype)
+    latents = (1.0 - strength) * image_latents + strength * initial_noise
+    result = (latents, raw_sigmas.tolist())
+    return (*result, initial_noise) if return_noise else result
 
 
 # ============================================================

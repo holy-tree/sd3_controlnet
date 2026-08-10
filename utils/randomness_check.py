@@ -1,484 +1,691 @@
-"""Randomness sanity test for a trained SD3 + ControlNet + RA pipeline.
-
-For each dataset weather, the script samples a fixed set of LQ/GT pairs and
-runs the pipeline under several ``--seed`` values. For every seed it writes a
-``per_seed.json`` summary plus per-image metrics in CSV. A combined
-``randomness_summary.csv`` is produced so you can compare seeds side by side.
-
-The script reuses the same ``build_pipeline`` and ``prepare_image_conditioned_latents``
-helpers as ``utils/evaluate_sd3.py`` to guarantee identical inference settings
-across all runs.
-"""
+"""Reproducible SD3 restoration randomness evaluation with a fixed Noise Bank."""
 from __future__ import annotations
 
 import argparse
 import contextlib
 import csv
-import io
+import hashlib
 import itertools
 import json
+import random
 import sys
 import time
+from unittest.mock import patch
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-# Reuse the same module path as evaluate_sd3.py
 THIS_DIR = Path(__file__).resolve().parent
 ROOT = THIS_DIR.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.evaluate_sd3 import (  # noqa: E402
-    IMG_EXT,
+    _get_lpips_model,
     build_dataset_for_eval,
     build_pipeline,
     load_config,
+    lpips_batch,
     maybe_make_prompt,
     prepare_image_conditioned_latents,
     psnr_batch,
     ssim_batch,
-    lpips_batch,
-    _get_lpips_model,
 )
-from utils.rss import encode_rss_condition  # noqa: E402
+from utils.noise_bank import (  # noqa: E402
+    load_or_create_noise_bank,
+    sample_identifier,
+    tensor_checksum,
+)
+from utils.rss import (  # noqa: E402
+    encode_rss_condition,
+    make_rss_callback,
+    validate_rss_config,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate generation randomness of the trained pipeline by sweeping "
-            "over seeds on a small fixed sample. Useful before DPO."
-        )
+        description="Evaluate restoration randomness with a persistent K=10 Noise Bank."
     )
-    parser.add_argument("--config", type=str, default="./config/eval_sd3.yaml",
-                        help="YAML 配置文件路径")
-    parser.add_argument("--output_dir", type=str,
-                        default="/root/autodl-tmp/sd3/experiment/randomness_check",
-                        help="结果输出目录")
-    parser.add_argument("--seeds", type=int, nargs="+",
-                        default=[0, 1, 2, 3, 4, 7, 11, 13, 17, 21],
-                        help="要评估的 seed 列表")
-    parser.add_argument("--samples_per_weather", type=int, default=3,
-                        help="每种天气随机抽几张")
+    parser.add_argument("--config", default="./config/eval_sd3.yaml")
+    parser.add_argument(
+        "--output_dir",
+        default="/root/autodl-tmp/sd3/experiment/randomness_results",
+    )
+    parser.add_argument(
+        "--noise_bank",
+        default="/root/autodl-tmp/sd3/experiment/noise_bank.pt",
+        help="可跨模型/checkpoint/消融实验复用的固定 Noise Bank 清单路径",
+    )
+    parser.add_argument("--noise_bank_size", type=int, default=10)
+    parser.add_argument("--noise_bank_seed", type=int, default=20240805)
+    parser.add_argument("--noise_bank_chunk_size", type=int, default=128)
+    parser.add_argument("--create_noise_bank_only", action="store_true")
+    parser.add_argument(
+        "--verify_reproducibility",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="用首张图和 noise_00 重复推理两次并检查输出 checksum",
+    )
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--pairwise_batch_size", type=int, default=16)
+    parser.add_argument("--strength", type=float, default=None)
+    parser.add_argument("--max_inference_steps", type=int, default=None)
+    parser.add_argument("--controlnet_conditioning_scale", type=float, default=None)
     parser.add_argument(
         "--use_ra_fusion",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="覆盖 YAML 的 RA Fusion 开关；未指定时沿用 YAML",
     )
-    parser.add_argument("--ra_fusion_scale", type=float, default=None,
-                        help="RA Fusion 输出缩放；未指定时沿用 YAML")
-    parser.add_argument("--disable_fid", action="store_true",
-                        help="本脚本默认不计算 FID")
-    parser.add_argument("--max_inference_steps", type=int, default=30,
-                        help="推理步数，默认与评估一致")
-    parser.add_argument("--save_predictions", action="store_true",
-                        help="按 LQ 样本分组保存 LQ、GT 和所有 seed 的预测 PNG")
-    parser.add_argument("--use_prompt", action="store_true",
-                        help="启用 weather-aware prompt；默认 False")
-    parser.add_argument("--controlnet_model_path", type=str, default=None,
-                        help="覆盖 YAML 中的 ControlNet 路径")
-    parser.add_argument("--ra_fusion_path", type=str, default=None,
-                        help="覆盖 YAML 中的 RA Fusion 路径")
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="每次 pipeline() 调用的 LQ 数量 (默认 4)")
+    parser.add_argument("--ra_fusion_scale", type=float, default=None)
+    parser.add_argument(
+        "--use_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--controlnet_model_path", default=None)
+    parser.add_argument("--ra_fusion_path", default=None)
     return parser.parse_args()
 
 
-def setup_pipeline(args_config: dict, dtype, device, ra_scale_override, use_ra_fusion: bool):
-    args_config = dict(args_config)
-    args_config["use_ra_fusion"] = bool(use_ra_fusion)
-    if ra_scale_override is not None:
-        args_config["ra_fusion_scale"] = ra_scale_override
-    args_config["mixed_precision"] = args_config.get("mixed_precision", "bf16")
-    pipeline = build_pipeline(args_config, device, dtype)
-    return pipeline
+def setup_pipeline(args_config: dict, dtype, device, ra_scale, use_ra_fusion: bool):
+    pipeline_config = dict(args_config)
+    pipeline_config["use_ra_fusion"] = use_ra_fusion
+    if ra_scale is not None:
+        pipeline_config["ra_fusion_scale"] = ra_scale
+    return build_pipeline(pipeline_config, device, dtype)
 
 
 def tensor_to_pil(image: torch.Tensor) -> Image.Image:
-    array = (image.detach().float().cpu().clamp(0, 1).numpy() * 255).round().astype("uint8")
+    array = (
+        image.detach().float().cpu().clamp(0, 1).numpy() * 255
+    ).round().astype("uint8")
     return Image.fromarray(array.transpose(1, 2, 0))
 
 
-def run_pipeline_for_seed(pipeline, args_config: dict, device, dtype, lq_pils, gt_tensors,
-                          weather: str, seed: int,
-                          num_inference_steps: int,
-                          use_ra_fusion: bool,
-                          batch_size: int = 4) -> torch.Tensor:
-    """Run the pipeline once for every LQ image using the supplied seed.
+def output_checksum(image: torch.Tensor) -> str:
+    array = (
+        image.detach().float().cpu().clamp(0, 1).numpy() * 255
+    ).round().astype("uint8")
+    return hashlib.sha256(array.tobytes()).hexdigest()
 
-    Returns a stacked ``(N, 3, H, W)`` tensor of [0, 1] predictions on GPU.
-    """
-    n = len(lq_pils)
-    prompt = maybe_make_prompt(weather, args_config)
 
-    generator = torch.Generator(device=device).manual_seed(seed)
-    preds: List[torch.Tensor] = []
+def finite_stats(values: Sequence[float]) -> Dict[str, float]:
+    array = np.asarray(values, dtype=np.float64)
+    array = array[np.isfinite(array)]
+    if not len(array):
+        return {key: float("nan") for key in ("mean", "std", "min", "max")}
+    return {
+        "mean": float(np.mean(array)),
+        "std": float(np.std(array)),
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
+    }
 
-    for start in range(0, n, batch_size):
-        items = lq_pils[start:start + batch_size]
-        if not items:
-            continue
-        B = len(items)
-        prompts = [prompt] * B
-        kwargs = dict(
-            prompt=prompts,
-            control_image=items,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=args_config.get("guidance_scale", 1.5),
-            negative_prompt=args_config.get("negative_prompt"),
-            height=args_config.get("resolution", 512),
-            width=args_config.get("resolution", 512),
-            num_images_per_prompt=1,
+
+def prefixed_stats(prefix: str, values: Sequence[float]) -> Dict[str, float]:
+    return {f"{prefix}_{key}": value for key, value in finite_stats(values).items()}
+
+
+def json_safe(value):
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+        return None
+    return value
+
+
+def write_csv(path: Path, rows: List[Dict]) -> None:
+    if not rows:
+        return
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"[random] CSV -> {path}")
+
+
+def build_preprocess(resolution: int):
+    return transforms.Compose([
+        transforms.Resize(
+            resolution, interpolation=transforms.InterpolationMode.BILINEAR
+        ),
+        transforms.CenterCrop(resolution),
+        transforms.ToTensor(),
+    ])
+
+
+def load_image_batch(records: Sequence[Dict], preprocess, device):
+    lq_tensors, gt_tensors, lq_pils = [], [], []
+    for record in records:
+        lq_tensor = preprocess(Image.open(record["lq_path"]).convert("RGB"))
+        gt_tensor = preprocess(Image.open(record["gt_path"]).convert("RGB"))
+        lq_tensors.append(lq_tensor)
+        gt_tensors.append(gt_tensor)
+        lq_pils.append(transforms.ToPILImage()(lq_tensor))
+    return (
+        lq_pils,
+        torch.stack(lq_tensors).to(device),
+        torch.stack(gt_tensors).to(device),
+    )
+
+
+@torch.no_grad()
+def infer_latent_shape(pipeline, image: Image.Image, resolution: int, device) -> Tuple[int, int, int]:
+    processed = pipeline.image_processor.preprocess(
+        [image], height=resolution, width=resolution
+    )
+    processed = processed.to(device=device, dtype=pipeline.vae.dtype)
+    latent = pipeline.vae.encode(processed).latent_dist.mode()
+    return tuple(int(value) for value in latent.shape[1:])
+
+
+def run_with_initial_noise(
+    pipeline,
+    args_config: dict,
+    device,
+    dtype,
+    lq_pils,
+    prompt: str,
+    initial_noise: torch.Tensor,
+    strength: float,
+    num_inference_steps: int,
+    use_ra_fusion: bool,
+) -> torch.Tensor:
+    """Run one batch while changing only the explicitly supplied initial noise."""
+    resolution = int(args_config.get("resolution", 512))
+    initial_noise = initial_noise.to(device=device, dtype=dtype)
+    latents, custom_sigmas = prepare_image_conditioned_latents(
+        pipeline,
+        lq_pils,
+        strength,
+        num_inference_steps,
+        device,
+        dtype,
+        generator=None,
+        height=resolution,
+        width=resolution,
+        initial_noise=initial_noise,
+    )
+    fixed_generator = torch.Generator(device=device).manual_seed(0)
+    kwargs = {
+        "prompt": [prompt] * len(lq_pils),
+        "control_image": lq_pils,
+        "num_inference_steps": num_inference_steps,
+        "guidance_scale": args_config.get("guidance_scale", 1.5),
+        "height": resolution,
+        "width": resolution,
+        "num_images_per_prompt": 1,
+        "latents": latents,
+        "sigmas": custom_sigmas,
+        "generator": fixed_generator,
+    }
+    negative_prompt = args_config.get("negative_prompt")
+    if negative_prompt is not None:
+        kwargs["negative_prompt"] = (
+            [negative_prompt] * len(lq_pils)
+            if isinstance(negative_prompt, str) else negative_prompt
         )
-        controlnet_scale = args_config.get("controlnet_conditioning_scale", None)
-        if controlnet_scale is not None:
-            kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
-        strength = float(args_config.get("strength", 1.0))
-        if strength < 1.0:
-            latents, custom_sigmas = prepare_image_conditioned_latents(
-                pipeline, items, strength, num_inference_steps,
-                device, dtype, generator,
-                args_config["resolution"], args_config["resolution"],
-            )
-            kwargs["latents"] = latents
-            kwargs["sigmas"] = custom_sigmas
-        kwargs["generator"] = generator
+    controlnet_scale = args_config.get("controlnet_conditioning_scale")
+    if controlnet_scale is not None:
+        kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
 
-        if use_ra_fusion:
-            restoration_condition = encode_rss_condition(
-                pipeline,
-                items,
-                height=args_config["resolution"],
-                width=args_config["resolution"],
-                device=device,
-                dtype=dtype,
-            )
-            ra_context = pipeline.transformer.restoration_condition_context(
-                restoration_condition
-            )
-        else:
-            ra_context = contextlib.nullcontext()
-        with ra_context, torch.autocast(
-            "cuda", enabled=(device.type == "cuda"), dtype=dtype
-        ), torch.no_grad():
-            out = pipeline(**kwargs).images
-        for pil_img in out:
-            preds.append(transforms.ToTensor()(pil_img).to(device).clamp(0, 1))
+    use_rss = bool(args_config.get("use_rss", False))
+    restoration_condition = None
+    if use_rss or use_ra_fusion:
+        restoration_condition = encode_rss_condition(
+            pipeline,
+            lq_pils,
+            height=resolution,
+            width=resolution,
+            device=device,
+            dtype=dtype,
+        )
+    if use_rss:
+        kwargs["callback_on_step_end"] = make_rss_callback(
+            restoration_condition,
+            weight=float(args_config.get("rss_weight", 0.01)),
+            threshold=float(args_config.get("rss_threshold", 0.8)),
+        )
+        kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
+    ra_context = (
+        pipeline.transformer.restoration_condition_context(restoration_condition)
+        if use_ra_fusion else contextlib.nullcontext()
+    )
 
-    if not preds:
-        raise RuntimeError("Pipeline produced no predictions")
-    return torch.stack(preds, dim=0)
+    # Diffusers normally samples the ControlNet VAE posterior. Use its mode so
+    # the control condition is deterministic and independent of batch layout.
+    deterministic_sample = lambda distribution, generator=None: distribution.mode()
+    with patch.object(
+        DiagonalGaussianDistribution, "sample", deterministic_sample
+    ), ra_context, torch.autocast(
+        "cuda", enabled=(device.type == "cuda"), dtype=dtype
+    ), torch.no_grad():
+        images = pipeline(**kwargs).images
+    return torch.stack([
+        transforms.ToTensor()(image).to(device).clamp(0, 1) for image in images
+    ])
+
+
+def pairwise_lpips_for_candidates(
+    candidate_paths: Sequence[Path], lpips_model, device, dtype, batch_size: int
+) -> Tuple[float, float]:
+    if lpips_model is None or len(candidate_paths) < 2:
+        return float("nan"), float("nan")
+    candidates = torch.stack([
+        transforms.ToTensor()(Image.open(path).convert("RGB"))
+        for path in candidate_paths
+    ])
+    pairs = list(itertools.combinations(range(len(candidate_paths)), 2))
+    distances = []
+    for start in range(0, len(pairs), batch_size):
+        chunk = pairs[start:start + batch_size]
+        left = torch.stack([candidates[first] for first, _ in chunk]).to(device)
+        right = torch.stack([candidates[second] for _, second in chunk]).to(device)
+        try:
+            distances.extend(lpips_batch(lpips_model, left, right, device, dtype))
+        except Exception as error:  # pragma: no cover
+            print(f"[random] pairwise LPIPS failed: {error}")
+            return float("nan"), float("nan")
+    stats = finite_stats(distances)
+    return stats["mean"], stats["max"]
 
 
 def main() -> None:
     args = parse_args()
     args_config = load_config(args.config)
-    if args.controlnet_model_path is not None:
-        args_config["controlnet_model_path"] = args.controlnet_model_path
-    if args.ra_fusion_path is not None:
-        args_config["ra_fusion_path"] = args.ra_fusion_path
+    for key in ("controlnet_model_path", "ra_fusion_path",
+                "controlnet_conditioning_scale"):
+        value = getattr(args, key)
+        if value is not None:
+            args_config[key] = value
+    if args.use_prompt is not None:
+        args_config["use_prompt"] = args.use_prompt
+
+    if args.noise_bank_size != 10:
+        raise ValueError("This evaluation requires exactly K=10 Noise Bank sets")
+    if args.batch_size <= 0 or args.pairwise_batch_size <= 0:
+        raise ValueError("batch sizes must be positive")
+
+    strength = (
+        args.strength if args.strength is not None
+        else float(args_config.get("strength", 1.0))
+    )
+    if not 0.0 < strength <= 1.0:
+        raise ValueError("strength must be in (0, 1]")
+    num_inference_steps = (
+        args.max_inference_steps if args.max_inference_steps is not None
+        else int(args_config.get("num_inference_steps", 30))
+    )
     use_ra_fusion = (
         bool(args_config.get("use_ra_fusion", False))
-        if args.use_ra_fusion is None
-        else args.use_ra_fusion
+        if args.use_ra_fusion is None else args.use_ra_fusion
     )
-    ra_fusion_scale = (
-        float(args_config.get("ra_fusion_scale", 0.1))
-        if args.ra_fusion_scale is None
-        else args.ra_fusion_scale
-    )
+    use_rss = bool(args_config.get("use_rss", False))
+    if use_rss:
+        validate_rss_config(
+            float(args_config.get("rss_weight", 0.01)),
+            float(args_config.get("rss_threshold", 0.8)),
+        )
+    configured_ra_scale = args_config.get("ra_fusion_scale")
+    if args.ra_fusion_scale is not None:
+        ra_fusion_scale = args.ra_fusion_scale
+    elif configured_ra_scale is not None:
+        ra_fusion_scale = float(configured_ra_scale)
+    else:
+        ra_fusion_scale = None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weight_dtype = torch.float32
+    dtype = torch.float32
     if args_config.get("mixed_precision") == "fp16":
-        weight_dtype = torch.float16
+        dtype = torch.float16
     elif args_config.get("mixed_precision") == "bf16":
-        weight_dtype = torch.bfloat16
-    print(f"[random] device={device}, dtype={weight_dtype}, seeds={args.seeds}")
-    print(
-        f"[random] 每 LQ × {len(args.seeds)} seeds; "
-        f"samples_per_weather={args.samples_per_weather}, batch_size={args.batch_size}"
-    )
+        dtype = torch.bfloat16
+    resolution = int(args_config.get("resolution", 512))
 
-    output_root = Path(args.output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
-    predictions_root = output_root / "predictions"
-    if args.save_predictions:
-        predictions_root.mkdir(parents=True, exist_ok=True)
-
-    # Build dataset and group by weather
-    samples = build_dataset_for_eval(args_config)
-    if not samples:
-        raise SystemExit("config did not yield any samples; check dataset_rain/snow/haze paths")
-    print(f"[random] {len(samples)} total samples loaded from {args_config['weather_types']}")
-
-    by_sub: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
-    sub_to_weather: Dict[str, str] = {}
-    for gt_path, lq_path, weather, sub_name in samples:
-        by_sub[sub_name].append((gt_path, lq_path))
-        sub_to_weather[sub_name] = weather
-
-    rng = np.random.default_rng(seed=20240805)
-    selected_pairs: Dict[str, List[Tuple[str, str]]] = {}
-    for sub_name, pairs in by_sub.items():
-        n = min(args.samples_per_weather, len(pairs))
-        idx = rng.choice(len(pairs), size=n, replace=False) if n > 0 else []
-        selected_pairs[sub_name] = [pairs[i] for i in idx]
-        print(f"[random] {sub_name}: selected {n} / {len(pairs)} samples")
-
-    # Pre-load images and GT tensors
-    preprocess = transforms.Compose([
-        transforms.Resize(args_config.get("resolution", 512),
-                          interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(args_config.get("resolution", 512)),
-        transforms.ToTensor(),
-    ])
-
-    sub_data: Dict[str, Dict] = {}
-    for sub_name, pairs in selected_pairs.items():
-        gt_tensors = []
-        lq_pils = []
-        lq_tensors = []
-        for gt_path, lq_path in pairs:
-            gt_img = preprocess(Image.open(gt_path).convert("RGB"))
-            lq_img = preprocess(Image.open(lq_path).convert("RGB"))
-            lq_pils.append(transforms.ToPILImage()(lq_img))
-            gt_tensors.append(gt_img)
-            lq_tensors.append(lq_img)
-        sub_data[sub_name] = {
-            "weather": sub_to_weather[sub_name],
-            "gt_batch": torch.stack(gt_tensors, dim=0).to(device),
-            "lq_batch": torch.stack(lq_tensors, dim=0).to(device),
-            "lq_pils": lq_pils,
+    raw_samples = build_dataset_for_eval(args_config)
+    if not raw_samples:
+        raise SystemExit("No validation samples found; check dataset paths")
+    sample_records = [
+        {
+            "global_index": index,
+            "gt_path": gt_path,
+            "lq_path": lq_path,
+            "weather": weather,
+            "subdataset": subdataset,
         }
+        for index, (gt_path, lq_path, weather, subdataset) in enumerate(raw_samples)
+    ]
+    sample_ids = [
+        sample_identifier(row["subdataset"], row["lq_path"], row["gt_path"])
+        for row in sample_records
+    ]
 
-    # Build pipeline
     pipeline = setup_pipeline(
-        args_config, weight_dtype, device, ra_fusion_scale, use_ra_fusion
-    )
-    print(f"[random] Pipeline loaded. RA scale = {ra_fusion_scale}")
-    print(
-        f"[random] use_ra_fusion={use_ra_fusion}, "
-        f"transformer type={type(pipeline.transformer).__name__}"
+        args_config, dtype, device, ra_fusion_scale, use_ra_fusion
     )
     if use_ra_fusion and type(pipeline.transformer).__name__ != "RAFusionSD3Transformer2DModel":
-        raise RuntimeError("RA Fusion is enabled, but the loaded transformer is not RA-aware")
+        raise RuntimeError("RA Fusion is enabled, but the transformer is not RA-aware")
+    if use_ra_fusion:
+        ra_fusion_scale = float(pipeline.transformer.ra_fusion_scale)
 
-    # LPIPS backbone for perceptual diversity checks
-    lpips_model = None
-    try:
-        lpips_model = _get_lpips_model(args_config.get("lpips_net", "alex"),
-                                        device=device)
-    except Exception as exc:  # pragma: no cover
-        print(f"[random] LPIPS unavailable: {exc}")
-
-    # Run each seed once per weather
-    rows: List[Dict] = []
-    per_image_rows: List[Dict] = []
-    summary: Dict[str, Dict] = {}
-    for sub_name, data in sub_data.items():
-        weather = data["weather"]
-        lq_pils = data["lq_pils"]
-        gt_batch = data["gt_batch"]
-        lq_batch = data["lq_batch"]
-
-        group_dirs: List[Path] = []
-        if args.save_predictions:
-            for image_idx, (gt_path, lq_path) in enumerate(selected_pairs[sub_name]):
-                sample_name = Path(lq_path).stem
-                group_dir = predictions_root / sub_name / f"group_{image_idx:04d}_{sample_name}"
-                group_dir.mkdir(parents=True, exist_ok=True)
-                tensor_to_pil(lq_batch[image_idx]).save(group_dir / "lq.png")
-                tensor_to_pil(gt_batch[image_idx]).save(group_dir / "gt.png")
-                group_dirs.append(group_dir)
-
-        seed_records: List[Dict] = []
-        for seed in args.seeds:
-            t0 = time.time()
-            preds = run_pipeline_for_seed(
-                pipeline, args_config, device, weight_dtype, lq_pils, gt_batch,
-                weather, seed,
-                args.max_inference_steps, use_ra_fusion,
-                args.batch_size,
-            )
-            psnrs = psnr_batch(preds, gt_batch)
-            ssims = ssim_batch(preds, gt_batch)
-            try:
-                lpipses = lpips_batch(lpips_model, preds, gt_batch, device, weight_dtype)
-            except Exception as exc:  # pragma: no cover
-                print(f"[random] LPIPS failed for seed {seed}: {exc}")
-                lpipses = [float("nan")] * preds.shape[0]
-            mean_psnr = float(np.mean(psnrs))
-            mean_ssim = float(np.mean(ssims))
-            mean_lpips = float(np.nanmean(lpipses))
-            elapsed = time.time() - t0
-
-            # Compare against LQ: this tells us how much the model changes the input.
-            lq_psnrs = psnr_batch(lq_batch, gt_batch)
-            lq_ssims = ssim_batch(lq_batch, gt_batch)
-            try:
-                lq_lpipses = lpips_batch(lpips_model, lq_batch, gt_batch, device, weight_dtype)
-            except Exception:
-                lq_lpipses = [float("nan")] * lq_batch.shape[0]
-
-            # Pairwise diversity against the first seed (deterministic baseline).
-            if seed_records:
-                base_pred = seed_records[0]["pred_tensor"]
-                diversity_lpips = [
-                    float(lpips_batch(lpips_model, base_pred[i:i + 1],
-                                       preds[i:i + 1], device, weight_dtype)[0])
-                    if lpips_model is not None else float("nan")
-                    for i in range(preds.shape[0])
-                ]
-                mean_div = float(np.nanmean(diversity_lpips))
-            else:
-                diversity_lpips = [0.0] * preds.shape[0]
-                mean_div = 0.0
-
-            record = {
-                "weather": weather,
-                "seed": seed,
-                "elapsed_sec": elapsed,
-                "mean_psnr": mean_psnr,
-                "mean_ssim": mean_ssim,
-                "mean_lpips": mean_lpips,
-                "mean_diversity_lpips_vs_seed0": mean_div,
-                "lq_mean_psnr": float(np.mean(lq_psnrs)),
-                "lq_mean_ssim": float(np.mean(lq_ssims)),
-                "lq_mean_lpips": float(np.nanmean(lq_lpipses)),
-            }
-            seed_records.append(record)
-            rows.append({"subdataset": sub_name, **record})
-            record.update({"psnrs": psnrs, "ssims": ssims, "lpipses": lpipses})
-
-            print(
-                f"[random] {sub_name} seed={seed:>3d} "
-                f"PSNR={mean_psnr:.3f} SSIM={mean_ssim:.4f} LPIPS={mean_lpips:.3f} "
-                f"divLPIPS={mean_div:.3f} ({elapsed:.1f}s)"
-            )
-
-            if args.save_predictions:
-                for image_idx, pred in enumerate(preds):
-                    tensor_to_pil(pred).save(group_dirs[image_idx] / f"seed_{seed:03d}.png")
-
-            record["pred_tensor"] = preds.detach()  # keep on GPU for diversity on next seeds
-
-        for image_idx, (gt_path, lq_path) in enumerate(selected_pairs[sub_name]):
-            image_psnrs = np.asarray([r["psnrs"][image_idx] for r in seed_records])
-            image_ssims = np.asarray([r["ssims"][image_idx] for r in seed_records])
-            image_lpips = np.asarray([r["lpipses"][image_idx] for r in seed_records])
-            best_idx = int(np.nanargmax(image_psnrs))
-            worst_idx = int(np.nanargmin(image_psnrs))
-            per_image_rows.append({
-                "subdataset": sub_name,
-                "weather": weather,
-                "image_index": image_idx,
-                "lq_path": lq_path,
-                "gt_path": gt_path,
-                "psnr_mean": float(np.mean(image_psnrs)),
-                "psnr_std": float(np.std(image_psnrs)),
-                "psnr_range": float(np.ptp(image_psnrs)),
-                "ssim_std": float(np.std(image_ssims)),
-                "ssim_range": float(np.ptp(image_ssims)),
-                "lpips_std": float(np.nanstd(image_lpips)),
-                "lpips_range": float(np.nanmax(image_lpips) - np.nanmin(image_lpips)),
-                "best_psnr_seed": args.seeds[best_idx],
-                "worst_psnr_seed": args.seeds[worst_idx],
-                "best_psnr": float(image_psnrs[best_idx]),
-                "worst_psnr": float(image_psnrs[worst_idx]),
-                "oracle_psnr_gain": float(image_psnrs[best_idx] - np.mean(image_psnrs)),
-            })
-
-        sub_image_rows = [r for r in per_image_rows if r["subdataset"] == sub_name]
-        summary[sub_name] = {
-            "weather": weather,
-            "n_samples": len(lq_pils),
-            "psnr_mean": float(np.mean([r["mean_psnr"] for r in seed_records])),
-            "psnr_std": float(np.std([r["mean_psnr"] for r in seed_records])),
-            "ssim_mean": float(np.mean([r["mean_ssim"] for r in seed_records])),
-            "ssim_std": float(np.std([r["mean_ssim"] for r in seed_records])),
-            "lpips_mean": float(np.mean([r["mean_lpips"] for r in seed_records])),
-            "lpips_std": float(np.std([r["mean_lpips"] for r in seed_records])),
-            "diversity_lpips_mean": float(np.mean([r["mean_diversity_lpips_vs_seed0"] for r in seed_records[1:]])),
-            "diversity_lpips_max": float(np.max([r["mean_diversity_lpips_vs_seed0"] for r in seed_records[1:]])),
-            "lq_mean_psnr": float(np.mean([r["lq_mean_psnr"] for r in seed_records])),
-            "lq_mean_ssim": float(np.mean([r["lq_mean_ssim"] for r in seed_records])),
-            "lq_mean_lpips": float(np.mean([r["lq_mean_lpips"] for r in seed_records])),
-            "per_image_psnr_range_mean": float(np.mean([r["psnr_range"] for r in sub_image_rows])),
-            "per_image_oracle_psnr_gain_mean": float(np.mean([r["oracle_psnr_gain"] for r in sub_image_rows])),
-            "images_with_psnr_range_ge_0_5_pct": float(np.mean([
-                r["psnr_range"] >= 0.5 for r in sub_image_rows
-            ]) * 100.0),
-        }
-
-    # Write CSV summary across all seeds
-    csv_path = output_root / "randomness_summary.csv"
-    with csv_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=[
-            "subdataset", "weather", "seed", "elapsed_sec",
-            "mean_psnr", "mean_ssim", "mean_lpips",
-            "mean_diversity_lpips_vs_seed0",
-            "lq_mean_psnr", "lq_mean_ssim", "lq_mean_lpips",
-        ])
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
-    print(f"[random] per-seed CSV -> {csv_path}")
-
-    per_image_path = output_root / "per_image_summary.csv"
-    with per_image_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=list(per_image_rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(per_image_rows)
-    print(f"[random] per-image CSV -> {per_image_path}")
-
-    # Aggregate per subdataset
-    agg_path = output_root / "per_subdataset_summary.csv"
-    with agg_path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=[
-            "subdataset", "weather", "n_samples",
-            "psnr_mean", "psnr_std",
-            "ssim_mean", "ssim_std",
-            "lpips_mean", "lpips_std",
-            "diversity_lpips_mean", "diversity_lpips_max",
-            "lq_mean_psnr", "lq_mean_ssim", "lq_mean_lpips",
-            "per_image_psnr_range_mean", "per_image_oracle_psnr_gain_mean",
-            "images_with_psnr_range_ge_0_5_pct",
-        ])
-        writer.writeheader()
-        for sub_name, stats in summary.items():
-            writer.writerow({"subdataset": sub_name, **stats})
-    print(f"[random] per-subdataset CSV -> {agg_path}")
-
-    json_path = output_root / "per_seed.json"
-    with json_path.open("w", encoding="utf-8") as fh:
-        serializable = []
-        for row in rows:
-            row = {k: v for k, v in row.items() if k != "pred_tensor"}
-            serializable.append(row)
-        json.dump({"per_seed": serializable, "summary": summary}, fh, indent=2, ensure_ascii=False)
-    print(f"[random] JSON summary  -> {json_path}")
-
-    print("\n=== Randomness summary ===")
-    for sub_name, stats in summary.items():
+    preprocess = build_preprocess(resolution)
+    first_lq = preprocess(Image.open(sample_records[0]["lq_path"]).convert("RGB"))
+    first_lq_pil = transforms.ToPILImage()(first_lq)
+    latent_shape = infer_latent_shape(
+        pipeline, first_lq_pil, resolution, device
+    )
+    noise_bank, created = load_or_create_noise_bank(
+        Path(args.noise_bank),
+        sample_ids,
+        latent_shape,
+        bank_size=args.noise_bank_size,
+        base_seed=args.noise_bank_seed,
+        chunk_size=args.noise_bank_chunk_size,
+    )
+    print(
+        f"[random] Noise Bank {'created' if created else 'loaded'}: {args.noise_bank}"
+    )
+    for stats in noise_bank.set_stats:
         print(
-            f"  {sub_name:>16s} ({stats['weather']:<5s}) "
-            f"PSNR={stats['psnr_mean']:.3f}±{stats['psnr_std']:.3f}  "
-            f"SSIM={stats['ssim_mean']:.4f}±{stats['ssim_std']:.4f}  "
-            f"LPIPS={stats['lpips_mean']:.3f}±{stats['lpips_std']:.3f}  "
-            f"divLPIPS vs seed0 mean={stats['diversity_lpips_mean']:.3f} max={stats['diversity_lpips_max']:.3f}  "
-            f"per-image PSNR range={stats['per_image_psnr_range_mean']:.3f} "
-            f"oracle gain={stats['per_image_oracle_psnr_gain_mean']:.3f} "
-            f"range>=0.5dB={stats['images_with_psnr_range_ge_0_5_pct']:.1f}%  "
-            f"| LQ baseline PSNR={stats['lq_mean_psnr']:.3f}"
+            f"[random] noise_{stats['noise_index']:02d} "
+            f"mean={stats['mean']:.6f} std={stats['std']:.6f} "
+            f"norm={stats['norm']:.3f} checksum={stats['checksum_sha256']}"
         )
+    if args.create_noise_bank_only:
+        return
+
+    try:
+        lpips_model = _get_lpips_model(
+            args_config.get("lpips_net", "alex"), device=device
+        )
+    except Exception as error:  # pragma: no cover
+        print(f"[random] LPIPS unavailable: {error}")
+        lpips_model = None
+
+    output_root = Path(args.output_dir)
+    candidates_root = output_root / "candidates"
+    output_root.mkdir(parents=True, exist_ok=True)
+    candidates_root.mkdir(parents=True, exist_ok=True)
+    with (output_root / "selected_samples.json").open("w", encoding="utf-8") as handle:
+        json.dump({"samples": sample_records}, handle, indent=2, ensure_ascii=False)
+
+    candidate_directories = {}
+    for record in sample_records:
+        image_dir = candidates_root / (
+            f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
+        )
+        image_dir.mkdir(parents=True, exist_ok=True)
+        candidate_directories[record["global_index"]] = image_dir
+
+    random.seed(20240805)
+    prompts = {
+        weather: maybe_make_prompt(weather, args_config)
+        for weather in sorted({row["weather"] for row in sample_records})
+    }
+    grouped_records: Dict[str, List[Dict]] = defaultdict(list)
+    for record in sample_records:
+        grouped_records[record["subdataset"]].append(record)
+
+    if args.verify_reproducibility:
+        test_records = [sample_records[0]]
+        test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)
+        test_noise = noise_bank.get(0, [0])
+        first_output = run_with_initial_noise(
+            pipeline, args_config, device, dtype, test_lq_pils,
+            prompts[test_records[0]["weather"]], test_noise, strength,
+            num_inference_steps, use_ra_fusion,
+        )
+        second_output = run_with_initial_noise(
+            pipeline, args_config, device, dtype, test_lq_pils,
+            prompts[test_records[0]["weather"]], test_noise, strength,
+            num_inference_steps, use_ra_fusion,
+        )
+        first_checksum = output_checksum(first_output[0])
+        second_checksum = output_checksum(second_output[0])
+        max_difference = float((first_output - second_output).abs().max())
+        print(
+            f"[random] reproducibility image_000000/noise_00: "
+            f"checksum_1={first_checksum} checksum_2={second_checksum} "
+            f"max_abs_diff={max_difference:.8f}"
+        )
+        if first_checksum != second_checksum:
+            raise RuntimeError(
+                "Reproducibility check failed: identical image/noise/config produced "
+                "different output checksums"
+            )
+
+    candidate_rows: List[Dict] = []
+    dataset_per_noise_rows: List[Dict] = []
+    all_scopes = list(grouped_records) + ["all"]
+
+    for noise_index in range(noise_bank.bank_size):
+        noise_metrics = {
+            scope: {metric: [] for metric in ("psnr", "ssim", "lpips")}
+            for scope in all_scopes
+        }
+        print(f"\n[random] ===== noise_{noise_index:02d} / 09 =====")
+
+        for subdataset, records in grouped_records.items():
+            for start in range(0, len(records), args.batch_size):
+                batch_records = records[start:start + args.batch_size]
+                global_indices = [row["global_index"] for row in batch_records]
+                lq_pils, lq_batch, gt_batch = load_image_batch(
+                    batch_records, preprocess, device
+                )
+                initial_noise = noise_bank.get(noise_index, global_indices)
+                begin = time.time()
+                predictions = run_with_initial_noise(
+                    pipeline,
+                    args_config,
+                    device,
+                    dtype,
+                    lq_pils,
+                    prompts[batch_records[0]["weather"]],
+                    initial_noise,
+                    strength,
+                    num_inference_steps,
+                    use_ra_fusion,
+                )
+                psnrs = psnr_batch(predictions, gt_batch)
+                ssims = ssim_batch(predictions, gt_batch)
+                try:
+                    lpips_values = lpips_batch(
+                        lpips_model, predictions, gt_batch, device, dtype
+                    )
+                except Exception as error:  # pragma: no cover
+                    print(f"[random] LPIPS batch failed: {error}")
+                    lpips_values = [float("nan")] * len(predictions)
+
+                for local_index, record in enumerate(batch_records):
+                    global_index = record["global_index"]
+                    image_dir = candidate_directories[global_index]
+                    if noise_index == 0:
+                        tensor_to_pil(lq_batch[local_index]).save(image_dir / "lq.png")
+                        tensor_to_pil(gt_batch[local_index]).save(image_dir / "gt.png")
+                    candidate_path = image_dir / f"candidate_{noise_index:02d}.png"
+                    tensor_to_pil(predictions[local_index]).save(candidate_path)
+                    noise_checksum = tensor_checksum(initial_noise[local_index])
+                    row = {
+                        **record,
+                        "noise_index": noise_index,
+                        "noise_checksum_sha256": noise_checksum,
+                        "psnr": psnrs[local_index],
+                        "ssim": ssims[local_index],
+                        "lpips": lpips_values[local_index],
+                        "candidate_path": str(candidate_path),
+                        "output_checksum_sha256": output_checksum(
+                            predictions[local_index]
+                        ),
+                    }
+                    candidate_rows.append(row)
+                    for scope in (subdataset, "all"):
+                        noise_metrics[scope]["psnr"].append(psnrs[local_index])
+                        noise_metrics[scope]["ssim"].append(ssims[local_index])
+                        noise_metrics[scope]["lpips"].append(lpips_values[local_index])
+
+                print(
+                    f"[random] {subdataset} noise={noise_index:02d} "
+                    f"images={global_indices[0]}..{global_indices[-1]} "
+                    f"PSNR={np.mean(psnrs):.3f} SSIM={np.mean(ssims):.4f} "
+                    f"LPIPS={np.nanmean(lpips_values):.4f} "
+                    f"({time.time() - begin:.1f}s)"
+                )
+
+        for scope in all_scopes:
+            dataset_per_noise_rows.append({
+                "scope": scope,
+                "noise_index": noise_index,
+                "n_images": len(noise_metrics[scope]["psnr"]),
+                "psnr": finite_stats(noise_metrics[scope]["psnr"])["mean"],
+                "ssim": finite_stats(noise_metrics[scope]["ssim"])["mean"],
+                "lpips": finite_stats(noise_metrics[scope]["lpips"])["mean"],
+                "noise_set_checksum_sha256": noise_bank.set_stats[noise_index][
+                    "checksum_sha256"
+                ],
+            })
+        write_csv(output_root / "per_candidate_metrics.csv", candidate_rows)
+        write_csv(output_root / "dataset_per_noise.csv", dataset_per_noise_rows)
+
+    rows_by_image: Dict[int, List[Dict]] = defaultdict(list)
+    for row in candidate_rows:
+        rows_by_image[row["global_index"]].append(row)
+
+    sample_summary_rows = []
+    for record in sample_records:
+        global_index = record["global_index"]
+        rows = sorted(rows_by_image[global_index], key=lambda row: row["noise_index"])
+        psnrs = [row["psnr"] for row in rows]
+        ssims = [row["ssim"] for row in rows]
+        lpips_values = [row["lpips"] for row in rows]
+        candidate_paths = [Path(row["candidate_path"]) for row in rows]
+        pairwise_mean, pairwise_max = pairwise_lpips_for_candidates(
+            candidate_paths, lpips_model, device, dtype, args.pairwise_batch_size
+        )
+        best_psnr_index = int(np.nanargmax(psnrs))
+        best_lpips_index = int(np.nanargmin(lpips_values)) if np.isfinite(lpips_values).any() else -1
+        psnr_stats = finite_stats(psnrs)
+        lpips_stats = finite_stats(lpips_values)
+        sample_summary_rows.append({
+            **record,
+            **prefixed_stats("psnr", psnrs),
+            **prefixed_stats("ssim", ssims),
+            **prefixed_stats("lpips", lpips_values),
+            "best_worst_psnr_gap": psnr_stats["max"] - psnr_stats["min"],
+            "best_worst_lpips_gap": lpips_stats["max"] - lpips_stats["min"],
+            "best_psnr_noise_index": rows[best_psnr_index]["noise_index"],
+            "best_lpips_noise_index": (
+                rows[best_lpips_index]["noise_index"] if best_lpips_index >= 0 else -1
+            ),
+            "pairwise_lpips_mean": pairwise_mean,
+            "pairwise_lpips_max": pairwise_max,
+        })
+        print(
+            f"[random] sample {global_index + 1}/{len(sample_records)} "
+            f"pairwise LPIPS mean={pairwise_mean:.4f} max={pairwise_max:.4f}"
+        )
+
+    dataset_summary_rows = []
+    for scope in all_scopes:
+        noise_rows = [row for row in dataset_per_noise_rows if row["scope"] == scope]
+        if scope == "all":
+            sample_rows = sample_summary_rows
+        else:
+            sample_rows = [
+                row for row in sample_summary_rows if row["subdataset"] == scope
+            ]
+        dataset_summary_rows.append({
+            "scope": scope,
+            "n_images": len(sample_rows),
+            "noise_bank_size": noise_bank.bank_size,
+            **prefixed_stats("dataset_psnr", [row["psnr"] for row in noise_rows]),
+            **prefixed_stats("dataset_ssim", [row["ssim"] for row in noise_rows]),
+            **prefixed_stats("dataset_lpips", [row["lpips"] for row in noise_rows]),
+            "average_sample_psnr_std": float(np.mean([
+                row["psnr_std"] for row in sample_rows
+            ])),
+            "average_best_worst_psnr_gap": float(np.mean([
+                row["best_worst_psnr_gap"] for row in sample_rows
+            ])),
+            "average_sample_lpips_std": float(np.nanmean([
+                row["lpips_std"] for row in sample_rows
+            ])),
+            "average_best_worst_lpips_gap": float(np.nanmean([
+                row["best_worst_lpips_gap"] for row in sample_rows
+            ])),
+            "average_pairwise_lpips": float(np.nanmean([
+                row["pairwise_lpips_mean"] for row in sample_rows
+            ])),
+            "maximum_pairwise_lpips": float(np.nanmax([
+                row["pairwise_lpips_max"] for row in sample_rows
+            ])),
+        })
+
+    write_csv(output_root / "sample_summary.csv", sample_summary_rows)
+    write_csv(output_root / "dataset_summary.csv", dataset_summary_rows)
+    settings = {
+        "noise_bank": str(Path(args.noise_bank)),
+        "noise_bank_created_this_run": created,
+        "noise_bank_size": noise_bank.bank_size,
+        "latent_shape": list(latent_shape),
+        "n_validation_images": len(sample_records),
+        "checkpoint_controlnet": args_config.get("controlnet_model_path"),
+        "checkpoint_ra_fusion": args_config.get("ra_fusion_path"),
+        "strength": strength,
+        "num_inference_steps": num_inference_steps,
+        "controlnet_conditioning_scale": args_config.get(
+            "controlnet_conditioning_scale", 1.0
+        ),
+        "guidance_scale": args_config.get("guidance_scale", 1.5),
+        "scheduler": type(pipeline.scheduler).__name__,
+        "use_ra_fusion": use_ra_fusion,
+        "ra_fusion_scale": ra_fusion_scale,
+        "use_rss": use_rss,
+        "rss_weight": args_config.get("rss_weight", 0.01),
+        "rss_threshold": args_config.get("rss_threshold", 0.8),
+        "use_prompt": bool(args_config.get("use_prompt", False)),
+        "prompts": prompts,
+        "base_model": args_config.get("pretrained_model_name_or_path"),
+        "resolution": resolution,
+        "dtype": str(dtype),
+        "batch_size": args.batch_size,
+        "pairwise_batch_size": args.pairwise_batch_size,
+        "controlnet_vae_conditioning": "posterior_mode",
+        "reward_available": False,
+    }
+    with (output_root / "summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(
+            json_safe({
+                "settings": settings,
+                "noise_bank_stats": noise_bank.set_stats,
+                "dataset_summary": dataset_summary_rows,
+            }),
+            handle,
+            indent=2,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+
+    print("\n=== Fixed Noise Bank summary ===")
+    for row in dataset_summary_rows:
+        print(
+            f"{row['scope']:>16s} "
+            f"PSNR={row['dataset_psnr_mean']:.3f}±{row['dataset_psnr_std']:.3f} "
+            f"SSIM={row['dataset_ssim_mean']:.4f}±{row['dataset_ssim_std']:.4f} "
+            f"LPIPS={row['dataset_lpips_mean']:.4f}±{row['dataset_lpips_std']:.4f} "
+            f"sample PSNR std={row['average_sample_psnr_std']:.3f} "
+            f"PSNR gap={row['average_best_worst_psnr_gap']:.3f} "
+            f"pairwise LPIPS={row['average_pairwise_lpips']:.4f}"
+        )
+    print(f"[random] candidates -> {candidates_root}")
 
 
 if __name__ == "__main__":
