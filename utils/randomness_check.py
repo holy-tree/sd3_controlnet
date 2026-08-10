@@ -75,6 +75,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--pairwise_batch_size", type=int, default=16)
+    parser.add_argument(
+        "--max_samples_per_weather",
+        type=int,
+        default=None,
+        help="覆盖 YAML 的评估图片上限；0 或负数表示完整验证集",
+    )
     parser.add_argument("--strength", type=float, default=None)
     parser.add_argument("--max_inference_steps", type=int, default=None)
     parser.add_argument("--controlnet_conditioning_scale", type=float, default=None)
@@ -176,6 +182,39 @@ def load_image_batch(records: Sequence[Dict], preprocess, device):
         torch.stack(lq_tensors).to(device),
         torch.stack(gt_tensors).to(device),
     )
+
+
+def select_evaluation_records(
+    all_records: Sequence[Dict],
+    max_samples_per_weather: int,
+    sample_mode: str,
+    sample_seed: int,
+) -> List[Dict]:
+    """Apply the same per-subdataset truncation semantics as evaluate_sd3.py."""
+    if sample_mode not in ("head", "random"):
+        raise ValueError(f"Unsupported sample_mode: {sample_mode}")
+    grouped: Dict[str, List[Dict]] = defaultdict(list)
+    for record in all_records:
+        grouped[record["subdataset"]].append(record)
+
+    rng = random.Random(sample_seed)
+    selected = []
+    for subdataset, records in grouped.items():
+        records = list(records)
+        if max_samples_per_weather > 0 and len(records) > max_samples_per_weather:
+            if sample_mode == "random":
+                rng.shuffle(records)
+            records = records[:max_samples_per_weather]
+        print(
+            f"[random] {subdataset}: evaluating {len(records)} / "
+            f"{len(grouped[subdataset])} images ({sample_mode})"
+        )
+        selected.extend(records)
+
+    return [
+        {**record, "global_index": selected_index}
+        for selected_index, record in enumerate(selected)
+    ]
 
 
 @torch.no_grad()
@@ -350,13 +389,20 @@ def main() -> None:
     elif args_config.get("mixed_precision") == "bf16":
         dtype = torch.bfloat16
     resolution = int(args_config.get("resolution", 512))
+    max_samples_per_weather = (
+        args.max_samples_per_weather
+        if args.max_samples_per_weather is not None
+        else int(args_config.get("max_samples_per_weather", 0))
+    )
+    sample_mode = str(args_config.get("sample_mode", "head")).lower()
+    sample_seed = int(args_config.get("seed", 20240805))
 
     raw_samples = build_dataset_for_eval(args_config)
     if not raw_samples:
         raise SystemExit("No validation samples found; check dataset paths")
-    sample_records = [
+    all_sample_records = [
         {
-            "global_index": index,
+            "noise_bank_index": index,
             "gt_path": gt_path,
             "lq_path": lq_path,
             "weather": weather,
@@ -366,7 +412,7 @@ def main() -> None:
     ]
     sample_ids = [
         sample_identifier(row["subdataset"], row["lq_path"], row["gt_path"])
-        for row in sample_records
+        for row in all_sample_records
     ]
 
     pipeline = setup_pipeline(
@@ -378,7 +424,7 @@ def main() -> None:
         ra_fusion_scale = float(pipeline.transformer.ra_fusion_scale)
 
     preprocess = build_preprocess(resolution)
-    first_lq = preprocess(Image.open(sample_records[0]["lq_path"]).convert("RGB"))
+    first_lq = preprocess(Image.open(all_sample_records[0]["lq_path"]).convert("RGB"))
     first_lq_pil = transforms.ToPILImage()(first_lq)
     latent_shape = infer_latent_shape(
         pipeline, first_lq_pil, resolution, device
@@ -402,6 +448,13 @@ def main() -> None:
         )
     if args.create_noise_bank_only:
         return
+
+    sample_records = select_evaluation_records(
+        all_sample_records,
+        max_samples_per_weather,
+        sample_mode,
+        sample_seed,
+    )
 
     try:
         lpips_model = _get_lpips_model(
@@ -438,7 +491,7 @@ def main() -> None:
     if args.verify_reproducibility:
         test_records = [sample_records[0]]
         test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)
-        test_noise = noise_bank.get(0, [0])
+        test_noise = noise_bank.get(0, [test_records[0]["noise_bank_index"]])
         first_output = run_with_initial_noise(
             pipeline, args_config, device, dtype, test_lq_pils,
             prompts[test_records[0]["weather"]], test_noise, strength,
@@ -478,10 +531,13 @@ def main() -> None:
             for start in range(0, len(records), args.batch_size):
                 batch_records = records[start:start + args.batch_size]
                 global_indices = [row["global_index"] for row in batch_records]
+                noise_bank_indices = [
+                    row["noise_bank_index"] for row in batch_records
+                ]
                 lq_pils, lq_batch, gt_batch = load_image_batch(
                     batch_records, preprocess, device
                 )
-                initial_noise = noise_bank.get(noise_index, global_indices)
+                initial_noise = noise_bank.get(noise_index, noise_bank_indices)
                 begin = time.time()
                 predictions = run_with_initial_noise(
                     pipeline,
@@ -637,6 +693,10 @@ def main() -> None:
         "noise_bank_size": noise_bank.bank_size,
         "latent_shape": list(latent_shape),
         "n_validation_images": len(sample_records),
+        "n_noise_bank_images": len(all_sample_records),
+        "max_samples_per_weather": max_samples_per_weather,
+        "sample_mode": sample_mode,
+        "sample_seed": sample_seed,
         "checkpoint_controlnet": args_config.get("controlnet_model_path"),
         "checkpoint_ra_fusion": args_config.get("ra_fusion_path"),
         "strength": strength,
