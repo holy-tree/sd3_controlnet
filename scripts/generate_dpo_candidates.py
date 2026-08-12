@@ -13,7 +13,6 @@ import yaml
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate SD3 restoration DPO candidates")
     parser.add_argument("--config", default="./config/dpo_sd3.yaml")
-    parser.add_argument("--create_noise_bank_only", action="store_true")
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
     with open(args.config, "r", encoding="utf-8") as handle:
@@ -28,14 +27,10 @@ def main() -> None:
         str(generation.get("eval_config", "./config/eval_sd3.yaml")),
         "--output_dir",
         str(generation["output_dir"]),
-        "--noise_bank",
-        str(generation["noise_bank"]),
-        "--noise_bank_size",
+        "--num_candidates_per_image",
         str(generation.get("num_candidates_per_image", 8)),
-        "--noise_bank_seed",
-        str(generation.get("noise_bank_seed", 20240805)),
-        "--noise_bank_chunk_size",
-        str(generation.get("noise_bank_chunk_size", 128)),
+        "--seed",
+        str(generation.get("seed", 20240805)),
         "--batch_size",
         str(generation.get("batch_size", 1)),
         "--pairwise_batch_size",
@@ -83,8 +78,6 @@ def main() -> None:
         value = generation.get(key)
         if value is not None:
             command.append(flag if value else f"--no-{flag.removeprefix('--')}")
-    if args.create_noise_bank_only:
-        command.append("--create_noise_bank_only")
     root = Path(__file__).resolve().parents[1]
     print("[candidate] " + " ".join(command))
     if args.dry_run:

@@ -1,4 +1,4 @@
-"""Reproducible SD3 restoration randomness evaluation with a fixed Noise Bank."""
+"""Seeded SD3 restoration candidate generation and quality evaluation."""
 from __future__ import annotations
 
 import argparse
@@ -40,11 +40,6 @@ from utils.evaluate_sd3 import (  # noqa: E402
     ssim_batch,
 )
 from dpo.provenance import checkpoint_checksum  # noqa: E402
-from utils.noise_bank import (  # noqa: E402
-    load_or_create_noise_bank,
-    sample_identifier,
-    tensor_checksum,
-)
 from utils.rss import (  # noqa: E402
     encode_rss_condition,
     make_rss_callback,
@@ -54,22 +49,15 @@ from utils.rss import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate restoration candidates with a persistent Noise Bank."
+        description="Generate restoration candidates from deterministic per-sample seeds."
     )
     parser.add_argument("--config", default="./config/eval_sd3.yaml")
     parser.add_argument(
         "--output_dir",
         default="/root/autodl-tmp/sd3/experiment/randomness_results",
     )
-    parser.add_argument(
-        "--noise_bank",
-        default="/root/autodl-tmp/sd3/experiment/noise_bank.pt",
-        help="可跨模型/checkpoint/消融实验复用的固定 Noise Bank 清单路径",
-    )
-    parser.add_argument("--noise_bank_size", type=int, default=10)
-    parser.add_argument("--noise_bank_seed", type=int, default=20240805)
-    parser.add_argument("--noise_bank_chunk_size", type=int, default=128)
-    parser.add_argument("--create_noise_bank_only", action="store_true")
+    parser.add_argument("--num_candidates_per_image", type=int, default=8)
+    parser.add_argument("--seed", type=int, default=20240805)
     parser.add_argument(
         "--verify_reproducibility",
         action=argparse.BooleanOptionalAction,
@@ -139,6 +127,28 @@ def output_checksum(image: torch.Tensor) -> str:
         image.detach().float().cpu().clamp(0, 1).numpy() * 255
     ).round().astype("uint8")
     return hashlib.sha256(array.tobytes()).hexdigest()
+
+
+def candidate_seed(base_seed: int, candidate_index: int, sample_index: int) -> int:
+    """Derive a stable seed independent of batch size and processing order."""
+    payload = f"{base_seed}:{candidate_index}:{sample_index}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") % (2 ** 63 - 1)
+
+
+def make_candidate_noise(
+    records: Sequence[Dict],
+    candidate_index: int,
+    latent_shape: Tuple[int, int, int],
+    base_seed: int,
+) -> tuple[torch.Tensor, List[int]]:
+    noises = []
+    seeds = []
+    for record in records:
+        seed = candidate_seed(base_seed, candidate_index, int(record["global_index"]))
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+        noises.append(torch.randn(latent_shape, generator=generator, dtype=torch.float32))
+        seeds.append(seed)
+    return torch.stack(noises), seeds
 
 
 def finite_stats(values: Sequence[float]) -> Dict[str, float]:
@@ -446,8 +456,8 @@ def main() -> None:
     if args.splits is not None:
         args_config["splits"] = args.splits
 
-    if args.noise_bank_size < 2:
-        raise ValueError("Candidate generation requires noise_bank_size >= 2")
+    if args.num_candidates_per_image < 2:
+        raise ValueError("Candidate generation requires num_candidates_per_image >= 2")
     if args.batch_size <= 0 or args.pairwise_batch_size <= 0:
         raise ValueError("batch sizes must be positive")
     if args.max_saved_groups_per_weather <= 0:
@@ -508,7 +518,6 @@ def main() -> None:
         raise SystemExit("No validation samples found; check dataset paths")
     all_sample_records = [
         {
-            "noise_bank_index": index,
             "gt_path": str(Path(gt_path).expanduser().resolve()),
             "lq_path": str(Path(lq_path).expanduser().resolve()),
             "weather": weather,
@@ -516,11 +525,6 @@ def main() -> None:
         }
         for index, (gt_path, lq_path, weather, subdataset) in enumerate(raw_samples)
     ]
-    sample_ids = [
-        sample_identifier(row["subdataset"], row["lq_path"], row["gt_path"])
-        for row in all_sample_records
-    ]
-
     pipeline = setup_pipeline(
         args_config, dtype, device, ra_fusion_scale, use_ra_fusion
     )
@@ -535,26 +539,6 @@ def main() -> None:
     latent_shape = infer_latent_shape(
         pipeline, first_lq_pil, resolution, device
     )
-    noise_bank, created = load_or_create_noise_bank(
-        Path(args.noise_bank),
-        sample_ids,
-        latent_shape,
-        bank_size=args.noise_bank_size,
-        base_seed=args.noise_bank_seed,
-        chunk_size=args.noise_bank_chunk_size,
-    )
-    print(
-        f"[random] Noise Bank {'created' if created else 'loaded'}: {args.noise_bank}"
-    )
-    for stats in noise_bank.set_stats:
-        print(
-            f"[random] noise_{stats['noise_index']:02d} "
-            f"mean={stats['mean']:.6f} std={stats['std']:.6f} "
-            f"norm={stats['norm']:.3f} checksum={stats['checksum_sha256']}"
-        )
-    if args.create_noise_bank_only:
-        return
-
     sample_records = select_evaluation_records(
         all_sample_records,
         max_samples_per_weather,
@@ -586,7 +570,7 @@ def main() -> None:
         image_dir.mkdir(parents=True, exist_ok=True)
         candidate_directories[record["global_index"]] = image_dir
 
-    random.seed(20240805)
+    random.seed(args.seed)
     prompts = {
         weather: maybe_make_prompt(weather, args_config)
         for weather in sorted({row["weather"] for row in sample_records})
@@ -598,7 +582,7 @@ def main() -> None:
     if args.verify_reproducibility:
         test_records = [sample_records[0]]
         test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)
-        test_noise = noise_bank.get(0, [test_records[0]["noise_bank_index"]])
+        test_noise, _ = make_candidate_noise(test_records, 0, latent_shape, args.seed)
         first_output = run_with_initial_noise(
             pipeline, args_config, device, dtype, test_lq_pils,
             prompts[test_records[0]["weather"]], test_noise, strength,
@@ -613,7 +597,7 @@ def main() -> None:
         second_checksum = output_checksum(second_output[0])
         max_difference = float((first_output - second_output).abs().max())
         print(
-            f"[random] reproducibility image_000000/noise_00: "
+            f"[random] reproducibility image_000000/candidate_00: "
             f"checksum_1={first_checksum} checksum_2={second_checksum} "
             f"max_abs_diff={max_difference:.8f}"
         )
@@ -630,31 +614,33 @@ def main() -> None:
         (len(records) + args.batch_size - 1) // args.batch_size
         for records in grouped_records.values()
     )
-    total_generation_batches = noise_bank.bank_size * batches_per_noise
+    total_generation_batches = args.num_candidates_per_image * batches_per_noise
     completed_generation_batches = 0
     generation_started_at = time.time()
 
-    for noise_index in range(noise_bank.bank_size):
+    for noise_index in range(args.num_candidates_per_image):
         noise_metrics = {
             scope: {metric: [] for metric in ("psnr", "ssim", "lpips")}
             for scope in all_scopes
         }
         print(
-            f"\n[random] ===== noise_{noise_index:02d} / "
-            f"{noise_bank.bank_size - 1:02d} ====="
+            f"\n[random] ===== candidate_{noise_index:02d} / "
+            f"{args.num_candidates_per_image - 1:02d} ====="
         )
 
         for subdataset, records in grouped_records.items():
             for start in range(0, len(records), args.batch_size):
                 batch_records = records[start:start + args.batch_size]
                 global_indices = [row["global_index"] for row in batch_records]
-                noise_bank_indices = [
-                    row["noise_bank_index"] for row in batch_records
-                ]
                 lq_pils, lq_batch, gt_batch = load_image_batch(
                     batch_records, preprocess, device
                 )
-                initial_noise = noise_bank.get(noise_index, noise_bank_indices)
+                initial_noise, candidate_seeds = make_candidate_noise(
+                    batch_records,
+                    noise_index,
+                    latent_shape,
+                    args.seed,
+                )
                 predictions = run_with_initial_noise(
                     pipeline,
                     args_config,
@@ -684,11 +670,11 @@ def main() -> None:
                         tensor_to_pil(gt_batch[local_index]).save(image_dir / "gt.png")
                     candidate_path = image_dir / f"candidate_{noise_index:02d}.png"
                     tensor_to_pil(predictions[local_index]).save(candidate_path)
-                    noise_checksum = tensor_checksum(initial_noise[local_index])
                     row = {
                         **record,
+                        "candidate_index": noise_index,
+                        "candidate_seed": candidate_seeds[local_index],
                         "noise_index": noise_index,
-                        "noise_checksum_sha256": noise_checksum,
                         "psnr": psnrs[local_index],
                         "ssim": ssims[local_index],
                         "lpips": lpips_values[local_index],
@@ -716,7 +702,7 @@ def main() -> None:
                     if total_generation_batches > 0 else 100.0
                 )
                 print(
-                    f"[random] {subdataset} noise={noise_index:02d} "
+                    f"[random] {subdataset} candidate={noise_index:02d} "
                     f"images={global_indices[0]}..{global_indices[-1]} "
                     f"PSNR={np.mean(psnrs):.3f} SSIM={np.mean(ssims):.4f} "
                     f"LPIPS={np.nanmean(lpips_values):.4f} "
@@ -732,9 +718,6 @@ def main() -> None:
                 "psnr": finite_stats(noise_metrics[scope]["psnr"])["mean"],
                 "ssim": finite_stats(noise_metrics[scope]["ssim"])["mean"],
                 "lpips": finite_stats(noise_metrics[scope]["lpips"])["mean"],
-                "noise_set_checksum_sha256": noise_bank.set_stats[noise_index][
-                    "checksum_sha256"
-                ],
             })
     rows_by_image: Dict[int, List[Dict]] = defaultdict(list)
     for row in candidate_rows:
@@ -816,7 +799,7 @@ def main() -> None:
     retained_scopes = retained_subdatasets + (["all"] if retained_records else [])
     dataset_per_noise_rows = []
     for scope in retained_scopes:
-        for noise_index in range(noise_bank.bank_size):
+        for noise_index in range(args.num_candidates_per_image):
             scoped_rows = [
                 row
                 for row in candidate_rows
@@ -830,9 +813,6 @@ def main() -> None:
                 "psnr": finite_stats([row["psnr"] for row in scoped_rows])["mean"],
                 "ssim": finite_stats([row["ssim"] for row in scoped_rows])["mean"],
                 "lpips": finite_stats([row["lpips"] for row in scoped_rows])["mean"],
-                "noise_set_checksum_sha256": noise_bank.set_stats[noise_index][
-                    "checksum_sha256"
-                ],
             })
     dataset_summary_rows = []
     for scope in retained_scopes:
@@ -846,7 +826,7 @@ def main() -> None:
         dataset_summary_rows.append({
             "scope": scope,
             "n_images": len(sample_rows),
-            "noise_bank_size": noise_bank.bank_size,
+            "num_candidates_per_image": args.num_candidates_per_image,
             **prefixed_stats("dataset_psnr", [row["psnr"] for row in noise_rows]),
             **prefixed_stats("dataset_ssim", [row["ssim"] for row in noise_rows]),
             **prefixed_stats("dataset_lpips", [row["lpips"] for row in noise_rows]),
@@ -874,14 +854,14 @@ def main() -> None:
     write_csv(output_root / "dataset_per_noise.csv", dataset_per_noise_rows)
     write_csv(output_root / "dataset_summary.csv", dataset_summary_rows)
     settings = {
-        "noise_bank": str(Path(args.noise_bank)),
-        "noise_bank_created_this_run": created,
-        "noise_bank_size": noise_bank.bank_size,
+        "candidate_seed": args.seed,
+        "candidate_seed_strategy": "sha256(base_seed:candidate_index:global_index)",
+        "num_candidates_per_image": args.num_candidates_per_image,
         "latent_shape": list(latent_shape),
         "n_generated_images": len(sample_records),
         "n_retained_images": len(retained_records),
         "n_rejected_images": len(rejected_records),
-        "n_noise_bank_images": len(all_sample_records),
+        "n_dataset_images": len(all_sample_records),
         "max_samples_per_weather": max_samples_per_weather,
         "weather_psnr_gap_thresholds": weather_thresholds,
         "max_saved_groups_per_weather": args.max_saved_groups_per_weather,
@@ -963,7 +943,6 @@ def main() -> None:
             json_safe({
                 "settings": settings,
                 "candidate_policy": candidate_policy,
-                "noise_bank_stats": noise_bank.set_stats,
                 "dataset_summary": dataset_summary_rows,
             }),
             handle,
@@ -972,7 +951,7 @@ def main() -> None:
             allow_nan=False,
         )
 
-    print("\n=== Fixed Noise Bank summary ===")
+    print("\n=== Seeded candidate summary ===")
     for row in dataset_summary_rows:
         print(
             f"{row['scope']:>16s} "

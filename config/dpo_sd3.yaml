@@ -20,13 +20,10 @@ candidate_generation:
   dataset_haze: "/root/autodl-tmp/datasets/haze"
   splits: ["train"]
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
-  # Noise Banks are bound to dataset paths, split, order, K, and latent shape.
-  # Use a dedicated path for this train/K=8 candidate set.
-  noise_bank: "/root/autodl-tmp/sd3/experiment/dpo_noise_bank_train_k8.pt"
   # Generate exactly eight candidates for every source image.
   num_candidates_per_image: 8
-  noise_bank_seed: 20240805
-  noise_bank_chunk_size: 128
+  # Per-candidate noise is generated directly from this base seed.
+  seed: 20240805
   batch_size: 16
   pairwise_batch_size: 16
   # 0 means all samples in each subdataset.
