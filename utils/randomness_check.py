@@ -8,6 +8,7 @@ import hashlib
 import itertools
 import json
 import random
+import shutil
 import sys
 import time
 from unittest.mock import patch
@@ -35,8 +36,10 @@ from utils.evaluate_sd3 import (  # noqa: E402
     maybe_make_prompt,
     prepare_image_conditioned_latents,
     psnr_batch,
+    resolve_controlnet_path,
     ssim_batch,
 )
+from dpo.provenance import checkpoint_checksum  # noqa: E402
 from utils.noise_bank import (  # noqa: E402
     load_or_create_noise_bank,
     sample_identifier,
@@ -51,7 +54,7 @@ from utils.rss import (  # noqa: E402
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate restoration randomness with a persistent K=10 Noise Bank."
+        description="Generate restoration candidates with a persistent Noise Bank."
     )
     parser.add_argument("--config", default="./config/eval_sd3.yaml")
     parser.add_argument(
@@ -97,6 +100,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--controlnet_model_path", default=None)
     parser.add_argument("--ra_fusion_path", default=None)
+    parser.add_argument("--pretrained_model_name_or_path", default=None)
+    parser.add_argument("--revision", default=None)
+    parser.add_argument("--variant", default=None)
+    parser.add_argument(
+        "--load_transformer_lora",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--dataset_rain", default=None)
+    parser.add_argument("--dataset_snow", default=None)
+    parser.add_argument("--dataset_haze", default=None)
+    parser.add_argument("--rain_psnr_gap", type=float, default=0.2)
+    parser.add_argument("--snow_psnr_gap", type=float, default=0.62)
+    parser.add_argument("--haze_psnr_gap", type=float, default=2.5)
+    parser.add_argument("--max_saved_groups_per_weather", type=int, default=10000)
     return parser.parse_args()
 
 
@@ -151,12 +169,70 @@ def json_safe(value):
 
 def write_csv(path: Path, rows: List[Dict]) -> None:
     if not rows:
+        path.unlink(missing_ok=True)
         return
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
     print(f"[random] CSV -> {path}")
+
+
+def select_candidate_groups(
+    sample_records: Sequence[Dict],
+    rows_by_image: Dict[int, List[Dict]],
+    weather_thresholds: Dict[str, float],
+    max_saved_groups_per_weather: int,
+) -> tuple[List[Dict], List[Dict]]:
+    """Keep the largest-gap qualified groups independently for each weather."""
+    qualified: Dict[str, List[tuple[float, Dict]]] = defaultdict(list)
+    rejected = []
+    for record in sample_records:
+        rows = rows_by_image.get(record["global_index"], [])
+        if not rows:
+            rejected.append({**record, "reason": "missing_candidates", "psnr_gap": None})
+            continue
+        weather = record["weather"]
+        if weather not in weather_thresholds:
+            raise KeyError(f"Missing PSNR gap threshold for weather: {weather}")
+        psnr_values = [float(row["psnr"]) for row in rows]
+        gap = max(psnr_values) - min(psnr_values)
+        threshold = weather_thresholds[weather]
+        enriched = {**record, "psnr_gap": gap, "psnr_gap_threshold": threshold}
+        if gap + 1e-9 >= threshold:
+            qualified[weather].append((gap, enriched))
+        else:
+            rejected.append({**enriched, "reason": "psnr_gap_below_threshold"})
+
+    retained = []
+    for weather, records in qualified.items():
+        records.sort(key=lambda item: (-item[0], item[1]["global_index"]))
+        retained.extend(record for _, record in records[:max_saved_groups_per_weather])
+        rejected.extend(
+            {**record, "reason": "weather_group_limit"}
+            for _, record in records[max_saved_groups_per_weather:]
+        )
+    retained.sort(key=lambda record: record["global_index"])
+    rejected.sort(key=lambda record: record["global_index"])
+    return retained, rejected
+
+
+def write_group_metrics(
+    image_dir: Path,
+    rows: Sequence[Dict],
+    psnr_gap: float,
+    psnr_gap_threshold: float,
+) -> None:
+    with (image_dir / "metrics.txt").open("w", encoding="utf-8") as handle:
+        handle.write("# candidate, PSNR(dB), SSIM, LPIPS\n")
+        for row in sorted(rows, key=lambda item: item["noise_index"]):
+            handle.write(
+                f"candidate_{int(row['noise_index']):02d}.png, "
+                f"{float(row['psnr']):.6f}, {float(row['ssim']):.6f}, "
+                f"{float(row['lpips']):.6f}\n"
+            )
+        handle.write(f"\npsnr_gap: {psnr_gap:.6f}\n")
+        handle.write(f"psnr_gap_threshold: {psnr_gap_threshold:.6f}\n")
 
 
 def build_preprocess(resolution: int):
@@ -341,18 +417,38 @@ def pairwise_lpips_for_candidates(
 def main() -> None:
     args = parse_args()
     args_config = load_config(args.config)
-    for key in ("controlnet_model_path", "ra_fusion_path",
-                "controlnet_conditioning_scale"):
+    for key in (
+        "controlnet_model_path",
+        "ra_fusion_path",
+        "pretrained_model_name_or_path",
+        "revision",
+        "variant",
+        "controlnet_conditioning_scale",
+        "dataset_rain",
+        "dataset_snow",
+        "dataset_haze",
+    ):
         value = getattr(args, key)
         if value is not None:
             args_config[key] = value
     if args.use_prompt is not None:
         args_config["use_prompt"] = args.use_prompt
+    if args.load_transformer_lora is not None:
+        args_config["load_transformer_lora"] = args.load_transformer_lora
 
-    if args.noise_bank_size != 10:
-        raise ValueError("This evaluation requires exactly K=10 Noise Bank sets")
+    if args.noise_bank_size < 2:
+        raise ValueError("Candidate generation requires noise_bank_size >= 2")
     if args.batch_size <= 0 or args.pairwise_batch_size <= 0:
         raise ValueError("batch sizes must be positive")
+    if args.max_saved_groups_per_weather <= 0:
+        raise ValueError("max_saved_groups_per_weather must be positive")
+    weather_thresholds = {
+        "rain": float(args.rain_psnr_gap),
+        "snow": float(args.snow_psnr_gap),
+        "haze": float(args.haze_psnr_gap),
+    }
+    if any(value < 0.0 for value in weather_thresholds.values()):
+        raise ValueError("Weather PSNR gap thresholds must be non-negative")
 
     strength = (
         args.strength if args.strength is not None
@@ -403,8 +499,8 @@ def main() -> None:
     all_sample_records = [
         {
             "noise_bank_index": index,
-            "gt_path": gt_path,
-            "lq_path": lq_path,
+            "gt_path": str(Path(gt_path).expanduser().resolve()),
+            "lq_path": str(Path(lq_path).expanduser().resolve()),
             "weather": weather,
             "subdataset": subdataset,
         }
@@ -461,19 +557,20 @@ def main() -> None:
             args_config.get("lpips_net", "alex"), device=device
         )
     except Exception as error:  # pragma: no cover
-        print(f"[random] LPIPS unavailable: {error}")
-        lpips_model = None
+        raise RuntimeError("LPIPS is required for offline candidate metrics") from error
 
-    output_root = Path(args.output_dir)
+    output_root = Path(args.output_dir).expanduser().resolve()
     candidates_root = output_root / "candidates"
+    staging_root = output_root / ".candidate_staging"
     output_root.mkdir(parents=True, exist_ok=True)
+    for directory in (candidates_root, staging_root):
+        if directory.exists():
+            shutil.rmtree(directory)
     candidates_root.mkdir(parents=True, exist_ok=True)
-    with (output_root / "selected_samples.json").open("w", encoding="utf-8") as handle:
-        json.dump({"samples": sample_records}, handle, indent=2, ensure_ascii=False)
-
+    staging_root.mkdir(parents=True, exist_ok=True)
     candidate_directories = {}
     for record in sample_records:
-        image_dir = candidates_root / (
+        image_dir = staging_root / (
             f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
         )
         image_dir.mkdir(parents=True, exist_ok=True)
@@ -525,7 +622,10 @@ def main() -> None:
             scope: {metric: [] for metric in ("psnr", "ssim", "lpips")}
             for scope in all_scopes
         }
-        print(f"\n[random] ===== noise_{noise_index:02d} / 09 =====")
+        print(
+            f"\n[random] ===== noise_{noise_index:02d} / "
+            f"{noise_bank.bank_size - 1:02d} ====="
+        )
 
         for subdataset, records in grouped_records.items():
             for start in range(0, len(records), args.batch_size):
@@ -558,8 +658,7 @@ def main() -> None:
                         lpips_model, predictions, gt_batch, device, dtype
                     )
                 except Exception as error:  # pragma: no cover
-                    print(f"[random] LPIPS batch failed: {error}")
-                    lpips_values = [float("nan")] * len(predictions)
+                    raise RuntimeError("Failed to compute candidate LPIPS") from error
 
                 for local_index, record in enumerate(batch_records):
                     global_index = record["global_index"]
@@ -577,6 +676,7 @@ def main() -> None:
                         "psnr": psnrs[local_index],
                         "ssim": ssims[local_index],
                         "lpips": lpips_values[local_index],
+                        "prompt": prompts[record["weather"]],
                         "candidate_path": str(candidate_path),
                         "output_checksum_sha256": output_checksum(
                             predictions[local_index]
@@ -608,15 +708,50 @@ def main() -> None:
                     "checksum_sha256"
                 ],
             })
-        write_csv(output_root / "per_candidate_metrics.csv", candidate_rows)
-        write_csv(output_root / "dataset_per_noise.csv", dataset_per_noise_rows)
-
     rows_by_image: Dict[int, List[Dict]] = defaultdict(list)
     for row in candidate_rows:
         rows_by_image[row["global_index"]].append(row)
 
+    retained_records, rejected_records = select_candidate_groups(
+        sample_records,
+        rows_by_image,
+        weather_thresholds,
+        args.max_saved_groups_per_weather,
+    )
+    retained_indices = {record["global_index"] for record in retained_records}
+    for record in retained_records:
+        global_index = record["global_index"]
+        staging_dir = candidate_directories[global_index]
+        write_group_metrics(
+            staging_dir,
+            rows_by_image[global_index],
+            record["psnr_gap"],
+            record["psnr_gap_threshold"],
+        )
+        final_dir = candidates_root / staging_dir.name
+        shutil.move(str(staging_dir), str(final_dir))
+        candidate_directories[global_index] = final_dir
+        for row in rows_by_image[global_index]:
+            row["candidate_path"] = str(final_dir / Path(row["candidate_path"]).name)
+    shutil.rmtree(staging_root)
+    candidate_rows = [
+        row for row in candidate_rows if row["global_index"] in retained_indices
+    ]
+    rows_by_image = defaultdict(list)
+    for row in candidate_rows:
+        rows_by_image[row["global_index"]].append(row)
+    with (output_root / "selected_samples.json").open("w", encoding="utf-8") as handle:
+        json.dump({"samples": retained_records}, handle, indent=2, ensure_ascii=False)
+    with (output_root / "rejected_samples.json").open("w", encoding="utf-8") as handle:
+        json.dump({"samples": rejected_records}, handle, indent=2, ensure_ascii=False)
+    write_csv(output_root / "per_candidate_metrics.csv", candidate_rows)
+    print(
+        f"[random] retained groups={len(retained_records)} / {len(sample_records)}, "
+        f"removed={len(rejected_records)}"
+    )
+
     sample_summary_rows = []
-    for record in sample_records:
+    for record in retained_records:
         global_index = record["global_index"]
         rows = sorted(rows_by_image[global_index], key=lambda row: row["noise_index"])
         psnrs = [row["psnr"] for row in rows]
@@ -649,8 +784,30 @@ def main() -> None:
             f"pairwise LPIPS mean={pairwise_mean:.4f} max={pairwise_max:.4f}"
         )
 
+    retained_subdatasets = sorted({record["subdataset"] for record in retained_records})
+    retained_scopes = retained_subdatasets + (["all"] if retained_records else [])
+    dataset_per_noise_rows = []
+    for scope in retained_scopes:
+        for noise_index in range(noise_bank.bank_size):
+            scoped_rows = [
+                row
+                for row in candidate_rows
+                if row["noise_index"] == noise_index
+                and (scope == "all" or row["subdataset"] == scope)
+            ]
+            dataset_per_noise_rows.append({
+                "scope": scope,
+                "noise_index": noise_index,
+                "n_images": len(scoped_rows),
+                "psnr": finite_stats([row["psnr"] for row in scoped_rows])["mean"],
+                "ssim": finite_stats([row["ssim"] for row in scoped_rows])["mean"],
+                "lpips": finite_stats([row["lpips"] for row in scoped_rows])["mean"],
+                "noise_set_checksum_sha256": noise_bank.set_stats[noise_index][
+                    "checksum_sha256"
+                ],
+            })
     dataset_summary_rows = []
-    for scope in all_scopes:
+    for scope in retained_scopes:
         noise_rows = [row for row in dataset_per_noise_rows if row["scope"] == scope]
         if scope == "all":
             sample_rows = sample_summary_rows
@@ -686,15 +843,20 @@ def main() -> None:
         })
 
     write_csv(output_root / "sample_summary.csv", sample_summary_rows)
+    write_csv(output_root / "dataset_per_noise.csv", dataset_per_noise_rows)
     write_csv(output_root / "dataset_summary.csv", dataset_summary_rows)
     settings = {
         "noise_bank": str(Path(args.noise_bank)),
         "noise_bank_created_this_run": created,
         "noise_bank_size": noise_bank.bank_size,
         "latent_shape": list(latent_shape),
-        "n_validation_images": len(sample_records),
+        "n_generated_images": len(sample_records),
+        "n_retained_images": len(retained_records),
+        "n_rejected_images": len(rejected_records),
         "n_noise_bank_images": len(all_sample_records),
         "max_samples_per_weather": max_samples_per_weather,
+        "weather_psnr_gap_thresholds": weather_thresholds,
+        "max_saved_groups_per_weather": args.max_saved_groups_per_weather,
         "sample_mode": sample_mode,
         "sample_seed": sample_seed,
         "checkpoint_controlnet": args_config.get("controlnet_model_path"),
@@ -719,12 +881,60 @@ def main() -> None:
         "batch_size": args.batch_size,
         "pairwise_batch_size": args.pairwise_batch_size,
         "controlnet_vae_conditioning": "posterior_mode",
-        "reward_available": False,
+        "reward_available": True,
+        "reward_metrics": ["psnr", "ssim", "lpips"],
+        "groups_per_weather": {
+            weather: {
+                "generated": sum(1 for row in sample_records if row["weather"] == weather),
+                "retained": sum(1 for row in retained_records if row["weather"] == weather),
+                "rejected": sum(1 for row in rejected_records if row["weather"] == weather),
+            }
+            for weather in weather_thresholds
+        },
+    }
+    resolved_controlnet_path = Path(resolve_controlnet_path(
+        args_config["controlnet_model_path"]
+    )).expanduser().resolve()
+    resolved_ra_path = args_config.get("ra_fusion_path")
+    if use_ra_fusion and not resolved_ra_path:
+        resolved_ra_path = next(
+            (
+                path
+                for path in (
+                    resolved_controlnet_path / "ra_fusion",
+                    resolved_controlnet_path.parent / "ra_fusion",
+                )
+                if (path / "ra_fusion.safetensors").is_file()
+            ),
+            None,
+        )
+    resolved_ra_path = (
+        Path(resolved_ra_path).expanduser().resolve()
+        if resolved_ra_path is not None
+        else None
+    )
+    candidate_policy = {
+        "pretrained_model_name_or_path": args_config.get("pretrained_model_name_or_path"),
+        "revision": args_config.get("revision"),
+        "variant": args_config.get("variant"),
+        "controlnet_model_path": str(resolved_controlnet_path),
+        "controlnet_checksum_sha256": checkpoint_checksum(resolved_controlnet_path),
+        "ra_fusion_path": str(resolved_ra_path) if resolved_ra_path is not None else None,
+        "ra_fusion_checksum_sha256": (
+            checkpoint_checksum(resolved_ra_path) if resolved_ra_path is not None else None
+        ),
+        "controlnet_conditioning_scale": float(args_config.get(
+            "controlnet_conditioning_scale", 1.0
+        )),
+        "ra_fusion_scale": ra_fusion_scale,
+        "load_transformer_lora": bool(args_config.get("load_transformer_lora", False)),
+        "controlnet_vae_conditioning": "posterior_mode",
     }
     with (output_root / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
             json_safe({
                 "settings": settings,
+                "candidate_policy": candidate_policy,
                 "noise_bank_stats": noise_bank.set_stats,
                 "dataset_summary": dataset_summary_rows,
             }),

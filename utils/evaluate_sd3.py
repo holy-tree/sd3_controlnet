@@ -23,6 +23,7 @@ SD3 ControlNet 多天气图像恢复 - 独立评估脚本
 """
 
 import argparse
+import csv
 import contextlib
 import io
 import json
@@ -30,6 +31,7 @@ import os
 import random
 import sys
 import time
+from unittest.mock import patch
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -44,6 +46,7 @@ from torchvision import transforms
 from tqdm import tqdm
 
 from diffusers import StableDiffusion3ControlNetPipeline, SD3ControlNetModel
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 from dataloaders.paired_dataset import DEFAULT_WEATHER_PROMPTS
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
@@ -251,6 +254,8 @@ def build_pipeline(args_config: dict, device, dtype):
         transformer = RAFusionSD3Transformer2DModel.from_pretrained(
             args_config["pretrained_model_name_or_path"],
             subfolder="transformer",
+            revision=args_config.get("revision"),
+            variant=args_config.get("variant"),
             torch_dtype=dtype,
             low_cpu_mem_usage=False,
             ra_fusion_enabled=True,
@@ -277,6 +282,8 @@ def build_pipeline(args_config: dict, device, dtype):
         pipeline_components["transformer"] = transformer
     pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
         args_config["pretrained_model_name_or_path"],
+        revision=args_config.get("revision"),
+        variant=args_config.get("variant"),
         **pipeline_components,
     )
 
@@ -597,7 +604,16 @@ def evaluate(args_config: dict):
                     if args_config.get("use_ra_fusion", False)
                     else contextlib.nullcontext()
                 )
-                with ra_context, torch.autocast(
+                posterior_context = (
+                    patch.object(
+                        DiagonalGaussianDistribution,
+                        "sample",
+                        lambda distribution, generator=None: distribution.mode(),
+                    )
+                    if args_config.get("deterministic_controlnet_vae", False)
+                    else contextlib.nullcontext()
+                )
+                with posterior_context, ra_context, torch.autocast(
                     "cuda", enabled=(device.type == "cuda"), dtype=weight_dtype
                 ), torch.no_grad():
                     outs = pipeline(**pipeline_kwargs).images
@@ -825,6 +841,64 @@ def evaluate(args_config: dict):
         f.write(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
                 f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10} {'-':>12}\n")
         f.write("=" * 90 + "\n")
+
+    per_image_csv = eval_root / "per_image_metrics.csv"
+    with open(per_image_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["weather", "subdataset", "name", "psnr", "ssim", "lpips", "infer_time"],
+        )
+        writer.writeheader()
+        for sub_name, items in per_image_results.items():
+            for stem, p, s, l, infer_time in items:
+                writer.writerow({
+                    "weather": sub_to_weather[sub_name],
+                    "subdataset": sub_name,
+                    "name": stem,
+                    "psnr": p,
+                    "ssim": s,
+                    "lpips": l,
+                    "infer_time": infer_time,
+                })
+
+    def _json_metric(value):
+        value = float(value)
+        return value if np.isfinite(value) else None
+
+    metrics_json = {
+        "model": {
+            "pretrained_model_name_or_path": args_config["pretrained_model_name_or_path"],
+            "controlnet_model_path": args_config["controlnet_model_path"],
+            "ra_fusion_path": args_config.get("ra_fusion_path"),
+            "use_ra_fusion": bool(args_config.get("use_ra_fusion", False)),
+        },
+        "inference": {
+            "resolution": args_config["resolution"],
+            "num_inference_steps": args_config["num_inference_steps"],
+            "guidance_scale": args_config["guidance_scale"],
+            "strength": args_config.get("strength", 1.0),
+            "seed": args_config.get("seed"),
+        },
+        "per_subdataset": {
+            name: {key: _json_metric(value) if key not in ("weather", "n") else value
+                   for key, value in metrics.items()}
+            for name, metrics in sub_metrics.items()
+        },
+        "per_weather": {
+            name: {key: int(value) if key == "n" else _json_metric(value)
+                   for key, value in metrics.items()}
+            for name, metrics in weather_metrics.items()
+        },
+        "overall": {
+            "n": total_n,
+            "psnr": _json_metric(avg_psnr),
+            "ssim": _json_metric(avg_ssim),
+            "lpips": _json_metric(avg_lpips),
+            "fid": _json_metric(overall_fid),
+        },
+    }
+    with open(eval_root / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics_json, f, indent=2, ensure_ascii=False, allow_nan=False)
 
     print("\n" + "=" * 90)
     print("Per-Subdataset Metrics:")

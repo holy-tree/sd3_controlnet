@@ -200,7 +200,7 @@ def load_noise_bank(
         raise ValueError(f"Unsupported Noise Bank version in {manifest_path}")
     if int(manifest["bank_size"]) != expected_bank_size:
         raise ValueError(
-            f"Noise Bank K={manifest['bank_size']} but evaluation requires K={expected_bank_size}"
+            f"Noise Bank K={manifest['bank_size']} but this run requires K={expected_bank_size}"
         )
     if list(manifest["sample_ids"]) != list(expected_sample_ids):
         raise ValueError(
