@@ -275,7 +275,6 @@ def build_pipeline(args_config: dict, device, dtype):
 
     pipeline_components = {
         "controlnet": controlnet,
-        "safety_checker": None,
         "torch_dtype": dtype,
     }
     if transformer is not None:

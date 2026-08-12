@@ -204,8 +204,9 @@ def load_noise_bank(
         )
     if list(manifest["sample_ids"]) != list(expected_sample_ids):
         raise ValueError(
-            "Noise Bank sample mapping does not match this validation set. "
-            "Use the same dataset/order or create a different bank path."
+            f"Noise Bank sample mapping does not match the current dataset/split/order: "
+            f"{manifest_path}. Set candidate_generation.noise_bank to a new path; "
+            "the generator will create a matching Noise Bank automatically."
         )
     if tuple(manifest["latent_shape"]) != tuple(expected_latent_shape):
         raise ValueError(
