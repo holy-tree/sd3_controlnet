@@ -11,13 +11,14 @@ weather_prompts:
 
 # ==================== 1. Offline candidate generation ====================
 candidate_generation:
-  # Dataset/model/inference keys, including dataset_rain/snow/haze, are reused
-  # directly from this evaluator config.
+  # Only model/inference defaults are reused from this evaluator config.
   eval_config: "./config/eval_sd3.yaml"
-  # null reuses dataset_<weather> from eval_config; set independently as needed.
-  dataset_rain: null
-  dataset_snow: null
-  dataset_haze: null
+  # Offline preference data is built explicitly from the complete training sets.
+  # Expected layout: <path>/train/{GT,LQ}/.
+  dataset_rain: "/root/autodl-tmp/datasets/rain"
+  dataset_snow: "/root/autodl-tmp/datasets/snow"
+  dataset_haze: "/root/autodl-tmp/datasets/haze"
+  splits: ["train"]
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
   noise_bank: "/root/autodl-tmp/sd3/experiment/dpo_noise_bank_k8.pt"
   # Generate exactly eight candidates for every source image.

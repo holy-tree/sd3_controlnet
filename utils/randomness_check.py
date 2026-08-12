@@ -111,6 +111,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_rain", default=None)
     parser.add_argument("--dataset_snow", default=None)
     parser.add_argument("--dataset_haze", default=None)
+    parser.add_argument("--splits", nargs="+", default=None)
     parser.add_argument("--rain_psnr_gap", type=float, default=0.2)
     parser.add_argument("--snow_psnr_gap", type=float, default=0.62)
     parser.add_argument("--haze_psnr_gap", type=float, default=2.5)
@@ -155,6 +156,13 @@ def finite_stats(values: Sequence[float]) -> Dict[str, float]:
 
 def prefixed_stats(prefix: str, values: Sequence[float]) -> Dict[str, float]:
     return {f"{prefix}_{key}": value for key, value in finite_stats(values).items()}
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def json_safe(value):
@@ -435,6 +443,8 @@ def main() -> None:
         args_config["use_prompt"] = args.use_prompt
     if args.load_transformer_lora is not None:
         args_config["load_transformer_lora"] = args.load_transformer_lora
+    if args.splits is not None:
+        args_config["splits"] = args.splits
 
     if args.noise_bank_size < 2:
         raise ValueError("Candidate generation requires noise_bank_size >= 2")
@@ -616,6 +626,13 @@ def main() -> None:
     candidate_rows: List[Dict] = []
     dataset_per_noise_rows: List[Dict] = []
     all_scopes = list(grouped_records) + ["all"]
+    batches_per_noise = sum(
+        (len(records) + args.batch_size - 1) // args.batch_size
+        for records in grouped_records.values()
+    )
+    total_generation_batches = noise_bank.bank_size * batches_per_noise
+    completed_generation_batches = 0
+    generation_started_at = time.time()
 
     for noise_index in range(noise_bank.bank_size):
         noise_metrics = {
@@ -638,7 +655,6 @@ def main() -> None:
                     batch_records, preprocess, device
                 )
                 initial_noise = noise_bank.get(noise_index, noise_bank_indices)
-                begin = time.time()
                 predictions = run_with_initial_noise(
                     pipeline,
                     args_config,
@@ -688,12 +704,24 @@ def main() -> None:
                         noise_metrics[scope]["ssim"].append(ssims[local_index])
                         noise_metrics[scope]["lpips"].append(lpips_values[local_index])
 
+                completed_generation_batches += 1
+                elapsed = time.time() - generation_started_at
+                remaining_batches = total_generation_batches - completed_generation_batches
+                eta_seconds = (
+                    elapsed / completed_generation_batches * remaining_batches
+                    if completed_generation_batches > 0 else 0.0
+                )
+                progress_percent = (
+                    completed_generation_batches / total_generation_batches * 100.0
+                    if total_generation_batches > 0 else 100.0
+                )
                 print(
                     f"[random] {subdataset} noise={noise_index:02d} "
                     f"images={global_indices[0]}..{global_indices[-1]} "
                     f"PSNR={np.mean(psnrs):.3f} SSIM={np.mean(ssims):.4f} "
                     f"LPIPS={np.nanmean(lpips_values):.4f} "
-                    f"({time.time() - begin:.1f}s)"
+                    f"progress={completed_generation_batches}/{total_generation_batches} "
+                    f"({progress_percent:.1f}%) ETA={format_duration(eta_seconds)}"
                 )
 
         for scope in all_scopes:

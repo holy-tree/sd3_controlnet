@@ -72,6 +72,10 @@ def main() -> None:
         value = generation.get(key)
         if value is not None:
             command.extend([flag, str(value)])
+    splits = generation.get("splits")
+    if splits:
+        command.append("--splits")
+        command.extend(str(split) for split in splits)
     for key in ("revision", "variant"):
         if model.get(key) is not None:
             command.extend([f"--{key}", str(model[key])])
