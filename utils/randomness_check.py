@@ -5,12 +5,10 @@ import argparse
 import contextlib
 import csv
 import hashlib
-import itertools
 import json
 import random
 import shutil
 import sys
-import time
 from unittest.mock import patch
 from collections import defaultdict
 from pathlib import Path
@@ -21,6 +19,7 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+from tqdm.auto import tqdm
 
 THIS_DIR = Path(__file__).resolve().parent
 ROOT = THIS_DIR.parent
@@ -62,16 +61,18 @@ def parse_args() -> argparse.Namespace:
         "--verify_reproducibility",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="用首张图和 noise_00 重复推理两次并检查输出 checksum",
+        help="用首张图和 candidate_00 重复推理两次并检查输出 checksum",
     )
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--pairwise_batch_size", type=int, default=16)
     parser.add_argument(
         "--max_samples_per_weather",
         type=int,
         default=None,
         help="覆盖 YAML 的评估图片上限；0 或负数表示完整验证集",
     )
+    parser.add_argument("--rain_max_samples", type=int, default=None)
+    parser.add_argument("--snow_max_samples", type=int, default=None)
+    parser.add_argument("--haze_max_samples", type=int, default=None)
+    parser.add_argument("--sample_mode", choices=["head", "random"], default=None)
     parser.add_argument("--strength", type=float, default=None)
     parser.add_argument("--max_inference_steps", type=int, default=None)
     parser.add_argument("--controlnet_conditioning_scale", type=float, default=None)
@@ -103,7 +104,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rain_psnr_gap", type=float, default=0.2)
     parser.add_argument("--snow_psnr_gap", type=float, default=0.62)
     parser.add_argument("--haze_psnr_gap", type=float, default=2.5)
-    parser.add_argument("--max_saved_groups_per_weather", type=int, default=10000)
+    parser.add_argument("--max_saved_groups_per_weather", type=int, default=7000)
     return parser.parse_args()
 
 
@@ -151,6 +152,23 @@ def make_candidate_noise(
     return torch.stack(noises), seeds
 
 
+def make_candidate_group_noise(
+    record: Dict,
+    num_candidates: int,
+    latent_shape: Tuple[int, int, int],
+    base_seed: int,
+) -> tuple[torch.Tensor, List[int]]:
+    noises = []
+    seeds = []
+    for candidate_index in range(num_candidates):
+        noise, candidate_seeds = make_candidate_noise(
+            [record], candidate_index, latent_shape, base_seed
+        )
+        noises.append(noise[0])
+        seeds.append(candidate_seeds[0])
+    return torch.stack(noises), seeds
+
+
 def finite_stats(values: Sequence[float]) -> Dict[str, float]:
     array = np.asarray(values, dtype=np.float64)
     array = array[np.isfinite(array)]
@@ -166,13 +184,6 @@ def finite_stats(values: Sequence[float]) -> Dict[str, float]:
 
 def prefixed_stats(prefix: str, values: Sequence[float]) -> Dict[str, float]:
     return {f"{prefix}_{key}": value for key, value in finite_stats(values).items()}
-
-
-def format_duration(seconds: float) -> str:
-    seconds = max(0, int(round(seconds)))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def json_safe(value):
@@ -196,45 +207,6 @@ def write_csv(path: Path, rows: List[Dict]) -> None:
     print(f"[random] CSV -> {path}")
 
 
-def select_candidate_groups(
-    sample_records: Sequence[Dict],
-    rows_by_image: Dict[int, List[Dict]],
-    weather_thresholds: Dict[str, float],
-    max_saved_groups_per_weather: int,
-) -> tuple[List[Dict], List[Dict]]:
-    """Keep the largest-gap qualified groups independently for each weather."""
-    qualified: Dict[str, List[tuple[float, Dict]]] = defaultdict(list)
-    rejected = []
-    for record in sample_records:
-        rows = rows_by_image.get(record["global_index"], [])
-        if not rows:
-            rejected.append({**record, "reason": "missing_candidates", "psnr_gap": None})
-            continue
-        weather = record["weather"]
-        if weather not in weather_thresholds:
-            raise KeyError(f"Missing PSNR gap threshold for weather: {weather}")
-        psnr_values = [float(row["psnr"]) for row in rows]
-        gap = max(psnr_values) - min(psnr_values)
-        threshold = weather_thresholds[weather]
-        enriched = {**record, "psnr_gap": gap, "psnr_gap_threshold": threshold}
-        if gap + 1e-9 >= threshold:
-            qualified[weather].append((gap, enriched))
-        else:
-            rejected.append({**enriched, "reason": "psnr_gap_below_threshold"})
-
-    retained = []
-    for weather, records in qualified.items():
-        records.sort(key=lambda item: (-item[0], item[1]["global_index"]))
-        retained.extend(record for _, record in records[:max_saved_groups_per_weather])
-        rejected.extend(
-            {**record, "reason": "weather_group_limit"}
-            for _, record in records[max_saved_groups_per_weather:]
-        )
-    retained.sort(key=lambda record: record["global_index"])
-    rejected.sort(key=lambda record: record["global_index"])
-    return retained, rejected
-
-
 def write_group_metrics(
     image_dir: Path,
     rows: Sequence[Dict],
@@ -243,9 +215,9 @@ def write_group_metrics(
 ) -> None:
     with (image_dir / "metrics.txt").open("w", encoding="utf-8") as handle:
         handle.write("# candidate, PSNR(dB), SSIM, LPIPS\n")
-        for row in sorted(rows, key=lambda item: item["noise_index"]):
+        for row in sorted(rows, key=lambda item: item["candidate_index"]):
             handle.write(
-                f"candidate_{int(row['noise_index']):02d}.png, "
+                f"candidate_{int(row['candidate_index']):02d}.png, "
                 f"{float(row['psnr']):.6f}, {float(row['ssim']):.6f}, "
                 f"{float(row['lpips']):.6f}\n"
             )
@@ -283,25 +255,28 @@ def select_evaluation_records(
     max_samples_per_weather: int,
     sample_mode: str,
     sample_seed: int,
+    weather_limits: Dict[str, int] | None = None,
 ) -> List[Dict]:
-    """Apply the same per-subdataset truncation semantics as evaluate_sd3.py."""
+    """Truncate each weather after merging its ordered subdataset records."""
     if sample_mode not in ("head", "random"):
         raise ValueError(f"Unsupported sample_mode: {sample_mode}")
     grouped: Dict[str, List[Dict]] = defaultdict(list)
     for record in all_records:
-        grouped[record["subdataset"]].append(record)
+        grouped[record["weather"]].append(record)
 
     rng = random.Random(sample_seed)
     selected = []
-    for subdataset, records in grouped.items():
+    weather_limits = dict(weather_limits or {})
+    for weather, records in grouped.items():
         records = list(records)
-        if max_samples_per_weather > 0 and len(records) > max_samples_per_weather:
+        limit = int(weather_limits.get(weather, max_samples_per_weather))
+        if limit > 0 and len(records) > limit:
             if sample_mode == "random":
                 rng.shuffle(records)
-            records = records[:max_samples_per_weather]
+            records = records[:limit]
         print(
-            f"[random] {subdataset}: evaluating {len(records)} / "
-            f"{len(grouped[subdataset])} images ({sample_mode})"
+            f"[random] {weather}: selecting {len(records)} / "
+            f"{len(grouped[weather])} images ({sample_mode})"
         )
         selected.extend(records)
 
@@ -408,30 +383,6 @@ def run_with_initial_noise(
     ])
 
 
-def pairwise_lpips_for_candidates(
-    candidate_paths: Sequence[Path], lpips_model, device, dtype, batch_size: int
-) -> Tuple[float, float]:
-    if lpips_model is None or len(candidate_paths) < 2:
-        return float("nan"), float("nan")
-    candidates = torch.stack([
-        transforms.ToTensor()(Image.open(path).convert("RGB"))
-        for path in candidate_paths
-    ])
-    pairs = list(itertools.combinations(range(len(candidate_paths)), 2))
-    distances = []
-    for start in range(0, len(pairs), batch_size):
-        chunk = pairs[start:start + batch_size]
-        left = torch.stack([candidates[first] for first, _ in chunk]).to(device)
-        right = torch.stack([candidates[second] for _, second in chunk]).to(device)
-        try:
-            distances.extend(lpips_batch(lpips_model, left, right, device, dtype))
-        except Exception as error:  # pragma: no cover
-            print(f"[random] pairwise LPIPS failed: {error}")
-            return float("nan"), float("nan")
-    stats = finite_stats(distances)
-    return stats["mean"], stats["max"]
-
-
 def main() -> None:
     args = parse_args()
     args_config = load_config(args.config)
@@ -458,8 +409,6 @@ def main() -> None:
 
     if args.num_candidates_per_image < 2:
         raise ValueError("Candidate generation requires num_candidates_per_image >= 2")
-    if args.batch_size <= 0 or args.pairwise_batch_size <= 0:
-        raise ValueError("batch sizes must be positive")
     if args.max_saved_groups_per_weather <= 0:
         raise ValueError("max_saved_groups_per_weather must be positive")
     weather_thresholds = {
@@ -510,7 +459,21 @@ def main() -> None:
         if args.max_samples_per_weather is not None
         else int(args_config.get("max_samples_per_weather", 0))
     )
-    sample_mode = str(args_config.get("sample_mode", "head")).lower()
+    weather_sample_limits = {
+        weather: int(value)
+        for weather, value in {
+            "rain": args.rain_max_samples,
+            "snow": args.snow_max_samples,
+            "haze": args.haze_max_samples,
+        }.items()
+        if value is not None
+    }
+    if any(value < 0 for value in weather_sample_limits.values()):
+        raise ValueError("Weather max sample limits must be zero or positive")
+    sample_mode = str(
+        args.sample_mode if args.sample_mode is not None
+        else args_config.get("sample_mode", "head")
+    ).lower()
     sample_seed = int(args_config.get("seed", 20240805))
 
     raw_samples = build_dataset_for_eval(args_config)
@@ -544,6 +507,7 @@ def main() -> None:
         max_samples_per_weather,
         sample_mode,
         sample_seed,
+        weather_sample_limits,
     )
 
     try:
@@ -555,30 +519,16 @@ def main() -> None:
 
     output_root = Path(args.output_dir).expanduser().resolve()
     candidates_root = output_root / "candidates"
-    staging_root = output_root / ".candidate_staging"
     output_root.mkdir(parents=True, exist_ok=True)
-    for directory in (candidates_root, staging_root):
-        if directory.exists():
-            shutil.rmtree(directory)
+    if candidates_root.exists():
+        shutil.rmtree(candidates_root)
     candidates_root.mkdir(parents=True, exist_ok=True)
-    staging_root.mkdir(parents=True, exist_ok=True)
-    candidate_directories = {}
-    for record in sample_records:
-        image_dir = staging_root / (
-            f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
-        )
-        image_dir.mkdir(parents=True, exist_ok=True)
-        candidate_directories[record["global_index"]] = image_dir
 
     random.seed(args.seed)
     prompts = {
         weather: maybe_make_prompt(weather, args_config)
         for weather in sorted({row["weather"] for row in sample_records})
     }
-    grouped_records: Dict[str, List[Dict]] = defaultdict(list)
-    for record in sample_records:
-        grouped_records[record["subdataset"]].append(record)
-
     if args.verify_reproducibility:
         test_records = [sample_records[0]]
         test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)
@@ -608,149 +558,124 @@ def main() -> None:
             )
 
     candidate_rows: List[Dict] = []
-    dataset_per_noise_rows: List[Dict] = []
-    all_scopes = list(grouped_records) + ["all"]
-    batches_per_noise = sum(
-        (len(records) + args.batch_size - 1) // args.batch_size
-        for records in grouped_records.values()
-    )
-    total_generation_batches = args.num_candidates_per_image * batches_per_noise
-    completed_generation_batches = 0
-    generation_started_at = time.time()
+    sample_summary_rows: List[Dict] = []
+    retained_records: List[Dict] = []
+    rejected_records: List[Dict] = []
+    retained_by_weather = defaultdict(int)
 
-    for noise_index in range(args.num_candidates_per_image):
-        noise_metrics = {
-            scope: {metric: [] for metric in ("psnr", "ssim", "lpips")}
-            for scope in all_scopes
-        }
-        print(
-            f"\n[random] ===== candidate_{noise_index:02d} / "
-            f"{args.num_candidates_per_image - 1:02d} ====="
-        )
-
-        for subdataset, records in grouped_records.items():
-            for start in range(0, len(records), args.batch_size):
-                batch_records = records[start:start + args.batch_size]
-                global_indices = [row["global_index"] for row in batch_records]
-                lq_pils, lq_batch, gt_batch = load_image_batch(
-                    batch_records, preprocess, device
-                )
-                initial_noise, candidate_seeds = make_candidate_noise(
-                    batch_records,
-                    noise_index,
-                    latent_shape,
-                    args.seed,
-                )
-                predictions = run_with_initial_noise(
-                    pipeline,
-                    args_config,
-                    device,
-                    dtype,
-                    lq_pils,
-                    prompts[batch_records[0]["weather"]],
-                    initial_noise,
-                    strength,
-                    num_inference_steps,
-                    use_ra_fusion,
-                )
-                psnrs = psnr_batch(predictions, gt_batch)
-                ssims = ssim_batch(predictions, gt_batch)
-                try:
-                    lpips_values = lpips_batch(
-                        lpips_model, predictions, gt_batch, device, dtype
-                    )
-                except Exception as error:  # pragma: no cover
-                    raise RuntimeError("Failed to compute candidate LPIPS") from error
-
-                for local_index, record in enumerate(batch_records):
-                    global_index = record["global_index"]
-                    image_dir = candidate_directories[global_index]
-                    if noise_index == 0:
-                        tensor_to_pil(lq_batch[local_index]).save(image_dir / "lq.png")
-                        tensor_to_pil(gt_batch[local_index]).save(image_dir / "gt.png")
-                    candidate_path = image_dir / f"candidate_{noise_index:02d}.png"
-                    tensor_to_pil(predictions[local_index]).save(candidate_path)
-                    row = {
-                        **record,
-                        "candidate_index": noise_index,
-                        "candidate_seed": candidate_seeds[local_index],
-                        "noise_index": noise_index,
-                        "psnr": psnrs[local_index],
-                        "ssim": ssims[local_index],
-                        "lpips": lpips_values[local_index],
-                        "prompt": prompts[record["weather"]],
-                        "candidate_path": str(candidate_path),
-                        "output_checksum_sha256": output_checksum(
-                            predictions[local_index]
-                        ),
-                    }
-                    candidate_rows.append(row)
-                    for scope in (subdataset, "all"):
-                        noise_metrics[scope]["psnr"].append(psnrs[local_index])
-                        noise_metrics[scope]["ssim"].append(ssims[local_index])
-                        noise_metrics[scope]["lpips"].append(lpips_values[local_index])
-
-                completed_generation_batches += 1
-                elapsed = time.time() - generation_started_at
-                remaining_batches = total_generation_batches - completed_generation_batches
-                eta_seconds = (
-                    elapsed / completed_generation_batches * remaining_batches
-                    if completed_generation_batches > 0 else 0.0
-                )
-                progress_percent = (
-                    completed_generation_batches / total_generation_batches * 100.0
-                    if total_generation_batches > 0 else 100.0
-                )
-                print(
-                    f"[random] {subdataset} candidate={noise_index:02d} "
-                    f"images={global_indices[0]}..{global_indices[-1]} "
-                    f"PSNR={np.mean(psnrs):.3f} SSIM={np.mean(ssims):.4f} "
-                    f"LPIPS={np.nanmean(lpips_values):.4f} "
-                    f"progress={completed_generation_batches}/{total_generation_batches} "
-                    f"({progress_percent:.1f}%) ETA={format_duration(eta_seconds)}"
-                )
-
-        for scope in all_scopes:
-            dataset_per_noise_rows.append({
-                "scope": scope,
-                "noise_index": noise_index,
-                "n_images": len(noise_metrics[scope]["psnr"]),
-                "psnr": finite_stats(noise_metrics[scope]["psnr"])["mean"],
-                "ssim": finite_stats(noise_metrics[scope]["ssim"])["mean"],
-                "lpips": finite_stats(noise_metrics[scope]["lpips"])["mean"],
+    progress = tqdm(sample_records, desc="Generate candidate groups", unit="group", dynamic_ncols=True)
+    for record in progress:
+        weather = record["weather"]
+        threshold = weather_thresholds[weather]
+        if retained_by_weather[weather] >= args.max_saved_groups_per_weather:
+            rejected_records.append({
+                **record,
+                "reason": "weather_group_limit",
+                "psnr_gap": None,
+                "psnr_gap_threshold": threshold,
             })
-    rows_by_image: Dict[int, List[Dict]] = defaultdict(list)
-    for row in candidate_rows:
-        rows_by_image[row["global_index"]].append(row)
+            progress.set_postfix(weather=weather, status="limit", kept=retained_by_weather[weather])
+            continue
 
-    retained_records, rejected_records = select_candidate_groups(
-        sample_records,
-        rows_by_image,
-        weather_thresholds,
-        args.max_saved_groups_per_weather,
-    )
-    retained_indices = {record["global_index"] for record in retained_records}
-    for record in retained_records:
-        global_index = record["global_index"]
-        staging_dir = candidate_directories[global_index]
-        write_group_metrics(
-            staging_dir,
-            rows_by_image[global_index],
-            record["psnr_gap"],
-            record["psnr_gap_threshold"],
+        lq_pils, lq_batch, gt_batch = load_image_batch([record], preprocess, device)
+        candidate_lq_pils = lq_pils * args.num_candidates_per_image
+        candidate_gt_batch = gt_batch.repeat(args.num_candidates_per_image, 1, 1, 1)
+        initial_noise, candidate_seeds = make_candidate_group_noise(
+            record,
+            args.num_candidates_per_image,
+            latent_shape,
+            args.seed,
         )
-        final_dir = candidates_root / staging_dir.name
-        shutil.move(str(staging_dir), str(final_dir))
-        candidate_directories[global_index] = final_dir
-        for row in rows_by_image[global_index]:
-            row["candidate_path"] = str(final_dir / Path(row["candidate_path"]).name)
-    shutil.rmtree(staging_root)
-    candidate_rows = [
-        row for row in candidate_rows if row["global_index"] in retained_indices
-    ]
-    rows_by_image = defaultdict(list)
-    for row in candidate_rows:
-        rows_by_image[row["global_index"]].append(row)
+        predictions = run_with_initial_noise(
+            pipeline,
+            args_config,
+            device,
+            dtype,
+            candidate_lq_pils,
+            prompts[weather],
+            initial_noise,
+            strength,
+            num_inference_steps,
+            use_ra_fusion,
+        )
+        psnrs = psnr_batch(predictions, candidate_gt_batch)
+        ssims = ssim_batch(predictions, candidate_gt_batch)
+        try:
+            lpips_values = lpips_batch(
+                lpips_model, predictions, candidate_gt_batch, device, dtype
+            )
+        except Exception as error:  # pragma: no cover
+            raise RuntimeError("Failed to compute candidate LPIPS") from error
+
+        psnr_gap = max(psnrs) - min(psnrs)
+        group_record = {
+            **record,
+            "psnr_gap": psnr_gap,
+            "psnr_gap_threshold": threshold,
+        }
+        progress.set_postfix(
+            weather=weather,
+            psnr=f"{np.mean(psnrs):.2f}",
+            ssim=f"{np.mean(ssims):.4f}",
+            lpips=f"{np.mean(lpips_values):.4f}",
+            gap=f"{psnr_gap:.3f}/{threshold:.3f}",
+            kept=retained_by_weather[weather],
+            status="rejected" if psnr_gap + 1e-9 < threshold else "qualified",
+        )
+        if psnr_gap + 1e-9 < threshold:
+            rejected_records.append({**group_record, "reason": "psnr_gap_below_threshold"})
+            continue
+
+        image_dir = candidates_root / (
+            f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
+        )
+        image_dir.mkdir(parents=True, exist_ok=False)
+        tensor_to_pil(lq_batch[0]).save(image_dir / "lq.png")
+        tensor_to_pil(gt_batch[0]).save(image_dir / "gt.png")
+        group_rows = []
+        for candidate_index in range(args.num_candidates_per_image):
+            candidate_path = image_dir / f"candidate_{candidate_index:02d}.png"
+            tensor_to_pil(predictions[candidate_index]).save(candidate_path)
+            group_rows.append({
+                **record,
+                "candidate_index": candidate_index,
+                "candidate_seed": candidate_seeds[candidate_index],
+                "noise_index": candidate_index,
+                "psnr": psnrs[candidate_index],
+                "ssim": ssims[candidate_index],
+                "lpips": lpips_values[candidate_index],
+                "prompt": prompts[weather],
+                "candidate_path": str(candidate_path),
+                "output_checksum_sha256": output_checksum(predictions[candidate_index]),
+            })
+        write_group_metrics(image_dir, group_rows, psnr_gap, threshold)
+        candidate_rows.extend(group_rows)
+        retained_records.append(group_record)
+        retained_by_weather[weather] += 1
+
+        best_psnr_index = int(np.nanargmax(psnrs))
+        best_lpips_index = int(np.nanargmin(lpips_values))
+        sample_summary_rows.append({
+            **group_record,
+            **prefixed_stats("psnr", psnrs),
+            **prefixed_stats("ssim", ssims),
+            **prefixed_stats("lpips", lpips_values),
+            "best_worst_psnr_gap": psnr_gap,
+            "best_worst_lpips_gap": max(lpips_values) - min(lpips_values),
+            "best_psnr_noise_index": best_psnr_index,
+            "best_lpips_noise_index": best_lpips_index,
+        })
+        progress.set_postfix(
+            weather=weather,
+            psnr=f"{np.mean(psnrs):.2f}",
+            ssim=f"{np.mean(ssims):.4f}",
+            lpips=f"{np.mean(lpips_values):.4f}",
+            gap=f"{psnr_gap:.3f}/{threshold:.3f}",
+            kept=retained_by_weather[weather],
+            status="saved",
+        )
+    progress.close()
+
     with (output_root / "selected_samples.json").open("w", encoding="utf-8") as handle:
         json.dump({"samples": retained_records}, handle, indent=2, ensure_ascii=False)
     with (output_root / "rejected_samples.json").open("w", encoding="utf-8") as handle:
@@ -760,40 +685,6 @@ def main() -> None:
         f"[random] retained groups={len(retained_records)} / {len(sample_records)}, "
         f"removed={len(rejected_records)}"
     )
-
-    sample_summary_rows = []
-    for record in retained_records:
-        global_index = record["global_index"]
-        rows = sorted(rows_by_image[global_index], key=lambda row: row["noise_index"])
-        psnrs = [row["psnr"] for row in rows]
-        ssims = [row["ssim"] for row in rows]
-        lpips_values = [row["lpips"] for row in rows]
-        candidate_paths = [Path(row["candidate_path"]) for row in rows]
-        pairwise_mean, pairwise_max = pairwise_lpips_for_candidates(
-            candidate_paths, lpips_model, device, dtype, args.pairwise_batch_size
-        )
-        best_psnr_index = int(np.nanargmax(psnrs))
-        best_lpips_index = int(np.nanargmin(lpips_values)) if np.isfinite(lpips_values).any() else -1
-        psnr_stats = finite_stats(psnrs)
-        lpips_stats = finite_stats(lpips_values)
-        sample_summary_rows.append({
-            **record,
-            **prefixed_stats("psnr", psnrs),
-            **prefixed_stats("ssim", ssims),
-            **prefixed_stats("lpips", lpips_values),
-            "best_worst_psnr_gap": psnr_stats["max"] - psnr_stats["min"],
-            "best_worst_lpips_gap": lpips_stats["max"] - lpips_stats["min"],
-            "best_psnr_noise_index": rows[best_psnr_index]["noise_index"],
-            "best_lpips_noise_index": (
-                rows[best_lpips_index]["noise_index"] if best_lpips_index >= 0 else -1
-            ),
-            "pairwise_lpips_mean": pairwise_mean,
-            "pairwise_lpips_max": pairwise_max,
-        })
-        print(
-            f"[random] sample {global_index + 1}/{len(sample_records)} "
-            f"pairwise LPIPS mean={pairwise_mean:.4f} max={pairwise_max:.4f}"
-        )
 
     retained_subdatasets = sorted({record["subdataset"] for record in retained_records})
     retained_scopes = retained_subdatasets + (["all"] if retained_records else [])
@@ -842,12 +733,6 @@ def main() -> None:
             "average_best_worst_lpips_gap": float(np.nanmean([
                 row["best_worst_lpips_gap"] for row in sample_rows
             ])),
-            "average_pairwise_lpips": float(np.nanmean([
-                row["pairwise_lpips_mean"] for row in sample_rows
-            ])),
-            "maximum_pairwise_lpips": float(np.nanmax([
-                row["pairwise_lpips_max"] for row in sample_rows
-            ])),
         })
 
     write_csv(output_root / "sample_summary.csv", sample_summary_rows)
@@ -863,6 +748,7 @@ def main() -> None:
         "n_rejected_images": len(rejected_records),
         "n_dataset_images": len(all_sample_records),
         "max_samples_per_weather": max_samples_per_weather,
+        "weather_sample_limits": weather_sample_limits,
         "weather_psnr_gap_thresholds": weather_thresholds,
         "max_saved_groups_per_weather": args.max_saved_groups_per_weather,
         "sample_mode": sample_mode,
@@ -886,8 +772,7 @@ def main() -> None:
         "base_model": args_config.get("pretrained_model_name_or_path"),
         "resolution": resolution,
         "dtype": str(dtype),
-        "batch_size": args.batch_size,
-        "pairwise_batch_size": args.pairwise_batch_size,
+        "pipeline_batch_size": args.num_candidates_per_image,
         "controlnet_vae_conditioning": "posterior_mode",
         "reward_available": True,
         "reward_metrics": ["psnr", "ssim", "lpips"],
@@ -959,8 +844,7 @@ def main() -> None:
             f"SSIM={row['dataset_ssim_mean']:.4f}±{row['dataset_ssim_std']:.4f} "
             f"LPIPS={row['dataset_lpips_mean']:.4f}±{row['dataset_lpips_std']:.4f} "
             f"sample PSNR std={row['average_sample_psnr_std']:.3f} "
-            f"PSNR gap={row['average_best_worst_psnr_gap']:.3f} "
-            f"pairwise LPIPS={row['average_pairwise_lpips']:.4f}"
+            f"PSNR gap={row['average_best_worst_psnr_gap']:.3f}"
         )
     print(f"[random] candidates -> {candidates_root}")
 

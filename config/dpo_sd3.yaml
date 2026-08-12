@@ -24,10 +24,12 @@ candidate_generation:
   num_candidates_per_image: 8
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
-  batch_size: 16
-  pairwise_batch_size: 16
-  # 0 means all samples in each subdataset.
-  max_samples_per_weather: 0
+  # Input scan limits. With sample_mode=head, take the first N images in
+  # deterministic path order after merging each weather's train subdatasets.
+  sample_mode: "head"
+  rain_max_samples: 12000
+  snow_max_samples: 10000
+  haze_max_samples: 10000
   # Keep a group only when max(candidate PSNR) - min(candidate PSNR) reaches
   # its weather threshold. Values are in dB.
   weather_psnr_gap_thresholds:
@@ -35,7 +37,7 @@ candidate_generation:
     snow: 0.62
     haze: 2.5
   # Applied independently to rain, snow, and haze after gap filtering.
-  max_saved_groups_per_weather: 10000
+  max_saved_groups_per_weather: 4000
   num_inference_steps: 30
   strength: 1.0
   controlnet_conditioning_scale: 1.0

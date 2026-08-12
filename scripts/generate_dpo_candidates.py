@@ -31,10 +31,6 @@ def main() -> None:
         str(generation.get("num_candidates_per_image", 8)),
         "--seed",
         str(generation.get("seed", 20240805)),
-        "--batch_size",
-        str(generation.get("batch_size", 1)),
-        "--pairwise_batch_size",
-        str(generation.get("pairwise_batch_size", 16)),
         "--rain_psnr_gap",
         str(generation.get("weather_psnr_gap_thresholds", {}).get("rain", 0.2)),
         "--snow_psnr_gap",
@@ -42,7 +38,7 @@ def main() -> None:
         "--haze_psnr_gap",
         str(generation.get("weather_psnr_gap_thresholds", {}).get("haze", 2.5)),
         "--max_saved_groups_per_weather",
-        str(generation.get("max_saved_groups_per_weather", 10000)),
+        str(generation.get("max_saved_groups_per_weather", 7000)),
         "--pretrained_model_name_or_path",
         str(model["pretrained_model_name_or_path"]),
         "--controlnet_model_path",
@@ -62,6 +58,10 @@ def main() -> None:
         "dataset_rain": "--dataset_rain",
         "dataset_snow": "--dataset_snow",
         "dataset_haze": "--dataset_haze",
+        "rain_max_samples": "--rain_max_samples",
+        "snow_max_samples": "--snow_max_samples",
+        "haze_max_samples": "--haze_max_samples",
+        "sample_mode": "--sample_mode",
     }
     for key, flag in optional.items():
         value = generation.get(key)
