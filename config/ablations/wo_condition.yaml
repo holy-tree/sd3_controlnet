@@ -1,0 +1,5 @@
+# E4: remove the independent LQ token and recursive condition-state path.
+base_config: ../train.yaml
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/wo_condition_seed42"
+seed: 42
+ra_fusion_use_condition: 0

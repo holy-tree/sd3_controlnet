@@ -127,7 +127,7 @@ lora_learning_rate: 1.0e-6
 
 # ==================== RA-inspired ControlNet Fusion ====================
 # 第一阶段加载已有 ControlNet 并冻结，只训练零初始化 RA Fusion。
-train_controlnet: 1
+train_controlnet: 0
 use_ra_fusion: 1
 ra_fusion_interval: 4
 ra_fusion_hidden_dim: 256
@@ -136,8 +136,13 @@ ra_fusion_kernel_size: 3
 ra_fusion_learning_rate: 5.0e-7
 ra_fusion_scale: 0.1                    # 限制 RA 增量，避免在多步采样中压过冻结主干
 ra_fusion_stabilize: 1                  # 对递归 condition、timestep 和输出做无参数归一化
+ra_fusion_use_main: 1                   # M: 当前 SD3 主干特征
+ra_fusion_use_control: 1                # C: RA 内的 ControlNet feature（不影响普通 ControlNet 注入）
+ra_fusion_use_condition: 1              # Q: 独立 LQ token 及 RA 层间递归状态
+ra_fusion_use_temb: 1                   # T: timestep + pooled text 联合嵌入
+ra_fusion_adapter_mode: "local"         # identity / channel / local
 ra_diagnostics_steps: 100               # 定期记录每个 RA block 的 delta/main RMS 比值
-ra_fusion_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/ra_fusion"              # 仅继续已有 RA 权重时填写；新训练保持 null
+ra_fusion_model_path: null              # 消融必须从相同随机初始化开始，不加载已有 RA
 
 # T5 text encoder 最大序列长度
 max_sequence_length: 77
@@ -185,7 +190,7 @@ report_to: "tensorboard"               # tensorboard / wandb / comet_ml / all
 tracker_project_name: "train_controlnet_SD3"
 
 # seed (null = 随机)
-seed: null
+seed: 42
 
 # ==================== 验证 (按 step 跑 pipeline 出图, SD3 官方 log_validation) ====================
 validation_prompt: null

@@ -1,0 +1,4 @@
+# Full RA. Override seed and output_dir together for independent repeats.
+base_config: ../train.yaml
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/full_seed42"
+seed: 42

@@ -1,0 +1,5 @@
+# E3: remove ControlNet feature from RA; ordinary ControlNet injection remains enabled.
+base_config: ../train.yaml
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/wo_control_seed42"
+seed: 42
+ra_fusion_use_control: 0

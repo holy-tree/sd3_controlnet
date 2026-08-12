@@ -85,9 +85,24 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_config(path: str) -> dict:
-    with io.open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+def load_config(path: str, seen: set[Path] | None = None) -> dict:
+    """Load YAML with optional relative ``base_config`` inheritance."""
+    config_path = Path(path).resolve()
+    seen = set() if seen is None else seen
+    if config_path in seen:
+        raise ValueError(f"YAML base_config cycle: {config_path}")
+    seen.add(config_path)
+    with io.open(config_path, "r", encoding="utf-8") as file:
+        config = yaml.safe_load(file) or {}
+    base_path = config.pop("base_config", None)
+    if base_path is None:
+        return config
+    base_path = Path(base_path)
+    if not base_path.is_absolute():
+        base_path = config_path.parent / base_path
+    merged = load_config(str(base_path), seen)
+    merged.update(config)
+    return merged
 
 
 # ============================================================
@@ -260,6 +275,11 @@ def build_pipeline(args_config: dict, device, dtype):
             ra_fusion_kernel_size=ra_config["ra_fusion_kernel_size"],
             ra_fusion_scale=effective_scale,
             ra_fusion_stabilize=bool(ra_config.get("ra_fusion_stabilize", False)),
+            ra_fusion_use_main=bool(ra_config.get("ra_fusion_use_main", True)),
+            ra_fusion_use_control=bool(ra_config.get("ra_fusion_use_control", True)),
+            ra_fusion_use_condition=bool(ra_config.get("ra_fusion_use_condition", True)),
+            ra_fusion_use_temb=bool(ra_config.get("ra_fusion_use_temb", True)),
+            ra_fusion_adapter_mode=ra_config.get("ra_fusion_adapter_mode", "local"),
         )
         transformer.set_ra_fusion_dtype(torch.float32)
         transformer.load_ra_fusion(ra_path)
@@ -267,6 +287,14 @@ def build_pipeline(args_config: dict, device, dtype):
             transformer.set_ra_fusion_scale(configured_scale)
         print(f"[eval] 加载 RA Fusion: {ra_path}")
         print(f"[eval] RA Fusion scale: {transformer.ra_fusion_scale}")
+        print(
+            "[eval] RA ablation: "
+            f"main={ra_config.get('ra_fusion_use_main', True)}, "
+            f"control={ra_config.get('ra_fusion_use_control', True)}, "
+            f"condition={ra_config.get('ra_fusion_use_condition', True)}, "
+            f"temb={ra_config.get('ra_fusion_use_temb', True)}, "
+            f"adapter={ra_config.get('ra_fusion_adapter_mode', 'local')}"
+        )
 
     pipeline_components = {
         "controlnet": controlnet,
@@ -455,6 +483,10 @@ def evaluate(args_config: dict):
     pipeline = build_pipeline(args_config, device, weight_dtype)
 
     use_rss = bool(args_config.get("use_rss", False))
+    needs_ra_condition = bool(
+        args_config.get("use_ra_fusion", False)
+        and pipeline.transformer.config.ra_fusion_use_condition
+    )
     rss_weight = float(args_config.get("rss_weight", 0.01))
     rss_threshold = float(args_config.get("rss_threshold", 0.8))
     if use_rss:
@@ -561,7 +593,7 @@ def evaluate(args_config: dict):
                 if controlnet_scale is not None:
                     pipeline_kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
                 restoration_condition = None
-                if use_rss or args_config.get("use_ra_fusion", False):
+                if use_rss or needs_ra_condition:
                     restoration_condition = encode_rss_condition(
                         pipeline,
                         lq_pils,

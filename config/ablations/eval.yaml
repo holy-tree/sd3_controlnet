@@ -1,0 +1,11 @@
+# Use the same evaluator settings for every trained variant. Override both model paths.
+base_config: ../eval_sd3.yaml
+controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/controlnet"
+ra_fusion_path: "/root/autodl-tmp/sd3/experiment/ra_ablation/full_seed42/ra_fusion"
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/eval/full_seed42"
+use_ra_fusion: true
+ra_fusion_scale: 0.1
+max_samples_per_weather: 0
+sample_mode: head
+save_predictions: false
+enable_fid: false

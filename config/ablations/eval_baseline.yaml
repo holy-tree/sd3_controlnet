@@ -1,0 +1,9 @@
+# E0: the fixed SD3+ControlNet baseline, without RA.
+base_config: ../eval_sd3.yaml
+controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/controlnet"
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/eval/controlnet_baseline"
+use_ra_fusion: false
+max_samples_per_weather: 0
+sample_mode: head
+save_predictions: false
+enable_fid: false

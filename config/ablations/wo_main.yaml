@@ -1,0 +1,5 @@
+# E2: remove the current SD3 main-state input from RA only.
+base_config: ../train.yaml
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/wo_main_seed42"
+seed: 42
+ra_fusion_use_main: 0

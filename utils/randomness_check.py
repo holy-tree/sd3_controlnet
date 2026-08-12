@@ -279,7 +279,10 @@ def run_with_initial_noise(
 
     use_rss = bool(args_config.get("use_rss", False))
     restoration_condition = None
-    if use_rss or use_ra_fusion:
+    needs_ra_condition = bool(
+        use_ra_fusion and pipeline.transformer.config.ra_fusion_use_condition
+    )
+    if use_rss or needs_ra_condition:
         restoration_condition = encode_rss_condition(
             pipeline,
             lq_pils,

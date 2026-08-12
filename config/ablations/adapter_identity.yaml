@@ -1,0 +1,5 @@
+# E6/L0: preserve four-way fusion and output projection, but remove token adapters.
+base_config: ../train.yaml
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/adapter_identity_seed42"
+seed: 42
+ra_fusion_adapter_mode: "identity"

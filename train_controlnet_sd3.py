@@ -235,7 +235,7 @@ def log_validation(controlnet, transformer, args, accelerator, weight_dtype, ste
         validation_image = Image.open(validation_image).convert("RGB")
         validation_prompt = validation_prompts[i]
         restoration_condition = None
-        if getattr(args, "use_ra_fusion", 0):
+        if getattr(args, "use_ra_fusion", 0) and getattr(args, "ra_fusion_use_condition", 1):
             restoration_condition = encode_rss_condition(
                 pipeline,
                 [validation_image],
@@ -471,7 +471,11 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 generator=generator,
             )
             restoration_condition = None
-            if use_rss or getattr(args, "use_ra_fusion", 0):
+            needs_ra_condition = bool(
+                getattr(args, "use_ra_fusion", 0)
+                and getattr(args, "ra_fusion_use_condition", 1)
+            )
+            if use_rss or needs_ra_condition:
                 restoration_condition = encode_rss_condition(
                     pipeline,
                     [lq_pil],
@@ -868,6 +872,16 @@ def parse_args(input_args=None):
     parser.add_argument("--ra_fusion_learning_rate", type=float, default=1e-5)
     parser.add_argument("--ra_fusion_scale", type=float, default=1.0)
     parser.add_argument("--ra_fusion_stabilize", type=int, default=0)
+    parser.add_argument("--ra_fusion_use_main", type=int, default=1)
+    parser.add_argument("--ra_fusion_use_control", type=int, default=1)
+    parser.add_argument("--ra_fusion_use_condition", type=int, default=1)
+    parser.add_argument("--ra_fusion_use_temb", type=int, default=1)
+    parser.add_argument(
+        "--ra_fusion_adapter_mode",
+        type=str,
+        choices=["identity", "channel", "local"],
+        default="local",
+    )
     parser.add_argument("--ra_diagnostics_steps", type=int, default=100)
     parser.add_argument("--ra_fusion_model_path", type=str, default=None)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
@@ -1675,13 +1689,32 @@ def _coerce_yaml_value(current, value):
     return value
 
 
+def _load_yaml_config(path: str | os.PathLike, seen: set[Path] | None = None) -> dict:
+    """Load a YAML config with optional relative ``base_config`` inheritance."""
+    config_path = Path(path).resolve()
+    seen = set() if seen is None else seen
+    if config_path in seen:
+        raise ValueError(f"YAML base_config 循环引用: {config_path}")
+    seen.add(config_path)
+    with open(config_path, "r", encoding="utf-8") as file:
+        config = yaml.safe_load(file) or {}
+    base_path = config.pop("base_config", None)
+    if base_path is None:
+        return config
+    base_path = Path(base_path)
+    if not base_path.is_absolute():
+        base_path = config_path.parent / base_path
+    merged = _load_yaml_config(base_path, seen)
+    merged.update(config)
+    return merged
+
+
 def main(args):
     # ==================== YAML 配置加载 (--config) ====================
     # 用法: accelerate launch train_controlnet_sd3.py --config config/train.yaml
     # 优先级: CLI > YAML > argparse 默认值 (YAML 不为 None 的字段会覆盖 argparse 默认)
     if args.config is not None:
-        with open(args.config, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
+        cfg = _load_yaml_config(args.config)
         for key, value in cfg.items():
             if key in args._explicit_cli_args:
                 continue
@@ -1787,6 +1820,13 @@ def main(args):
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
+            effective_config = {
+                key: value
+                for key, value in vars(args).items()
+                if not key.startswith("_")
+            }
+            with open(Path(args.output_dir) / "effective_config.yaml", "w", encoding="utf-8") as file:
+                yaml.safe_dump(effective_config, file, sort_keys=True, allow_unicode=True)
 
         if args.push_to_hub:
             repo_id = create_repo(
@@ -1846,6 +1886,11 @@ def main(args):
             ra_fusion_kernel_size=args.ra_fusion_kernel_size,
             ra_fusion_scale=args.ra_fusion_scale,
             ra_fusion_stabilize=bool(args.ra_fusion_stabilize),
+            ra_fusion_use_main=bool(args.ra_fusion_use_main),
+            ra_fusion_use_control=bool(args.ra_fusion_use_control),
+            ra_fusion_use_condition=bool(args.ra_fusion_use_condition),
+            ra_fusion_use_temb=bool(args.ra_fusion_use_temb),
+            ra_fusion_adapter_mode=args.ra_fusion_adapter_mode,
             low_cpu_mem_usage=False,
         )
     transformer = transformer_cls.from_pretrained(
@@ -2002,6 +2047,9 @@ def main(args):
             f"[RA Fusion] blocks={list(transformer.ra_fusion_indices)}, "
             f"hidden_dim={args.ra_fusion_hidden_dim}, "
             f"scale={transformer.ra_fusion_scale}, stabilize={bool(args.ra_fusion_stabilize)}, "
+            f"inputs=main:{bool(args.ra_fusion_use_main)}/control:{bool(args.ra_fusion_use_control)}/"
+            f"condition:{bool(args.ra_fusion_use_condition)}/temb:{bool(args.ra_fusion_use_temb)}, "
+            f"adapter={args.ra_fusion_adapter_mode}, "
             f"可训练参数={sum(p.numel() for p in ra_fusion_layers):,}"
         )
 
@@ -2629,11 +2677,13 @@ def main(args):
                 controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
                 controlnet_image = (controlnet_image - controlnet_shift) * vae.config.scaling_factor
                 controlnet_image = controlnet_image.to(dtype=weight_dtype)
-                restoration_condition = lq_posterior.mode()
-                restoration_condition = (
-                    restoration_condition - vae.config.shift_factor
-                ) * vae.config.scaling_factor
-                if check_source_tensors:
+                restoration_condition = None
+                if args.use_ra_fusion and args.ra_fusion_use_condition:
+                    restoration_condition = lq_posterior.mode()
+                    restoration_condition = (
+                        restoration_condition - vae.config.shift_factor
+                    ) * vae.config.scaling_factor
+                if check_source_tensors and restoration_condition is not None:
                     raise_if_nonfinite("LQ restoration latent", restoration_condition, global_step + 1)
 
                 control_block_res_samples = controlnet(
@@ -2659,7 +2709,7 @@ def main(args):
 
                 # Predict the noise residual
                 transformer_extra_kwargs = {}
-                if args.use_ra_fusion:
+                if args.use_ra_fusion and args.ra_fusion_use_condition:
                     transformer_extra_kwargs["restoration_cond"] = restoration_condition
                 ra_diagnostics_model = unwrap_model(transformer) if args.use_ra_fusion else None
                 collect_ra_diagnostics = bool(

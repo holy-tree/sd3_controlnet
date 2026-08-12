@@ -1,0 +1,5 @@
+# L1: token-wise channel adapter without depthwise spatial convolution.
+base_config: ../train.yaml
+output_dir: "/root/autodl-tmp/sd3/experiment/ra_ablation/adapter_channel_seed42"
+seed: 42
+ra_fusion_adapter_mode: "channel"
