@@ -21,15 +21,15 @@ candidate_generation:
   splits: ["train"]
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
   # Generate exactly eight candidates for every source image.
-  num_candidates_per_image: 8
+  num_candidates_per_image: 6
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
   # Input scan limits. With sample_mode=head, take the first N images in
   # deterministic path order after merging each weather's train subdatasets.
   sample_mode: "head"
-  rain_max_samples: 12000
-  snow_max_samples: 10000
-  haze_max_samples: 10000
+  rain_max_samples: 2000
+  snow_max_samples: 1500
+  haze_max_samples: 1000
   # Keep a group only when max(candidate PSNR) - min(candidate PSNR) reaches
   # its weather threshold. Values are in dB.
   weather_psnr_gap_thresholds:
