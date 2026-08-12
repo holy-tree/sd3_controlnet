@@ -17,7 +17,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: " /root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-20000/controlnet"
+controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
@@ -27,14 +27,14 @@ revision: null
 variant: null
 
 # ==================== 输出与缓存 ====================
-output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion"
+output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint"
 cache_dir: null
 
 # 接续训练 (从 checkpoint 恢复 optimizer / scheduler / global_step):
 #   null      = 不接续, 从头训
 #   "latest"  = 自动选 output_dir 里最新的 checkpoint
 #   "/path/to/checkpoint-N" = 指定具体 checkpoint
-resume_from_checkpoint:  "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000"
+resume_from_checkpoint:  null
 
 # ==================== 数据集 (源项目布局, 与 --dataset_root 配合) ====================
 # 数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/
@@ -80,7 +80,7 @@ checkpointing_steps: 1000
 checkpoints_total_limit: 3
 
 # ==================== 优化器与梯度 ====================
-learning_rate: 1.0e-5
+learning_rate: 1.0e-6
 scale_lr: false
 
 # AdamW 参数
@@ -127,17 +127,17 @@ lora_learning_rate: 1.0e-6
 
 # ==================== RA-inspired ControlNet Fusion ====================
 # 第一阶段加载已有 ControlNet 并冻结，只训练零初始化 RA Fusion。
-train_controlnet: 0
+train_controlnet: 1
 use_ra_fusion: 1
 ra_fusion_interval: 4
 ra_fusion_hidden_dim: 256
 ra_fusion_num_res_blocks: 2
 ra_fusion_kernel_size: 3
-ra_fusion_learning_rate: 1.0e-5
+ra_fusion_learning_rate: 5.0e-7
 ra_fusion_scale: 0.1                    # 限制 RA 增量，避免在多步采样中压过冻结主干
 ra_fusion_stabilize: 1                  # 对递归 condition、timestep 和输出做无参数归一化
 ra_diagnostics_steps: 100               # 定期记录每个 RA block 的 delta/main RMS 比值
-ra_fusion_model_path: null              # 仅继续已有 RA 权重时填写；新训练保持 null
+ra_fusion_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/ra_fusion"              # 仅继续已有 RA 权重时填写；新训练保持 null
 
 # T5 text encoder 最大序列长度
 max_sequence_length: 77
@@ -152,8 +152,8 @@ max_sequence_length: 77
 #
 # 各重建损失均按 (1 - sigma) 在样本维加权, 自动侧重低噪声 timestep.
 # VAE.decode 由 --lpips_interval 控制频率.
-latent_l1_weight: 0.1                   # 第二阶段建议从 0.05 开始
-pixel_charbonnier_weight: 0.05            # RA 稳定后再逐项启用图像域损失
+latent_l1_weight: 0.2                   # 第二阶段建议从 0.05 开始
+pixel_charbonnier_weight: 0.0            # RA 稳定后再逐项启用图像域损失
 edge_loss_weight: 0.0
 lpips_weight: 0.0                       # PSNR 敏感任务建议 ≤0.02
 lpips_interval: 4                      # 每 N 步算一次图像域损失, 其余步置 0

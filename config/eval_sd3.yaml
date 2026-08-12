@@ -9,16 +9,17 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 #   1) <path>/controlnet/config.json
 #   2) <path>/config.json
 #   3) <path>/checkpoint-N/controlnet/config.json  (accelerate save_state 输出)
-controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet/checkpoint-90000/controlnet"
+controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/controlnet"
 # null 时自动查找 controlnet checkpoint 同级的 transformer_lora/；
 # 也可显式填写，例如 "./experiment/SD3ControlNet/checkpoint-50000/transformer_lora"。
 transformer_lora_path: null
 load_transformer_lora: false            # 第一阶段单独评估 RA，不混入 LoRA
 # RA Fusion 训练完成后改为 true；null 时自动查找 checkpoint 同级 ra_fusion/。
-use_ra_fusion: false
-ra_fusion_path: null
+use_ra_fusion: true
+ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/ra_fusion"
 # 可覆盖 checkpoint 保存的 RA 输出尺度。排查色块时依次测试 0.0 / 0.01 / 0.1 / 1.0。
-ra_fusion_scale: null
+ra_fusion_scale: 0.1
+controlnet_conditioning_scale: 1.0
 
 # 评估结果输出目录
 output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3"
@@ -71,7 +72,7 @@ prompt_ratio: 0.2
 # 与源 config/eval.yaml 同语义:
 #   0  或负数: 不限制, 跑完整 test 集 (默认, 指标统计更准确)
 #   正数:      仅跑前 N 张 (用于快速调试)
-max_samples_per_weather: 0
+max_samples_per_weather: 20
 # 截断模式 (与 max_samples_per_weather 配合)
 #   head   : 取前 N 张, 可复现 (默认, 推荐)
 #   random : 随机抽 N 张, 可复现 (若 yaml 设 seed)
