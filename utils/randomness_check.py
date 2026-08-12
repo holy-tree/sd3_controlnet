@@ -626,7 +626,9 @@ def main() -> None:
             rejected_records.append({**group_record, "reason": "psnr_gap_below_threshold"})
             continue
 
-        image_dir = candidates_root / (
+        weather_dir = candidates_root / weather
+        weather_dir.mkdir(parents=True, exist_ok=True)
+        image_dir = weather_dir / (
             f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
         )
         image_dir.mkdir(parents=True, exist_ok=False)
