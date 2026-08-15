@@ -302,11 +302,15 @@ def run_with_initial_noise(
     device,
     dtype,
     lq_pils,
-    prompt: str,
+    prompt: str | None,
     initial_noise: torch.Tensor,
     strength: float,
     num_inference_steps: int,
     use_ra_fusion: bool,
+    prompt_embeds: torch.Tensor | None = None,
+    pooled_prompt_embeds: torch.Tensor | None = None,
+    negative_prompt_embeds: torch.Tensor | None = None,
+    negative_pooled_prompt_embeds: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one batch while changing only the explicitly supplied initial noise."""
     resolution = int(args_config.get("resolution", 512))
@@ -325,7 +329,6 @@ def run_with_initial_noise(
     )
     fixed_generator = torch.Generator(device=device).manual_seed(0)
     kwargs = {
-        "prompt": [prompt] * len(lq_pils),
         "control_image": lq_pils,
         "num_inference_steps": num_inference_steps,
         "guidance_scale": args_config.get("guidance_scale", 1.5),
@@ -336,12 +339,22 @@ def run_with_initial_noise(
         "sigmas": custom_sigmas,
         "generator": fixed_generator,
     }
-    negative_prompt = args_config.get("negative_prompt")
-    if negative_prompt is not None:
-        kwargs["negative_prompt"] = (
-            [negative_prompt] * len(lq_pils)
-            if isinstance(negative_prompt, str) else negative_prompt
-        )
+    if prompt_embeds is not None:
+        if pooled_prompt_embeds is None:
+            raise ValueError("pooled_prompt_embeds is required with prompt_embeds")
+        kwargs["prompt_embeds"] = prompt_embeds
+        kwargs["pooled_prompt_embeds"] = pooled_prompt_embeds
+        if negative_prompt_embeds is not None:
+            kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+            kwargs["negative_pooled_prompt_embeds"] = negative_pooled_prompt_embeds
+    else:
+        kwargs["prompt"] = [prompt or ""] * len(lq_pils)
+        negative_prompt = args_config.get("negative_prompt")
+        if negative_prompt is not None:
+            kwargs["negative_prompt"] = (
+                [negative_prompt] * len(lq_pils)
+                if isinstance(negative_prompt, str) else negative_prompt
+            )
     controlnet_scale = args_config.get("controlnet_conditioning_scale")
     if controlnet_scale is not None:
         kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)

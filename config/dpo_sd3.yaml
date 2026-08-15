@@ -33,9 +33,9 @@ candidate_generation:
   # Keep a group only when max(candidate PSNR) - min(candidate PSNR) reaches
   # its weather threshold. Values are in dB.
   weather_psnr_gap_thresholds:
-    rain: 0.2
-    snow: 0.62
-    haze: 2.5
+    rain: 0.1
+    snow: 0.4
+    haze: 2
   # Applied independently to rain, snow, and haze after gap filtering.
   max_saved_groups_per_weather: 4000
   num_inference_steps: 30
@@ -52,7 +52,7 @@ candidate_generation:
 preference_filter:
   candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics.csv"
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences"
-  pair_strategy: "best_vs_all"       # best_vs_all | best_vs_worst | all_pairs
+  pair_strategy: "all_pairs"       # best_vs_all | best_vs_worst | all_pairs
   min_psnr_gap: 0.2
   # Initial values based on current rain/snow/haze gaps. Tune independently.
   weather_specific_thresholds:
@@ -94,16 +94,31 @@ model:
 training:
   preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences/preference_pairs.jsonl"
   output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO"
+  # null = start from the original reference policy; "latest" = resume the
+  # newest resumable checkpoint; or provide an explicit checkpoint-N path.
+  resume_from_checkpoint: null
   # Three valid modes: RA only, ControlNet only, joint ControlNet+RA.
   # Setting both to false is rejected.
   train_controlnet: true
   train_ra_fusion: true
   resolution: 512
-  train_batch_size: 1
-  gradient_accumulation_steps: 4
-  dataloader_num_workers: 0
-  max_train_steps: 1000
-  checkpointing_steps: 250
+  train_batch_size: 4
+  gradient_accumulation_steps: 2
+  dataloader_num_workers: 4
+  max_train_steps: 5000
+  checkpointing_steps: 500
+  # Keep only the newest N checkpoint-* directories. 0 means unlimited.
+  checkpoints_total_limit: 3
+  # Run a lightweight test-set validation after every checkpoint save.
+  run_checkpoint_validation: true
+  validation_eval_config: "./config/eval_sd3.yaml"
+  validation_num_samples_per_weather: 3
+  validation_num_inference_steps: 30
+  validation_guidance_scale: 1.0
+  validation_strength: 1.0
+  validation_seed: 42
+  validation_use_rss: false
+  validation_lpips_net: "alex"
   beta: 0.1
   # ControlNet is larger and easier to destabilize; use a lower LR than RA.
   controlnet_learning_rate: 5.0e-8
@@ -132,6 +147,6 @@ evaluation:
   eval_config: "./config/eval_sd3.yaml"
   output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo"
   # null selects DPO output when that component was trained, otherwise the base path.
-  controlnet_model_path: null
-  ra_fusion_path: null
+  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO/checkpoint-5000/controlnet"
+  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO/checkpoint-5000/ra_fusion"
   enable_fid: true
