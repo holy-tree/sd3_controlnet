@@ -17,7 +17,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/controlnet"
+controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet/checkpoint-92000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
@@ -74,7 +74,7 @@ dataloader_num_workers: 0
 
 # ==================== 训练步数 ====================
 num_train_epochs: 1
-max_train_steps: 20000
+max_train_steps: 6000
 checkpointing_steps: 1000
 # 最多保存几个 checkpoint (旧的会被自动删除以节省磁盘)
 checkpoints_total_limit: 3
