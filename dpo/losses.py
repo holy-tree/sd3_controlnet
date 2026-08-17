@@ -6,6 +6,37 @@ import torch
 import torch.nn.functional as F
 
 
+def flow_matching_gt_losses(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    clean_latents: torch.Tensor,
+    sigma: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return GT velocity MSE and low-noise-weighted predicted-x0 L1."""
+    if not (
+        prediction.shape == target.shape == noisy_latents.shape == clean_latents.shape
+    ):
+        raise ValueError("GT flow tensors must have identical shapes")
+    if sigma.shape[0] != prediction.shape[0]:
+        raise ValueError("GT sigma batch size must match the latent batch size")
+
+    prediction_float = prediction.float()
+    target_float = target.float()
+    flow_mse = (
+        (prediction_float - target_float).square().flatten(1).mean(1).mean()
+    )
+
+    sigma_float = sigma.float()
+    predicted_x0 = noisy_latents.float() - sigma_float * prediction_float
+    x0_l1_per_sample = (
+        (predicted_x0 - clean_latents.float()).abs().flatten(1).mean(1)
+    )
+    low_noise_weight = (1.0 - sigma_float.flatten(1).mean(1)).clamp(0.0, 1.0)
+    x0_l1 = (x0_l1_per_sample * low_noise_weight).mean()
+    return flow_mse, x0_l1
+
+
 def diffusion_dpo_loss(
     policy_chosen_mse: torch.Tensor,
     policy_rejected_mse: torch.Tensor,

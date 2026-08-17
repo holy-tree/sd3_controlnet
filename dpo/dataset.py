@@ -43,6 +43,7 @@ class PreferencePairDataset(Dataset):
         return {
             "chosen_pixel_values": self._image(record["chosen_path"]),
             "rejected_pixel_values": self._image(record["rejected_path"]),
+            "gt_pixel_values": self._image(record["gt_path"]),
             "conditioning_pixel_values": self._image(record["lq_path"]),
             "prompt": str(record.get("prompt", "")),
             "weather": str(record["weather"]),
@@ -59,6 +60,7 @@ def collate_preference_pairs(examples: list[dict]) -> dict:
     return {
         "chosen_pixel_values": torch.stack([row["chosen_pixel_values"] for row in examples]),
         "rejected_pixel_values": torch.stack([row["rejected_pixel_values"] for row in examples]),
+        "gt_pixel_values": torch.stack([row["gt_pixel_values"] for row in examples]),
         "conditioning_pixel_values": torch.stack([
             row["conditioning_pixel_values"] for row in examples
         ]),

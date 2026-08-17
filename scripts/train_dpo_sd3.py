@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dpo.dataset import PreferencePairDataset, collate_preference_pairs
-from dpo.losses import diffusion_dpo_loss
+from dpo.losses import diffusion_dpo_loss, flow_matching_gt_losses
 from dpo.provenance import checkpoint_checksum
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from train_controlnet_sd3 import encode_prompt, import_model_class_from_model_name_or_path
@@ -329,6 +329,8 @@ def write_resume_metadata(
         "seed": int(train_config.get("seed", 42)),
         "resolution": int(train_config.get("resolution", 512)),
         "sft_weight": float(train_config.get("sft_weight", 0.0)),
+        "gt_flow_weight": float(train_config.get("gt_flow_weight", 0.0)),
+        "gt_x0_l1_weight": float(train_config.get("gt_x0_l1_weight", 0.0)),
         "weight_by_psnr_gap": bool(train_config.get("weight_by_psnr_gap", False)),
         "beta": float(train_config.get("beta", 0.1)),
         "controlnet_learning_rate": float(
@@ -370,6 +372,8 @@ def validate_resume_metadata(
         "seed": int(train_config.get("seed", 42)),
         "resolution": int(train_config.get("resolution", 512)),
         "sft_weight": float(train_config.get("sft_weight", 0.0)),
+        "gt_flow_weight": float(train_config.get("gt_flow_weight", 0.0)),
+        "gt_x0_l1_weight": float(train_config.get("gt_x0_l1_weight", 0.0)),
         "weight_by_psnr_gap": bool(train_config.get("weight_by_psnr_gap", False)),
         "beta": float(train_config.get("beta", 0.1)),
         "controlnet_learning_rate": float(
@@ -575,6 +579,11 @@ def main() -> None:
     train_config = dict(config["training"])
     train_controlnet = bool(train_config.get("train_controlnet", False))
     train_ra_fusion = bool(train_config.get("train_ra_fusion", True))
+    gt_flow_weight = float(train_config.get("gt_flow_weight", 0.0))
+    gt_x0_l1_weight = float(train_config.get("gt_x0_l1_weight", 0.0))
+    if gt_flow_weight < 0.0 or gt_x0_l1_weight < 0.0:
+        raise ValueError("training.gt_flow_weight and gt_x0_l1_weight must be non-negative")
+    gt_supervision_enabled = gt_flow_weight > 0.0 or gt_x0_l1_weight > 0.0
     if not train_controlnet and not train_ra_fusion:
         raise ValueError("At least one of training.train_controlnet/train_ra_fusion must be true")
     if cli.max_train_steps is not None:
@@ -987,6 +996,75 @@ def main() -> None:
                     sft_weight=float(train_config.get("sft_weight", 0.0)),
                 )
                 accelerator.backward(loss)
+
+                dpo_loss = loss.detach()
+                gt_flow_loss = torch.zeros((), device=device, dtype=torch.float32)
+                gt_x0_l1_loss = torch.zeros((), device=device, dtype=torch.float32)
+                weighted_gt_loss = torch.zeros((), device=device, dtype=torch.float32)
+                if gt_supervision_enabled:
+                    with torch.no_grad():
+                        gt_pixels = batch["gt_pixel_values"].to(
+                            device=device, dtype=vae.dtype
+                        )
+                        gt_latents = vae.encode(gt_pixels).latent_dist.mode()
+                        gt_latents = (
+                            gt_latents - vae.config.shift_factor
+                        ) * vae.config.scaling_factor
+                        gt_latents = gt_latents.to(weight_dtype)
+                        gt_noisy = (
+                            (1.0 - sigma) * gt_latents + sigma * shared_noise
+                        )
+                        gt_target = shared_noise - gt_latents
+
+                    gt_controlnet_kwargs = dict(
+                        hidden_states=gt_noisy,
+                        timestep=timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=(
+                            torch.zeros_like(pooled_embeds)
+                            if force_zero_pooled
+                            else pooled_embeds
+                        ),
+                        controlnet_cond=control_image.to(weight_dtype),
+                        conditioning_scale=float(
+                            model_config.get("controlnet_conditioning_scale", 1.0)
+                        ),
+                        return_dict=False,
+                    )
+                    with accelerator.autocast():
+                        gt_control_samples = controlnet(**gt_controlnet_kwargs)[0]
+                    gt_control_samples = [
+                        sample.to(weight_dtype) for sample in gt_control_samples
+                    ]
+                    with accelerator.autocast():
+                        gt_prediction = transformer(
+                            hidden_states=gt_noisy,
+                            timestep=timesteps,
+                            encoder_hidden_states=prompt_embeds,
+                            pooled_projections=pooled_embeds,
+                            block_controlnet_hidden_states=gt_control_samples,
+                            restoration_cond=restoration.to(weight_dtype),
+                            return_dict=False,
+                        )[0]
+                    gt_flow_loss, gt_x0_l1_loss = flow_matching_gt_losses(
+                        gt_prediction,
+                        gt_target,
+                        gt_noisy,
+                        gt_latents,
+                        sigma,
+                    )
+                    weighted_gt_loss = (
+                        gt_flow_weight * gt_flow_loss
+                        + gt_x0_l1_weight * gt_x0_l1_loss
+                    )
+                    accelerator.backward(weighted_gt_loss)
+
+                loss = dpo_loss + weighted_gt_loss.detach()
+                stats.update({
+                    "loss_gt_flow": gt_flow_loss.detach(),
+                    "loss_gt_x0_l1": gt_x0_l1_loss.detach(),
+                    "loss_gt_weighted": weighted_gt_loss.detach(),
+                })
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable, float(train_config.get("max_grad_norm", 1.0)))
                 optimizer.step()
@@ -1002,7 +1080,11 @@ def main() -> None:
                     for index, group in enumerate(optimizer.param_groups)
                 }
                 logs.update(loss=float(loss.detach()), **group_lrs)
-                progress.set_postfix(loss=f"{logs['loss']:.4f}", acc=f"{logs['implicit_accuracy']:.2f}")
+                progress.set_postfix(
+                    loss=f"{logs['loss']:.4f}",
+                    gt=f"{logs['loss_gt_weighted']:.4f}",
+                    acc=f"{logs['implicit_accuracy']:.2f}",
+                )
                 if train_config.get("report_to"):
                     accelerator.log(logs, step=global_step)
                 checkpointing_steps = int(train_config.get("checkpointing_steps", 250))
@@ -1105,6 +1187,9 @@ def main() -> None:
                 "global_step": global_step,
                 "num_preference_pairs": len(dataset),
                 "beta": beta,
+                "sft_weight": float(train_config.get("sft_weight", 0.0)),
+                "gt_flow_weight": gt_flow_weight,
+                "gt_x0_l1_weight": gt_x0_l1_weight,
                 "train_controlnet": train_controlnet,
                 "train_ra_fusion": train_ra_fusion,
                 "controlnet_trainable_parameters": sum(

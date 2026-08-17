@@ -136,6 +136,9 @@ training:
   max_sequence_length: 77
   # Optional chosen reconstruction regularizer. Start at zero for pure DPO.
   sft_weight: 0.0
+  # Direct GT anchors. These supervise the policy only; the reference remains frozen.
+  gt_flow_weight: 0.1
+  gt_x0_l1_weight: 0.05
   weight_by_psnr_gap: false
   # Refuse legacy/mismatched preference data unless explicitly disabled.
   require_candidate_provenance: true
