@@ -273,6 +273,53 @@ def collect_rain1400(directory: Path, unmatched: list[dict]) -> list[PairRecord]
     return records
 
 
+def collect_spa_test(directory: Path, unmatched: list[dict]) -> list[PairRecord]:
+    gt_paths = image_files(directory / "gt")
+    lq_map = unique_stem_map(image_files(directory / "rain"), "SPA-Test1000 LQ")
+    gt_map = {}
+    for path in gt_paths:
+        if not path.stem.lower().endswith("gt"):
+            add_unmatched(unmatched, "rain", "SPA-Test1000", "test", "GT", path)
+            continue
+        identifier = path.stem[:-2]
+        if identifier in gt_map:
+            raise ValueError(f"Duplicate SPA-Test1000 GT ID: {identifier}")
+        gt_map[identifier] = path
+
+    records = []
+    for identifier in sorted(set(gt_map) & set(lq_map)):
+        records.append(PairRecord(
+            weather="rain",
+            source="SPA-Test1000",
+            split="test",
+            subset="SPA-Test1000",
+            pair_id=safe_stem(f"spa-test1000__{identifier}"),
+            gt_source=gt_map[identifier],
+            lq_source=lq_map[identifier],
+        ))
+    for identifier in sorted(set(gt_map) - set(lq_map)):
+        add_unmatched(
+            unmatched,
+            "rain",
+            "SPA-Test1000",
+            "test",
+            "GT",
+            gt_map[identifier],
+            identifier,
+        )
+    for identifier in sorted(set(lq_map) - set(gt_map)):
+        add_unmatched(
+            unmatched,
+            "rain",
+            "SPA-Test1000",
+            "test",
+            "LQ",
+            lq_map[identifier],
+            f"{identifier}gt",
+        )
+    return records
+
+
 def find_unique_directory(root: Path, name: str) -> Path:
     matches = sorted(path for path in root.rglob(name) if path.is_dir())
     if len(matches) != 1:
@@ -291,10 +338,8 @@ def collect_all(source_root: Path) -> tuple[list[PairRecord], list[dict], dict]:
     records.extend(collect_rain_benchmark(rain_root / "Rain100H", "Rain100H", unmatched))
     records.extend(collect_rain_benchmark(rain_root / "Rain100L", "Rain100L", unmatched))
     records.extend(collect_rain1400(rain_root / "Rain1400", unmatched))
-    records.extend(collect_same_stem(
-        rain_root / "SPA+" / "Testing" / "real_test_1000" / "gt",
-        rain_root / "SPA+" / "Testing" / "real_test_1000" / "rain",
-        "rain", "SPA-Test1000", "test", "SPA-Test1000", unmatched,
+    records.extend(collect_spa_test(
+        rain_root / "SPA+" / "Testing" / "real_test_1000", unmatched
     ))
 
     snow_root = source_root / "snow"
@@ -451,7 +496,11 @@ def find_gt_leakage(records: list[PairRecord]) -> list[dict]:
 
 
 def summarize(
-    records: list[PairRecord], unmatched: list[dict], excluded: dict, leakage: list[dict]
+    records: list[PairRecord],
+    unmatched: list[dict],
+    excluded: dict,
+    leakage: list[dict],
+    content_hash_checked: bool,
 ) -> dict:
     by_split_weather = Counter((record.split, record.weather) for record in records)
     by_source = Counter(record.source for record in records)
@@ -473,8 +522,12 @@ def summarize(
         "unmatched_by_source": dict(sorted(Counter(
             item["source"] for item in unmatched
         ).items())),
+        "unmatched_by_source_side": dict(sorted(Counter(
+            f"{item['source']}/{item['side']}" for item in unmatched
+        ).items())),
         "excluded_auxiliary_or_unpaired": excluded,
-        "train_test_gt_leakage_count": len(leakage),
+        "content_hash_checked": content_hash_checked,
+        "train_test_gt_leakage_count": len(leakage) if content_hash_checked else None,
     }
 
 
@@ -518,7 +571,13 @@ def main() -> None:
         raise ValueError(f"Duplicate pair IDs: {duplicate_ids[:20]}")
 
     leakage = find_gt_leakage(records) if args.check_content_hash else []
-    summary = summarize(records, unmatched, excluded, leakage)
+    summary = summarize(
+        records,
+        unmatched,
+        excluded,
+        leakage,
+        content_hash_checked=args.check_content_hash,
+    )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     if args.fail_on_leakage and leakage:
         raise ValueError(f"Found {len(leakage)} train/test GT content overlaps")

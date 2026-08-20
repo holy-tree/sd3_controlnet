@@ -7,6 +7,7 @@ from scripts.organize_weather_dataset import (
     collect_rain_benchmark,
     collect_rain_train,
     collect_spa_train,
+    collect_spa_test,
     materialize_operations,
     output_paths,
 )
@@ -83,6 +84,21 @@ class DatasetOrganizerPairingTest(unittest.TestCase):
             "rain1400__901__1",
             "rain1400__901__14",
         })
+
+    def test_spa_test_removes_gt_suffix(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            make_file(root / "gt" / "000gt.png")
+            make_file(root / "rain" / "000.png")
+            unmatched = []
+
+            records = collect_spa_test(root, unmatched)
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].gt_source.name, "000gt.png")
+        self.assertEqual(records[0].lq_source.name, "000.png")
+        self.assertEqual(records[0].pair_id, "spa-test1000__000")
+        self.assertEqual(unmatched, [])
 
     def test_output_uses_loader_compatible_directories(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
