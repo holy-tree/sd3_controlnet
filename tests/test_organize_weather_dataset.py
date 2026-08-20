@@ -3,11 +3,14 @@ import unittest
 from pathlib import Path
 
 from scripts.organize_weather_dataset import (
+    PairRecord,
     collect_rain1400,
     collect_rain_benchmark,
     collect_rain_train,
     collect_spa_train,
     collect_spa_test,
+    exclude_leaked_training_pairs,
+    find_gt_leakage,
     materialize_operations,
     output_paths,
 )
@@ -138,6 +141,26 @@ class DatasetOrganizerPairingTest(unittest.TestCase):
 
             self.assertFalse(source.exists())
             self.assertEqual(target.read_bytes(), b"test")
+
+    def test_content_overlap_removes_train_pair_only(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            train_gt = make_file(root / "train_gt.png")
+            test_gt = make_file(root / "test_gt.png")
+            train_lq = make_file(root / "train_lq.png")
+            test_lq = make_file(root / "test_lq.png")
+            records = [
+                PairRecord("rain", "Train", "train", "train", "train-1", train_gt, train_lq),
+                PairRecord("rain", "Test", "test", "Test", "test-1", test_gt, test_lq),
+            ]
+
+            leakage, cache = find_gt_leakage(records)
+            filtered, excluded = exclude_leaked_training_pairs(records, leakage, cache)
+
+        self.assertEqual(len(leakage), 1)
+        self.assertEqual([record.pair_id for record in filtered], ["test-1"])
+        self.assertEqual(len(excluded), 1)
+        self.assertEqual(excluded[0]["train_pair_id"], "train-1")
 
 
 if __name__ == "__main__":

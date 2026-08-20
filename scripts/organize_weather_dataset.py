@@ -469,7 +469,7 @@ def file_sha256(path: Path, cache: dict[Path, str]) -> str:
     return cache[path]
 
 
-def find_gt_leakage(records: list[PairRecord]) -> list[dict]:
+def find_gt_leakage(records: list[PairRecord]) -> tuple[list[dict], dict[Path, str]]:
     cache: dict[Path, str] = {}
     train_hashes: dict[str, PairRecord] = {}
     for record in records:
@@ -492,7 +492,33 @@ def find_gt_leakage(records: list[PairRecord]) -> list[dict]:
                 "test_source": record.source,
                 "test_gt": str(record.gt_source),
             })
-    return leakage
+    return leakage, cache
+
+
+def exclude_leaked_training_pairs(
+    records: list[PairRecord],
+    leakage: list[dict],
+    hash_cache: dict[Path, str],
+) -> tuple[list[PairRecord], list[dict]]:
+    test_by_hash = {item["sha256"]: item for item in leakage}
+    filtered = []
+    excluded = []
+    for record in records:
+        digest = file_sha256(record.gt_source, hash_cache) if record.split == "train" else None
+        test_match = test_by_hash.get(digest)
+        if test_match is None:
+            filtered.append(record)
+            continue
+        excluded.append({
+            "sha256": digest,
+            "train_source": record.source,
+            "train_pair_id": record.pair_id,
+            "train_gt": str(record.gt_source),
+            "train_lq": str(record.lq_source),
+            "test_source": test_match["test_source"],
+            "test_gt": test_match["test_gt"],
+        })
+    return filtered, excluded
 
 
 def summarize(
@@ -501,6 +527,7 @@ def summarize(
     excluded: dict,
     leakage: list[dict],
     content_hash_checked: bool,
+    excluded_leakage_pairs: list[dict],
 ) -> dict:
     by_split_weather = Counter((record.split, record.weather) for record in records)
     by_source = Counter(record.source for record in records)
@@ -527,7 +554,23 @@ def summarize(
         ).items())),
         "excluded_auxiliary_or_unpaired": excluded,
         "content_hash_checked": content_hash_checked,
-        "train_test_gt_leakage_count": len(leakage) if content_hash_checked else None,
+        "detected_train_test_gt_leakage_count": (
+            len(leakage) if content_hash_checked else None
+        ),
+        "leakage_by_source_pair": (
+            dict(sorted(Counter(
+                f"{item['train_source']} -> {item['test_source']}" for item in leakage
+            ).items()))
+            if content_hash_checked else None
+        ),
+        "leakage_examples": leakage[:10] if content_hash_checked else None,
+        "train_pairs_excluded_for_leakage": len(excluded_leakage_pairs),
+        "excluded_leakage_pairs_by_source": dict(sorted(Counter(
+            item["train_source"] for item in excluded_leakage_pairs
+        ).items())),
+        "remaining_train_test_gt_leakage_count": (
+            0 if excluded_leakage_pairs else len(leakage)
+        ) if content_hash_checked else None,
     }
 
 
@@ -549,6 +592,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check-content-hash", action="store_true")
+    parser.add_argument(
+        "--exclude-test-overlap",
+        action="store_true",
+        help="Remove training pairs whose GT content appears in any test subset.",
+    )
     parser.add_argument("--fail-on-leakage", action="store_true")
     return parser.parse_args()
 
@@ -563,6 +611,8 @@ def main() -> None:
         raise ValueError("Output must not be inside the source dataset tree")
     if not args.dry_run and output_root.exists() and any(output_root.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {output_root}")
+    if args.exclude_test_overlap and not args.check_content_hash:
+        raise ValueError("--exclude-test-overlap requires --check-content-hash")
 
     records, unmatched, excluded = collect_all(source_root)
     pair_ids = [record.pair_id for record in records]
@@ -570,17 +620,27 @@ def main() -> None:
     if duplicate_ids:
         raise ValueError(f"Duplicate pair IDs: {duplicate_ids[:20]}")
 
-    leakage = find_gt_leakage(records) if args.check_content_hash else []
+    leakage = []
+    hash_cache = {}
+    if args.check_content_hash:
+        leakage, hash_cache = find_gt_leakage(records)
+    excluded_leakage_pairs = []
+    if args.exclude_test_overlap and leakage:
+        records, excluded_leakage_pairs = exclude_leaked_training_pairs(
+            records, leakage, hash_cache
+        )
     summary = summarize(
         records,
         unmatched,
         excluded,
         leakage,
         content_hash_checked=args.check_content_hash,
+        excluded_leakage_pairs=excluded_leakage_pairs,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
-    if args.fail_on_leakage and leakage:
-        raise ValueError(f"Found {len(leakage)} train/test GT content overlaps")
+    remaining_leakage = summary["remaining_train_test_gt_leakage_count"]
+    if args.fail_on_leakage and remaining_leakage:
+        raise ValueError(f"Found {remaining_leakage} train/test GT content overlaps")
     if args.dry_run:
         return
 
@@ -606,6 +666,10 @@ def main() -> None:
     write_jsonl(manifest_root / "pairs.jsonl", manifest)
     write_jsonl(manifest_root / "unmatched.jsonl", unmatched)
     write_jsonl(manifest_root / "train_test_gt_leakage.jsonl", leakage)
+    write_jsonl(
+        manifest_root / "excluded_train_pairs_for_leakage.jsonl",
+        excluded_leakage_pairs,
+    )
     with (output_root / "dataset_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
 
