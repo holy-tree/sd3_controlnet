@@ -16,16 +16,17 @@ from utils.evaluate_sd3 import evaluate, load_config
 
 
 def latest_complete_checkpoint(
-    output_dir: Path, train_controlnet: bool, train_ra_fusion: bool
+    output_dir: Path, train_controlnet: bool, train_ra_fusion: bool, use_ema: bool = False
 ) -> Path | None:
     candidates = []
     for path in output_dir.glob("checkpoint-*"):
         step = path.name.removeprefix("checkpoint-")
         if not path.is_dir() or not step.isdigit():
             continue
-        if train_controlnet and not (path / "controlnet" / "config.json").is_file():
+        model_root = path / "ema" if use_ema else path
+        if train_controlnet and not (model_root / "controlnet" / "config.json").is_file():
             continue
-        if train_ra_fusion and not (path / "ra_fusion" / "ra_fusion.safetensors").is_file():
+        if train_ra_fusion and not (model_root / "ra_fusion" / "ra_fusion.safetensors").is_file():
             continue
         candidates.append((int(step), path))
     return max(candidates, default=(None, None), key=lambda item: item[0])[1]
@@ -48,6 +49,7 @@ def main() -> None:
     dpo_output = Path(training["output_dir"])
     train_controlnet = bool(training.get("train_controlnet", False))
     train_ra_fusion = bool(training.get("train_ra_fusion", True))
+    use_ema = bool(training.get("use_ema", False))
     final_controlnet = dpo_output / "controlnet"
     final_ra = dpo_output / "ra_fusion"
     needs_checkpoint_fallback = (
@@ -55,15 +57,20 @@ def main() -> None:
         or (train_ra_fusion and not (final_ra / "ra_fusion.safetensors").is_file())
     )
     checkpoint_fallback = (
-        latest_complete_checkpoint(dpo_output, train_controlnet, train_ra_fusion)
+        latest_complete_checkpoint(dpo_output, train_controlnet, train_ra_fusion, use_ema)
         if needs_checkpoint_fallback
         else None
+    )
+    checkpoint_model_root = (
+        checkpoint_fallback / "ema"
+        if checkpoint_fallback is not None and use_ema
+        else checkpoint_fallback
     )
     eval_config["pretrained_model_name_or_path"] = dpo_config["model"][
         "pretrained_model_name_or_path"
     ]
     default_controlnet_path = (
-        str((checkpoint_fallback / "controlnet") if checkpoint_fallback else final_controlnet)
+        str((checkpoint_model_root / "controlnet") if checkpoint_model_root else final_controlnet)
         if train_controlnet
         else dpo_config["model"]["controlnet_model_path"]
     )
@@ -84,7 +91,7 @@ def main() -> None:
     eval_config["load_transformer_lora"] = False
     eval_config["deterministic_controlnet_vae"] = True
     default_ra_path = (
-        str((checkpoint_fallback / "ra_fusion") if checkpoint_fallback else final_ra)
+        str((checkpoint_model_root / "ra_fusion") if checkpoint_model_root else final_ra)
         if train_ra_fusion
         else dpo_config["model"]["ra_fusion_path"]
     )

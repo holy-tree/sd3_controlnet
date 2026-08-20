@@ -17,7 +17,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/controlnet"
+controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
@@ -127,7 +127,7 @@ lora_learning_rate: 1.0e-6
 
 # ==================== RA-inspired ControlNet Fusion ====================
 # 第一阶段加载已有 ControlNet 并冻结，只训练零初始化 RA Fusion。
-train_controlnet: 1
+train_controlnet: 0
 use_ra_fusion: 1
 ra_fusion_interval: 4
 ra_fusion_hidden_dim: 256
@@ -136,8 +136,16 @@ ra_fusion_kernel_size: 3
 ra_fusion_learning_rate: 5.0e-7
 ra_fusion_scale: 0.1                    # 限制 RA 增量，避免在多步采样中压过冻结主干
 ra_fusion_stabilize: 1                  # 对递归 condition、timestep 和输出做无参数归一化
+ra_degradation_enabled: 1               # P1: 从 LQ latent 预测全局退化向量 g
+ra_degradation_hidden_dim: 64            # LQ latent encoder 的中间通道数
+ra_degradation_global_dim: 128           # 全局退化向量 g 的维度
+ra_weather_loss_weight: 0.1              # rain/snow/haze 辅助分类损失权重
+ra_spatial_enabled: 1                    # 将空间退化图 M 注入 LQ condition tokens
+ra_deformable_enabled: 1                 # 对 M 使用可学习偏移的局部采样
+ra_deformable_kernel_size: 3             # 每个位置采样 3x3=9 个点
+ra_deformable_max_offset: 1.0            # 每个采样点最多额外偏移 1 个 token 网格
 ra_diagnostics_steps: 100               # 定期记录每个 RA block 的 delta/main RMS 比值
-ra_fusion_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/ra_fusion"              # 仅继续已有 RA 权重时填写；新训练保持 null
+ra_fusion_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/ra_fusion"              # 仅继续已有 RA 权重时填写；新训练保持 null
 
 # T5 text encoder 最大序列长度
 max_sequence_length: 77

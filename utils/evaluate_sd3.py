@@ -265,6 +265,14 @@ def build_pipeline(args_config: dict, device, dtype):
             ra_fusion_kernel_size=ra_config["ra_fusion_kernel_size"],
             ra_fusion_scale=effective_scale,
             ra_fusion_stabilize=bool(ra_config.get("ra_fusion_stabilize", False)),
+            ra_degradation_enabled=bool(ra_config.get("ra_degradation_enabled", False)),
+            ra_degradation_hidden_dim=int(ra_config.get("ra_degradation_hidden_dim", 64)),
+            ra_degradation_global_dim=int(ra_config.get("ra_degradation_global_dim", 128)),
+            ra_degradation_num_classes=int(ra_config.get("ra_degradation_num_classes", 3)),
+            ra_spatial_enabled=bool(ra_config.get("ra_spatial_enabled", False)),
+            ra_deformable_enabled=bool(ra_config.get("ra_deformable_enabled", False)),
+            ra_deformable_kernel_size=int(ra_config.get("ra_deformable_kernel_size", 3)),
+            ra_deformable_max_offset=float(ra_config.get("ra_deformable_max_offset", 1.0)),
         )
         transformer.set_ra_fusion_dtype(torch.float32)
         transformer.load_ra_fusion(ra_path)

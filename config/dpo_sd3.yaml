@@ -101,6 +101,18 @@ training:
   # Setting both to false is rejected.
   train_controlnet: true
   train_ra_fusion: true
+  # EMA tracks all trainable ControlNet/RA parameters. CPU avoids duplicating
+  # the policy in VRAM; set ema_device to "accelerator" only when memory allows.
+  use_ema: true
+  ema_decay: 0.9999
+  ema_use_warmup: true
+  ema_inv_gamma: 1.0
+  ema_power: 0.75
+  ema_update_after_step: 0
+  ema_update_interval: 1
+  ema_device: "cpu"
+  # Checkpoint validation and the final controlnet/ra_fusion export use EMA.
+  validation_use_ema: true
   resolution: 512
   train_batch_size: 4
   gradient_accumulation_steps: 2
@@ -150,6 +162,6 @@ evaluation:
   eval_config: "./config/eval_sd3.yaml"
   output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo"
   # null selects DPO output when that component was trained, otherwise the base path.
-  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO/checkpoint-5000/controlnet"
-  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO/checkpoint-5000/ra_fusion"
+  controlnet_model_path: null
+  ra_fusion_path: null
   enable_fid: true

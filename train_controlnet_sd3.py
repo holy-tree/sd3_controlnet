@@ -87,6 +87,8 @@ check_min_version("0.32.0")
 
 logger = get_logger(__name__)
 
+WEATHER_CLASS_IDS = {"rain": 0, "snow": 1, "haze": 2}
+
 
 # ============================================================
 # RGB 图像域损失辅助函数
@@ -868,6 +870,14 @@ def parse_args(input_args=None):
     parser.add_argument("--ra_fusion_learning_rate", type=float, default=1e-5)
     parser.add_argument("--ra_fusion_scale", type=float, default=1.0)
     parser.add_argument("--ra_fusion_stabilize", type=int, default=0)
+    parser.add_argument("--ra_degradation_enabled", type=int, default=0)
+    parser.add_argument("--ra_degradation_hidden_dim", type=int, default=64)
+    parser.add_argument("--ra_degradation_global_dim", type=int, default=128)
+    parser.add_argument("--ra_weather_loss_weight", type=float, default=0.1)
+    parser.add_argument("--ra_spatial_enabled", type=int, default=0)
+    parser.add_argument("--ra_deformable_enabled", type=int, default=0)
+    parser.add_argument("--ra_deformable_kernel_size", type=int, default=3)
+    parser.add_argument("--ra_deformable_max_offset", type=float, default=1.0)
     parser.add_argument("--ra_diagnostics_steps", type=int, default=100)
     parser.add_argument("--ra_fusion_model_path", type=str, default=None)
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
@@ -1531,12 +1541,16 @@ def collate_fn(examples):
         for value in (example["pooled_prompt_embeds"] for example in examples)
     ])
 
-    return {
+    batch = {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "prompt_embeds": prompt_embeds,
         "pooled_prompt_embeds": pooled_prompt_embeds,
     }
+    weather = [example.get("weather") for example in examples]
+    if all(value is not None for value in weather):
+        batch["weather"] = weather
+    return batch
 
 
 # Copied from dreambooth sd3 example
@@ -1719,6 +1733,21 @@ def main(args):
             "pretrained_model_name_or_path 未设置. 请通过 --pretrained_model_name_or_path 或 YAML 配置提供."
         )
 
+    if args.ra_degradation_enabled and not args.use_ra_fusion:
+        raise ValueError("ra_degradation_enabled=1 requires use_ra_fusion=1")
+    if args.ra_spatial_enabled and not args.ra_degradation_enabled:
+        raise ValueError("ra_spatial_enabled=1 requires ra_degradation_enabled=1")
+    if args.ra_deformable_enabled and not args.ra_spatial_enabled:
+        raise ValueError("ra_deformable_enabled=1 requires ra_spatial_enabled=1")
+    if args.ra_weather_loss_weight < 0.0:
+        raise ValueError("ra_weather_loss_weight must be non-negative")
+    unknown_weather = sorted(set(args.weather_types) - set(WEATHER_CLASS_IDS))
+    if args.ra_degradation_enabled and unknown_weather:
+        raise ValueError(
+            f"Degradation-aware RA only supports {sorted(WEATHER_CLASS_IDS)}; "
+            f"unknown weather types: {unknown_weather}"
+        )
+
     # 数据源三选一校验 (下移到 main() 头部, YAML 加载后执行)
     if args.dataset_name is None and args.train_data_dir is None and args.dataset_root is None:
         raise ValueError("Specify one of `--dataset_name`, `--train_data_dir`, or `--dataset_root`")
@@ -1846,6 +1875,14 @@ def main(args):
             ra_fusion_kernel_size=args.ra_fusion_kernel_size,
             ra_fusion_scale=args.ra_fusion_scale,
             ra_fusion_stabilize=bool(args.ra_fusion_stabilize),
+            ra_degradation_enabled=bool(args.ra_degradation_enabled),
+            ra_degradation_hidden_dim=args.ra_degradation_hidden_dim,
+            ra_degradation_global_dim=args.ra_degradation_global_dim,
+            ra_degradation_num_classes=len(WEATHER_CLASS_IDS),
+            ra_spatial_enabled=bool(args.ra_spatial_enabled),
+            ra_deformable_enabled=bool(args.ra_deformable_enabled),
+            ra_deformable_kernel_size=args.ra_deformable_kernel_size,
+            ra_deformable_max_offset=args.ra_deformable_max_offset,
             low_cpu_mem_usage=False,
         )
     transformer = transformer_cls.from_pretrained(
@@ -2002,6 +2039,9 @@ def main(args):
             f"[RA Fusion] blocks={list(transformer.ra_fusion_indices)}, "
             f"hidden_dim={args.ra_fusion_hidden_dim}, "
             f"scale={transformer.ra_fusion_scale}, stabilize={bool(args.ra_fusion_stabilize)}, "
+            f"degradation_aware={bool(args.ra_degradation_enabled)}, "
+            f"spatial={bool(args.ra_spatial_enabled)}, "
+            f"deformable={bool(args.ra_deformable_enabled)}, "
             f"可训练参数={sum(p.numel() for p in ra_fusion_layers):,}"
         )
 
@@ -2709,6 +2749,29 @@ def main(args):
                 loss = loss_mse
                 raise_if_nonfinite("flow MSE loss", loss_mse, global_step + 1)
 
+                loss_weather = torch.tensor(0.0, device=model_pred.device)
+                weather_accuracy = torch.tensor(0.0, device=model_pred.device)
+                if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
+                    weather_names = batch.get("weather")
+                    if weather_names is None:
+                        raise ValueError(
+                            "Weather labels are required when ra_weather_loss_weight > 0"
+                        )
+                    weather_labels = torch.tensor(
+                        [WEATHER_CLASS_IDS[name] for name in weather_names],
+                        device=model_pred.device,
+                        dtype=torch.long,
+                    )
+                    weather_logits = ra_diagnostics_model.get_last_ra_weather_logits()
+                    if weather_logits is None:
+                        raise RuntimeError("Degradation-aware RA did not produce weather logits")
+                    loss_weather = F.cross_entropy(weather_logits.float(), weather_labels)
+                    weather_accuracy = (
+                        weather_logits.detach().argmax(dim=-1) == weather_labels
+                    ).float().mean()
+                    loss = loss + args.ra_weather_loss_weight * loss_weather
+                    raise_if_nonfinite("RA weather classification loss", loss_weather, global_step + 1)
+
                 # ============================================================
                 # RGB 图像域重建损失 (Charbonnier + Edge + LPIPS)
                 #   - 仅在 timestep 噪声较低时贡献梯度 (time-varying weight = 1-sigma)
@@ -2919,6 +2982,9 @@ def main(args):
                 logs[f"{group.get('name', 'group')}_lr"] = group_lr
             # 拆解各项, 便于 tensorboard 对照
             logs["loss_mse"] = loss_mse.detach().item()
+            if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
+                logs["ra/loss_weather"] = loss_weather.detach().item()
+                logs["ra/weather_accuracy"] = weather_accuracy.detach().item()
             if args.latent_l1_weight > 0.0:
                 logs["loss_latent_l1"] = loss_l1.detach().item()
             if ra_diagnostics is not None:

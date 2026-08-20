@@ -12,7 +12,7 @@ import random
 import shutil
 import sys
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dpo.dataset import PreferencePairDataset, collate_preference_pairs
+from dpo.ema import ModelEMA
 from dpo.losses import diffusion_dpo_loss, flow_matching_gt_losses
 from dpo.provenance import checkpoint_checksum
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
@@ -114,6 +115,14 @@ def load_ra_transformer(config: dict, dtype: torch.dtype, train_ra_fusion: bool)
         ra_fusion_kernel_size=ra_config["ra_fusion_kernel_size"],
         ra_fusion_scale=float(config.get("ra_fusion_scale", ra_config.get("ra_fusion_scale", 1.0))),
         ra_fusion_stabilize=bool(ra_config.get("ra_fusion_stabilize", False)),
+        ra_degradation_enabled=bool(ra_config.get("ra_degradation_enabled", False)),
+        ra_degradation_hidden_dim=int(ra_config.get("ra_degradation_hidden_dim", 64)),
+        ra_degradation_global_dim=int(ra_config.get("ra_degradation_global_dim", 128)),
+        ra_degradation_num_classes=int(ra_config.get("ra_degradation_num_classes", 3)),
+        ra_spatial_enabled=bool(ra_config.get("ra_spatial_enabled", False)),
+        ra_deformable_enabled=bool(ra_config.get("ra_deformable_enabled", False)),
+        ra_deformable_kernel_size=int(ra_config.get("ra_deformable_kernel_size", 3)),
+        ra_deformable_max_offset=float(ra_config.get("ra_deformable_max_offset", 1.0)),
     )
     transformer.load_ra_fusion(ra_path)
     transformer.set_ra_fusion_scale(float(config.get("ra_fusion_scale", transformer.ra_fusion_scale)))
@@ -211,6 +220,7 @@ def checkpoint_is_complete(
     path: Path,
     train_controlnet: bool,
     train_ra_fusion: bool,
+    use_ema: bool,
     process_index: int,
 ) -> bool:
     required = [
@@ -223,6 +233,8 @@ def checkpoint_is_complete(
         required.append(path / "controlnet" / "config.json")
     if train_ra_fusion:
         required.append(path / "ra_fusion" / "ra_fusion.safetensors")
+    if use_ema:
+        required.append(path / "ema_state.pt")
     if not all(item.is_file() for item in required):
         return False
     try:
@@ -265,6 +277,7 @@ def resolve_resume_checkpoint(
     resume_from_checkpoint,
     train_controlnet: bool,
     train_ra_fusion: bool,
+    use_ema: bool,
     process_index: int,
 ) -> Path | None:
     if resume_from_checkpoint in (None, "", False):
@@ -274,7 +287,7 @@ def resolve_resume_checkpoint(
             (step, path)
             for step, path in checkpoint_directories(output_dir)
             if checkpoint_is_complete(
-                path, train_controlnet, train_ra_fusion, process_index
+                path, train_controlnet, train_ra_fusion, use_ema, process_index
             )
         ]
         if not resumable:
@@ -289,7 +302,7 @@ def resolve_resume_checkpoint(
     if not path.is_dir():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
     if not checkpoint_is_complete(
-        path, train_controlnet, train_ra_fusion, process_index
+        path, train_controlnet, train_ra_fusion, use_ema, process_index
     ):
         raise FileNotFoundError(
             f"Checkpoint is missing complete model/optimizer/scheduler/RNG state: {path}. "
@@ -310,7 +323,7 @@ def write_resume_metadata(
     dataset_length: int,
 ) -> None:
     metadata = {
-        "version": 1,
+        "version": 2,
         "global_step": global_step,
         "epoch": epoch,
         "next_batch_index": next_batch_index,
@@ -340,6 +353,15 @@ def write_resume_metadata(
         "lr_scheduler": str(train_config.get("lr_scheduler", "constant_with_warmup")),
         "lr_warmup_steps": int(train_config.get("lr_warmup_steps", 50)),
     }
+    metadata.update({
+        "use_ema": bool(train_config.get("use_ema", False)),
+        "ema_decay": float(train_config.get("ema_decay", 0.9999)),
+        "ema_update_after_step": int(train_config.get("ema_update_after_step", 0)),
+        "ema_update_interval": int(train_config.get("ema_update_interval", 1)),
+        "ema_use_warmup": bool(train_config.get("ema_use_warmup", True)),
+        "ema_inv_gamma": float(train_config.get("ema_inv_gamma", 1.0)),
+        "ema_power": float(train_config.get("ema_power", 0.75)),
+    })
     temporary = checkpoint_dir / "dpo_resume.json.tmp"
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
@@ -383,10 +405,24 @@ def validate_resume_metadata(
         "lr_scheduler": str(train_config.get("lr_scheduler", "constant_with_warmup")),
         "lr_warmup_steps": int(train_config.get("lr_warmup_steps", 50)),
     }
+    use_ema = bool(train_config.get("use_ema", False))
+    expected["use_ema"] = use_ema
+    if use_ema:
+        expected.update({
+            "ema_decay": float(train_config.get("ema_decay", 0.9999)),
+            "ema_update_after_step": int(train_config.get("ema_update_after_step", 0)),
+            "ema_update_interval": int(train_config.get("ema_update_interval", 1)),
+            "ema_use_warmup": bool(train_config.get("ema_use_warmup", True)),
+            "ema_inv_gamma": float(train_config.get("ema_inv_gamma", 1.0)),
+            "ema_power": float(train_config.get("ema_power", 0.75)),
+        })
     mismatches = {
-        key: {"checkpoint": metadata.get(key), "current": value}
+        key: {
+            "checkpoint": metadata.get(key, False) if key == "use_ema" else metadata.get(key),
+            "current": value,
+        }
         for key, value in expected.items()
-        if metadata.get(key) != value
+        if (metadata.get(key, False) if key == "use_ema" else metadata.get(key)) != value
     }
     if mismatches:
         raise ValueError(f"Resume configuration mismatch: {mismatches}")
@@ -443,6 +479,7 @@ def run_checkpoint_validation(
     scheduler,
     device,
     weight_dtype,
+    weights_name: str = "raw",
 ) -> dict:
     if not validation_records:
         raise ValueError("Checkpoint validation is enabled but no validation images were found")
@@ -559,7 +596,12 @@ def run_checkpoint_validation(
         metric: sum(row[metric] for row in per_image_rows) / len(per_image_rows)
         for metric in ("psnr", "ssim", "lpips")
     })
-    result = {"step": step, "per_weather": per_weather, "overall": overall}
+    result = {
+        "step": step,
+        "weights": weights_name,
+        "per_weather": per_weather,
+        "overall": overall,
+    }
     with (checkpoint_dir / "validation_metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, ensure_ascii=False)
     with (checkpoint_dir / "validation_per_image.csv").open(
@@ -579,6 +621,8 @@ def main() -> None:
     train_config = dict(config["training"])
     train_controlnet = bool(train_config.get("train_controlnet", False))
     train_ra_fusion = bool(train_config.get("train_ra_fusion", True))
+    use_ema = bool(train_config.get("use_ema", False))
+    validation_use_ema = bool(train_config.get("validation_use_ema", use_ema))
     gt_flow_weight = float(train_config.get("gt_flow_weight", 0.0))
     gt_x0_l1_weight = float(train_config.get("gt_x0_l1_weight", 0.0))
     if gt_flow_weight < 0.0 or gt_x0_l1_weight < 0.0:
@@ -586,6 +630,8 @@ def main() -> None:
     gt_supervision_enabled = gt_flow_weight > 0.0 or gt_x0_l1_weight > 0.0
     if not train_controlnet and not train_ra_fusion:
         raise ValueError("At least one of training.train_controlnet/train_ra_fusion must be true")
+    if validation_use_ema and not use_ema:
+        raise ValueError("training.validation_use_ema requires training.use_ema=true")
     if cli.max_train_steps is not None:
         train_config["max_train_steps"] = cli.max_train_steps
     if cli.output_dir is not None:
@@ -736,6 +782,50 @@ def main() -> None:
     raw_controlnet = accelerator.unwrap_model(controlnet, keep_torch_compile=False)
     raw_transformer = accelerator.unwrap_model(transformer, keep_torch_compile=False)
 
+    def ema_named_parameters() -> list[tuple[str, torch.nn.Parameter]]:
+        parameters = []
+        if train_controlnet:
+            parameters.extend(
+                (f"controlnet.{name}", parameter)
+                for name, parameter in raw_controlnet.named_parameters()
+                if parameter.requires_grad
+            )
+        if train_ra_fusion:
+            parameters.extend(
+                (f"ra_fusion.{name}", parameter)
+                for name, parameter in raw_transformer.named_parameters()
+                if name.startswith("ra_") and parameter.requires_grad
+            )
+        return parameters
+
+    ema = None
+    if use_ema:
+        ema_device_config = str(train_config.get("ema_device", "cpu"))
+        ema_device = device if ema_device_config.lower() in {"accelerator", "device"} else ema_device_config
+        ema = ModelEMA(
+            ema_named_parameters(),
+            decay=float(train_config.get("ema_decay", 0.9999)),
+            update_after_step=int(train_config.get("ema_update_after_step", 0)),
+            update_interval=int(train_config.get("ema_update_interval", 1)),
+            use_warmup=bool(train_config.get("ema_use_warmup", True)),
+            inv_gamma=float(train_config.get("ema_inv_gamma", 1.0)),
+            power=float(train_config.get("ema_power", 0.75)),
+            device=ema_device,
+            dtype=torch.float32,
+        )
+        if accelerator.is_main_process:
+            print(
+                f"[EMA] parameters={len(ema.parameter_names)}, device={ema.device}, "
+                f"decay={ema.decay}, warmup={ema.use_warmup}, "
+                f"interval={ema.update_interval}"
+            )
+
+    def save_policy_components(directory: Path) -> None:
+        if train_controlnet:
+            raw_controlnet.save_pretrained(directory / "controlnet")
+        if train_ra_fusion:
+            raw_transformer.save_ra_fusion(directory / "ra_fusion")
+
     def save_state_model_hook(models, weights, save_dir):
         if accelerator.is_main_process:
             save_dir = Path(save_dir)
@@ -743,6 +833,8 @@ def main() -> None:
                 raw_controlnet.save_pretrained(save_dir / "controlnet")
             if train_ra_fusion:
                 raw_transformer.save_ra_fusion(save_dir / "ra_fusion")
+            if ema is not None:
+                ema.save(save_dir / "ema_state.pt")
         weights.clear()
 
     def load_state_model_hook(models, load_dir):
@@ -754,6 +846,8 @@ def main() -> None:
         if train_ra_fusion:
             raw_transformer.load_ra_fusion(load_dir / "ra_fusion")
             raw_transformer.set_ra_fusion_scale(float(model_config.get("ra_fusion_scale", 1.0)))
+        if ema is not None:
+            ema.load(load_dir / "ema_state.pt")
         models.clear()
 
     accelerator.register_save_state_pre_hook(save_state_model_hook)
@@ -764,6 +858,7 @@ def main() -> None:
         train_config.get("resume_from_checkpoint"),
         train_controlnet,
         train_ra_fusion,
+        use_ema,
         accelerator.process_index,
     )
     initial_global_step = 0
@@ -853,6 +948,11 @@ def main() -> None:
         # Restore RNG only after all model/text/validation initialization so the
         # first resumed training sample matches an uninterrupted run.
         accelerator.load_state(str(resume_path))
+        if ema is not None and ema.optimization_step != initial_global_step:
+            raise ValueError(
+                "EMA/global step mismatch after resume: "
+                f"ema={ema.optimization_step}, global_step={initial_global_step}"
+            )
         print(
             f"[resume] loaded {resume_path}, global_step={initial_global_step}, "
             f"epoch={resume_epoch}, skip_batches={resume_batches}"
@@ -863,6 +963,40 @@ def main() -> None:
             torch.stack([prompt_cache[prompt][0] for prompt in prompts]).to(device, dtype=weight_dtype),
             torch.stack([prompt_cache[prompt][1] for prompt in prompts]).to(device, dtype=weight_dtype),
         )
+
+    def validate_current_policy(checkpoint_dir: Path, step: int, weights_name: str) -> dict:
+        with preserve_rng_state():
+            result = run_checkpoint_validation(
+                checkpoint_dir=checkpoint_dir,
+                step=step,
+                validation_config=validation_config,
+                validation_records=validation_records,
+                prompt_cache=prompt_cache,
+                controlnet=raw_controlnet,
+                transformer=raw_transformer,
+                vae=vae,
+                scheduler=scheduler,
+                device=device,
+                weight_dtype=weight_dtype,
+                weights_name=weights_name,
+            )
+        validation_logs = {
+            "validation/overall_psnr": result["overall"]["psnr"],
+            "validation/overall_ssim": result["overall"]["ssim"],
+            "validation/overall_lpips": result["overall"]["lpips"],
+        }
+        for weather, metrics in result["per_weather"].items():
+            for metric in ("psnr", "ssim", "lpips"):
+                validation_logs[f"validation/{weather}_{metric}"] = metrics[metric]
+        if train_config.get("report_to"):
+            accelerator.log(validation_logs, step=step)
+        print(
+            f"[validation][weights={weights_name}][step={step}] "
+            f"PSNR={result['overall']['psnr']:.4f} "
+            f"SSIM={result['overall']['ssim']:.4f} "
+            f"LPIPS={result['overall']['lpips']:.4f}"
+        )
+        return result
 
     scheduler_timesteps = scheduler.timesteps.to(device)
     scheduler_sigmas = scheduler.sigmas.to(device)
@@ -1068,6 +1202,9 @@ def main() -> None:
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable, float(train_config.get("max_grad_norm", 1.0)))
                 optimizer.step()
+                ema_updated = False
+                if accelerator.sync_gradients and ema is not None:
+                    ema_updated = ema.step(ema_named_parameters())
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
@@ -1080,6 +1217,10 @@ def main() -> None:
                     for index, group in enumerate(optimizer.param_groups)
                 }
                 logs.update(loss=float(loss.detach()), **group_lrs)
+                if ema is not None:
+                    logs["ema/decay"] = float(ema.cur_decay_value)
+                    logs["ema/updates"] = float(ema.num_updates)
+                    logs["ema/updated"] = float(ema_updated)
                 progress.set_postfix(
                     loss=f"{logs['loss']:.4f}",
                     gt=f"{logs['loss_gt_weighted']:.4f}",
@@ -1107,37 +1248,15 @@ def main() -> None:
                             accelerator.num_processes,
                             len(dataset),
                         )
-                        if validation_enabled:
-                            with preserve_rng_state():
-                                validation_result = run_checkpoint_validation(
-                                    checkpoint_dir=checkpoint_dir,
-                                    step=global_step,
-                                    validation_config=validation_config,
-                                    validation_records=validation_records,
-                                    prompt_cache=prompt_cache,
-                                    controlnet=raw_controlnet,
-                                    transformer=raw_transformer,
-                                    vae=vae,
-                                    scheduler=scheduler,
-                                    device=device,
-                                    weight_dtype=weight_dtype,
-                                )
-                            validation_logs = {
-                                "validation/overall_psnr": validation_result["overall"]["psnr"],
-                                "validation/overall_ssim": validation_result["overall"]["ssim"],
-                                "validation/overall_lpips": validation_result["overall"]["lpips"],
-                            }
-                            for weather, metrics in validation_result["per_weather"].items():
-                                for metric in ("psnr", "ssim", "lpips"):
-                                    validation_logs[f"validation/{weather}_{metric}"] = metrics[metric]
-                            if train_config.get("report_to"):
-                                accelerator.log(validation_logs, step=global_step)
-                            print(
-                                f"[validation][step={global_step}] "
-                                f"PSNR={validation_result['overall']['psnr']:.4f} "
-                                f"SSIM={validation_result['overall']['ssim']:.4f} "
-                                f"LPIPS={validation_result['overall']['lpips']:.4f}"
-                            )
+                        if ema is not None:
+                            with ema.average_parameters(ema_named_parameters()):
+                                save_policy_components(checkpoint_dir / "ema")
+                                if validation_enabled and validation_use_ema:
+                                    validate_current_policy(
+                                        checkpoint_dir, global_step, "ema"
+                                    )
+                        if validation_enabled and not validation_use_ema:
+                            validate_current_policy(checkpoint_dir, global_step, "raw")
                         prune_checkpoints(
                             output_dir,
                             int(train_config.get("checkpoints_total_limit", 3)),
@@ -1151,37 +1270,36 @@ def main() -> None:
 
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        if train_controlnet:
-            raw_controlnet.save_pretrained(output_dir / "controlnet")
-        if train_ra_fusion:
-            raw_transformer.save_ra_fusion(output_dir / "ra_fusion")
-        if validation_enabled:
-            checkpointing_steps = int(train_config.get("checkpointing_steps", 250))
-            latest_checkpoint = output_dir / f"checkpoint-{global_step}"
-            latest_metrics = latest_checkpoint / "validation_metrics.json"
-            latest_per_image = latest_checkpoint / "validation_per_image.csv"
-            if (
-                checkpointing_steps > 0
-                and global_step % checkpointing_steps == 0
-                and latest_metrics.is_file()
-            ):
-                shutil.copy2(latest_metrics, output_dir / "validation_metrics.json")
-                shutil.copy2(latest_per_image, output_dir / "validation_per_image.csv")
-            else:
-                with preserve_rng_state():
-                    run_checkpoint_validation(
-                        checkpoint_dir=output_dir,
-                        step=global_step,
-                        validation_config=validation_config,
-                        validation_records=validation_records,
-                        prompt_cache=prompt_cache,
-                        controlnet=raw_controlnet,
-                        transformer=raw_transformer,
-                        vae=vae,
-                        scheduler=scheduler,
-                        device=device,
-                        weight_dtype=weight_dtype,
-                    )
+        final_weights_name = "ema" if ema is not None else "raw"
+        if ema is not None:
+            ema.save(output_dir / "ema_state.pt")
+        final_context = (
+            ema.average_parameters(ema_named_parameters())
+            if ema is not None
+            else nullcontext()
+        )
+        with final_context:
+            save_policy_components(output_dir)
+            if validation_enabled:
+                checkpointing_steps = int(train_config.get("checkpointing_steps", 250))
+                latest_checkpoint = output_dir / f"checkpoint-{global_step}"
+                latest_metrics = latest_checkpoint / "validation_metrics.json"
+                latest_per_image = latest_checkpoint / "validation_per_image.csv"
+                can_copy_latest = False
+                if (
+                    checkpointing_steps > 0
+                    and global_step % checkpointing_steps == 0
+                    and latest_metrics.is_file()
+                    and latest_per_image.is_file()
+                ):
+                    with latest_metrics.open("r", encoding="utf-8") as handle:
+                        latest_result = json.load(handle)
+                    can_copy_latest = latest_result.get("weights", "raw") == final_weights_name
+                if can_copy_latest:
+                    shutil.copy2(latest_metrics, output_dir / "validation_metrics.json")
+                    shutil.copy2(latest_per_image, output_dir / "validation_per_image.csv")
+                else:
+                    validate_current_policy(output_dir, global_step, final_weights_name)
         with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
             json.dump({
                 "global_step": global_step,
@@ -1192,6 +1310,15 @@ def main() -> None:
                 "gt_x0_l1_weight": gt_x0_l1_weight,
                 "train_controlnet": train_controlnet,
                 "train_ra_fusion": train_ra_fusion,
+                "use_ema": use_ema,
+                "final_weights": final_weights_name,
+                "validation_use_ema": validation_use_ema,
+                "ema_decay": ema.decay if ema is not None else None,
+                "ema_use_warmup": ema.use_warmup if ema is not None else None,
+                "ema_update_interval": ema.update_interval if ema is not None else None,
+                "ema_optimization_step": ema.optimization_step if ema is not None else 0,
+                "ema_num_updates": ema.num_updates if ema is not None else 0,
+                "ema_final_decay": ema.cur_decay_value if ema is not None else None,
                 "controlnet_trainable_parameters": sum(
                     parameter.numel() for parameter in controlnet_trainable
                 ),
