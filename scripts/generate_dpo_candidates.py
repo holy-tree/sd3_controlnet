@@ -58,6 +58,7 @@ def main() -> None:
         "dataset_rain": "--dataset_rain",
         "dataset_snow": "--dataset_snow",
         "dataset_haze": "--dataset_haze",
+        "selection_manifest": "--selection_manifest",
         "rain_max_samples": "--rain_max_samples",
         "snow_max_samples": "--snow_max_samples",
         "haze_max_samples": "--haze_max_samples",

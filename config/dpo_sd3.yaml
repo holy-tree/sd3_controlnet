@@ -15,18 +15,20 @@ candidate_generation:
   eval_config: "./config/eval_sd3.yaml"
   # Offline preference data is built explicitly from the complete training sets.
   # Expected layout: <path>/train/{GT,LQ}/.
-  dataset_rain: "/root/autodl-tmp/datasets/rain"
-  dataset_snow: "/root/autodl-tmp/datasets/snow"
-  dataset_haze: "/root/autodl-tmp/datasets/haze"
+  dataset_rain: "/root/autodl-tmp/datasets2/train/rain"
+  dataset_snow: "/root/autodl-tmp/datasets2/train/snow"
+  dataset_haze: "/root/autodl-tmp/datasets2/train/haze"
+  # Created by scripts/select_dpo_sources.py. When set, these curated pairs
+  # replace directory scanning while the per-weather limits below still apply.
+  selection_manifest: "/root/autodl-tmp/datasets2/manifests/dpo_source_selection.json"
   splits: ["train"]
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
-  # Generate exactly eight candidates for every source image.
+  # Generate exactly six candidates for every source image.
   num_candidates_per_image: 6
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
-  # Input scan limits. With sample_mode=head, take the first N images in
-  # deterministic path order after merging each weather's train subdatasets.
-  sample_mode: "head"
+  # Input limits are sampled from the curated manifest with a fixed seed.
+  sample_mode: "random"
   rain_max_samples: 2000
   snow_max_samples: 1500
   haze_max_samples: 1000

@@ -100,12 +100,55 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_rain", default=None)
     parser.add_argument("--dataset_snow", default=None)
     parser.add_argument("--dataset_haze", default=None)
+    parser.add_argument(
+        "--selection_manifest",
+        default=None,
+        help="JSON/JSONL source-pair manifest; when set, dataset scanning is skipped",
+    )
     parser.add_argument("--splits", nargs="+", default=None)
     parser.add_argument("--rain_psnr_gap", type=float, default=0.2)
     parser.add_argument("--snow_psnr_gap", type=float, default=0.62)
     parser.add_argument("--haze_psnr_gap", type=float, default=2.5)
     parser.add_argument("--max_saved_groups_per_weather", type=int, default=7000)
     return parser.parse_args()
+
+
+def load_selection_manifest(manifest_path: str | Path) -> List[Dict]:
+    path = Path(manifest_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"DPO source selection manifest not found: {path}")
+    with path.open("r", encoding="utf-8") as handle:
+        if path.suffix.lower() == ".jsonl":
+            rows = [json.loads(line) for line in handle if line.strip()]
+        else:
+            payload = json.load(handle)
+            rows = payload.get("samples", []) if isinstance(payload, dict) else payload
+    if not rows:
+        raise ValueError(f"DPO source selection manifest is empty: {path}")
+
+    records = []
+    for index, row in enumerate(rows):
+        try:
+            weather = str(row["weather"]).lower()
+            if weather not in ("rain", "snow", "haze"):
+                raise ValueError(f"unsupported weather {weather!r}")
+            resolved_paths = {}
+            for key in ("gt_path", "lq_path"):
+                image_path = Path(row[key]).expanduser()
+                if not image_path.is_absolute():
+                    image_path = (path.parent / image_path).resolve()
+                if not image_path.is_file():
+                    raise FileNotFoundError(image_path)
+                resolved_paths[key] = str(image_path)
+        except (KeyError, TypeError, ValueError, FileNotFoundError) as error:
+            raise ValueError(f"Invalid source selection row {index}: {error}") from error
+        records.append({
+            **resolved_paths,
+            "weather": weather,
+            "subdataset": str(row.get("subdataset") or row.get("source") or weather),
+            "pair_id": str(row.get("pair_id", Path(resolved_paths["lq_path"]).stem)),
+        })
+    return records
 
 
 def setup_pipeline(args_config: dict, dtype, device, ra_scale, use_ra_fusion: bool):
@@ -409,6 +452,7 @@ def main() -> None:
         "dataset_rain",
         "dataset_snow",
         "dataset_haze",
+        "selection_manifest",
     ):
         value = getattr(args, key)
         if value is not None:
@@ -489,17 +533,30 @@ def main() -> None:
     ).lower()
     sample_seed = int(args_config.get("seed", 20240805))
 
-    raw_samples = build_dataset_for_eval(args_config)
-    if not raw_samples:
-        raise SystemExit("No validation samples found; check dataset paths")
+    selection_manifest = args_config.get("selection_manifest")
+    if selection_manifest:
+        all_sample_records = load_selection_manifest(selection_manifest)
+        print(
+            f"[random] loaded {len(all_sample_records)} source pairs from "
+            f"{Path(selection_manifest).expanduser()}"
+        )
+    else:
+        raw_samples = build_dataset_for_eval(args_config)
+        if not raw_samples:
+            raise SystemExit("No validation samples found; check dataset paths")
+        all_sample_records = [
+            {
+                "gt_path": str(Path(gt_path).expanduser().resolve()),
+                "lq_path": str(Path(lq_path).expanduser().resolve()),
+                "weather": weather,
+                "subdataset": subdataset,
+                "pair_id": Path(lq_path).stem,
+            }
+            for gt_path, lq_path, weather, subdataset in raw_samples
+        ]
     all_sample_records = [
-        {
-            "gt_path": str(Path(gt_path).expanduser().resolve()),
-            "lq_path": str(Path(lq_path).expanduser().resolve()),
-            "weather": weather,
-            "subdataset": subdataset,
-        }
-        for index, (gt_path, lq_path, weather, subdataset) in enumerate(raw_samples)
+        {**record, "global_index": index}
+        for index, record in enumerate(all_sample_records)
     ]
     pipeline = setup_pipeline(
         args_config, dtype, device, ra_fusion_scale, use_ra_fusion
