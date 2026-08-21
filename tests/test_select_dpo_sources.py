@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from scripts.select_dpo_sources import (
     add_quality_scores,
@@ -71,6 +71,8 @@ class DpoSourceDiscoveryTest(unittest.TestCase):
         self.assertTrue(result["valid"])
         self.assertEqual(len(result["gt_fingerprint"]), 64)
         self.assertIn("lq_gt_ssim", result["metrics"])
+        self.assertIn("gt_high_frequency_energy", result["metrics"])
+        self.assertIn("gt_local_contrast", result["metrics"])
         self.assertGreater(result["metrics"]["lq_gt_psnr"], 0)
 
     def test_candidate_generator_loads_selection_json(self):
@@ -94,6 +96,35 @@ class DpoSourceDiscoveryTest(unittest.TestCase):
         self.assertEqual(records[0]["subdataset"], "RainTrainH")
         self.assertTrue(Path(records[0]["gt_path"]).is_absolute())
 
+    def test_detail_metrics_rank_sharp_texture_above_blurred_texture(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            checkerboard = ((np.indices((128, 128)).sum(axis=0) // 4) % 2 * 255).astype(np.uint8)
+            sharp_image = Image.fromarray(np.repeat(checkerboard[..., None], 3, axis=2))
+            sharp_image.save(root / "sharp.png")
+            sharp_image.filter(ImageFilter.GaussianBlur(radius=3)).save(root / "blurred.png")
+
+            def analyze(name: str) -> dict:
+                path = root / f"{name}.png"
+                return analyze_pair(({
+                    "pair_id": name,
+                    "weather": "rain",
+                    "source": "source",
+                    "gt_path": str(path),
+                    "lq_path": str(path),
+                }, 128, 32))
+
+            sharp = analyze("sharp")
+            blurred = analyze("blurred")
+
+        self.assertGreater(
+            sharp["metrics"]["gt_sharpness"], blurred["metrics"]["gt_sharpness"]
+        )
+        self.assertGreater(
+            sharp["metrics"]["gt_high_frequency_energy"],
+            blurred["metrics"]["gt_high_frequency_energy"],
+        )
+
 
 class DpoSourceSelectionTest(unittest.TestCase):
     def test_selects_exact_balanced_weather_counts(self):
@@ -107,6 +138,10 @@ class DpoSourceSelectionTest(unittest.TestCase):
                     "gt_fingerprint": f"{weather}-gt-{index}",
                     "metrics": {
                         "gt_sharpness": 10.0 + index,
+                        "gt_tenengrad": 20.0 + index,
+                        "gt_high_frequency_energy": 2.0 + index / 10,
+                        "gt_local_contrast": 3.0 + index / 10,
+                        "gt_edge_density": 0.1 + index / 100,
                         "gt_entropy": 4.0 + index / 10,
                         "gt_dynamic_range": 100.0 + index,
                         "gt_clipped_fraction": index / 100,
@@ -134,6 +169,7 @@ class DpoSourceSelectionTest(unittest.TestCase):
                 {row["degradation_level"] for row in weather_rows},
                 {"strong", "medium", "light"},
             )
+            self.assertTrue(all(row["detail_percentile"] >= 0.25 for row in weather_rows))
 
 
 if __name__ == "__main__":

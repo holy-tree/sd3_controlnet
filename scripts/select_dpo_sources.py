@@ -22,18 +22,9 @@ from PIL import Image
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 WEATHERS = ("rain", "snow", "haze")
 DEFAULT_GT_CAPS = {"rain": 4, "snow": 1, "haze": 4}
-DEFAULT_SOURCE_QUOTAS = {
-    "rain": {
-        "RainTrainH": 1254,
-        "RainTrainL": 200,
-        "Rain12600": 4546,
-        "SPAPlus": 4000,
-    },
-    "haze": {
-        "RESIDE-Indoor-Train": 5000,
-        "RESIDE-Outdoor-Train": 5000,
-    },
-}
+# Quality is the primary selection objective. Source counts are reported, but
+# no source is guaranteed a quota that could force low-detail images back in.
+DEFAULT_SOURCE_QUOTAS: dict[str, dict[str, int]] = {}
 
 
 def image_map(directory: Path) -> dict[str, Path]:
@@ -167,6 +158,28 @@ def _gradient_correlation(first: np.ndarray, second: np.ndarray) -> float:
     return float(np.clip(np.dot(first_edges, second_edges) / denominator, -1.0, 1.0))
 
 
+def _detail_metrics(gray: np.ndarray) -> dict[str, float]:
+    gray_float = gray.astype(np.float32)
+    x_gradient = cv2.Sobel(gray_float, cv2.CV_32F, 1, 0, ksize=3)
+    y_gradient = cv2.Sobel(gray_float, cv2.CV_32F, 0, 1, ksize=3)
+    gradient_energy = x_gradient**2 + y_gradient**2
+    low_frequency = cv2.GaussianBlur(gray_float, (0, 0), 1.2)
+    local_mean = cv2.GaussianBlur(gray_float, (0, 0), 3.0)
+    local_second_moment = cv2.GaussianBlur(gray_float**2, (0, 0), 3.0)
+    local_variance = np.maximum(local_second_moment - local_mean**2, 0.0)
+    median = float(np.median(gray))
+    lower = int(max(0.0, 0.66 * median))
+    upper = int(min(255.0, max(lower + 1, 1.33 * median)))
+    edges = cv2.Canny(gray, lower, upper)
+    return {
+        "gt_sharpness": float(np.var(cv2.Laplacian(gray_float, cv2.CV_32F))),
+        "gt_tenengrad": float(np.mean(gradient_energy)),
+        "gt_high_frequency_energy": float(np.mean(np.abs(gray_float - low_frequency))),
+        "gt_local_contrast": float(np.mean(np.sqrt(local_variance))),
+        "gt_edge_density": float(np.mean(edges > 0)),
+    }
+
+
 def analyze_pair(task: tuple[dict, int, int]) -> dict:
     record, max_edge, min_side = task
     try:
@@ -208,7 +221,7 @@ def analyze_pair(task: tuple[dict, int, int]) -> dict:
     metrics = {
         "width": gt_size[0],
         "height": gt_size[1],
-        "gt_sharpness": float(np.var(cv2.Laplacian(gt_gray, cv2.CV_32F))),
+        **_detail_metrics(gt_gray),
         "gt_entropy": _entropy(gt_gray),
         "gt_dynamic_range": float(np.percentile(gt_gray, 99) - np.percentile(gt_gray, 1)),
         "gt_clipped_fraction": float(np.mean((gt_gray <= 2) | (gt_gray >= 253))),
@@ -245,6 +258,12 @@ def add_quality_scores(records: list[dict]) -> None:
             continue
         rankings = {
             "sharpness": _percentile_map(weather_records, "gt_sharpness"),
+            "tenengrad": _percentile_map(weather_records, "gt_tenengrad"),
+            "high_frequency": _percentile_map(
+                weather_records, "gt_high_frequency_energy"
+            ),
+            "local_contrast": _percentile_map(weather_records, "gt_local_contrast"),
+            "edge_density": _percentile_map(weather_records, "gt_edge_density"),
             "entropy": _percentile_map(weather_records, "gt_entropy"),
             "dynamic": _percentile_map(weather_records, "gt_dynamic_range"),
             "clipping": _percentile_map(weather_records, "gt_clipped_fraction", False),
@@ -256,12 +275,19 @@ def add_quality_scores(records: list[dict]) -> None:
         }
         for row in weather_records:
             key = row["pair_id"]
-            gt_quality = (
+            detail_score = (
                 0.35 * rankings["sharpness"][key]
-                + 0.25 * rankings["entropy"][key]
-                + 0.20 * rankings["dynamic"][key]
-                + 0.10 * rankings["clipping"][key]
-                + 0.10 * rankings["border"][key]
+                + 0.25 * rankings["tenengrad"][key]
+                + 0.20 * rankings["high_frequency"][key]
+                + 0.10 * rankings["local_contrast"][key]
+                + 0.10 * rankings["edge_density"][key]
+            )
+            visual_quality = (
+                0.75 * detail_score
+                + 0.10 * rankings["entropy"][key]
+                + 0.07 * rankings["dynamic"][key]
+                + 0.04 * rankings["clipping"][key]
+                + 0.04 * rankings["border"][key]
             )
             alignment = (
                 0.40 * rankings["ssim"][key]
@@ -269,9 +295,19 @@ def add_quality_scores(records: list[dict]) -> None:
                 + 0.20 * rankings["shift"][key]
                 + 0.10 * rankings["phase"][key]
             )
-            row["gt_quality_score"] = gt_quality
+            row["detail_score"] = detail_score
+            row["visual_quality_score"] = visual_quality
+            row["gt_quality_score"] = visual_quality
             row["alignment_score"] = alignment
-            row["selection_score"] = 0.55 * gt_quality + 0.45 * alignment
+            row["selection_score"] = 0.80 * visual_quality + 0.20 * alignment
+
+        detail_values = sorted(row["detail_score"] for row in weather_records)
+        denominator = max(len(detail_values) - 1, 1)
+        for row in weather_records:
+            value = row["detail_score"]
+            row["detail_percentile"] = (
+                bisect_left(detail_values, value) + bisect_right(detail_values, value) - 1
+            ) / 2 / denominator
 
     grouped: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for row in records:
@@ -335,16 +371,21 @@ def select_records(
     target_per_weather: int,
     gt_caps: Mapping[str, int] | None = None,
     source_quotas: Mapping[str, Mapping[str, int]] | None = None,
+    min_detail_percentile: float = 0.25,
 ) -> list[dict]:
     gt_caps = dict(DEFAULT_GT_CAPS if gt_caps is None else gt_caps)
     source_quotas = DEFAULT_SOURCE_QUOTAS if source_quotas is None else source_quotas
     selected = []
     for weather in WEATHERS:
-        weather_records = [row for row in records if row["weather"] == weather]
+        all_weather_records = [row for row in records if row["weather"] == weather]
+        weather_records = [
+            row for row in all_weather_records
+            if row["detail_percentile"] >= min_detail_percentile
+        ]
         if len(weather_records) < target_per_weather:
             raise ValueError(
-                f"{weather} has only {len(weather_records)} valid pairs, fewer than target "
-                f"{target_per_weather}"
+                f"{weather} has only {len(weather_records)} detail-qualified pairs, fewer "
+                f"than target {target_per_weather}; lower --min-detail-percentile"
             )
         selected_ids: set[str] = set()
         gt_counts: Counter = Counter()
@@ -398,6 +439,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-per-weather", type=int, default=10000)
     parser.add_argument("--min-side", type=int, default=256)
     parser.add_argument("--metric-max-edge", type=int, default=512)
+    parser.add_argument(
+        "--min-detail-percentile",
+        type=float,
+        default=0.25,
+        help="Reject the lowest detail-score fraction within each weather before selection",
+    )
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--seed", type=int, default=20240805)
     return parser.parse_args()
@@ -407,6 +454,8 @@ def main() -> None:
     args = parse_args()
     if args.target_per_weather <= 0 or args.min_side <= 0 or args.metric_max_edge <= 0:
         raise ValueError("Selection counts and image sizes must be positive")
+    if not 0.0 <= args.min_detail_percentile < 1.0:
+        raise ValueError("--min-detail-percentile must be in [0, 1)")
     dataset_root = args.dataset_root.expanduser().resolve()
     output_path = (
         args.output.expanduser().resolve()
@@ -435,7 +484,11 @@ def main() -> None:
     valid = [row for row in analyzed if row["valid"]]
     rejected = [row for row in analyzed if not row["valid"]]
     add_quality_scores(valid)
-    selected = select_records(valid, args.target_per_weather)
+    selected = select_records(
+        valid,
+        args.target_per_weather,
+        min_detail_percentile=args.min_detail_percentile,
+    )
     random.Random(args.seed).shuffle(selected)
     samples = []
     for row in selected:
@@ -448,6 +501,9 @@ def main() -> None:
             "lq_path": row["lq_path"],
             "gt_fingerprint": row["gt_fingerprint"],
             "degradation_level": row["degradation_level"],
+            "detail_score": round(row["detail_score"], 8),
+            "detail_percentile": round(row["detail_percentile"], 8),
+            "visual_quality_score": round(row["visual_quality_score"], 8),
             "gt_quality_score": round(row["gt_quality_score"], 8),
             "alignment_score": round(row["alignment_score"], 8),
             "selection_score": round(row["selection_score"], 8),
@@ -477,13 +533,22 @@ def main() -> None:
         "selection_policy": {
             "minimum_side": args.min_side,
             "metric_max_edge": args.metric_max_edge,
+            "minimum_detail_percentile": args.min_detail_percentile,
             "default_gt_caps": DEFAULT_GT_CAPS,
-            "default_source_quotas_at_10000": DEFAULT_SOURCE_QUOTAS,
+            "source_quotas": DEFAULT_SOURCE_QUOTAS,
             "degradation_strata": ["strong", "medium", "light"],
         },
         "summary": {
             "discovered_pairs": dict(Counter(row["weather"] for row in records)),
             "valid_pairs": dict(Counter(row["weather"] for row in valid)),
+            "detail_qualified_pairs": {
+                weather: sum(
+                    row["weather"] == weather
+                    and row["detail_percentile"] >= args.min_detail_percentile
+                    for row in valid
+                )
+                for weather in WEATHERS
+            },
             "selected_pairs": dict(selected_counts),
             "effective_gt_caps": effective_gt_caps,
             "maximum_selected_lq_per_gt": actual_gt_repeats,
