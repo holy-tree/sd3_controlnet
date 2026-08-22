@@ -52,13 +52,13 @@ haze_num: null
 # ==================== 文本 prompt (天气感知) ====================
 # 是否启用天气 prompt (与源 train.yaml 一致)
 use_prompt: false
-prompt_ratio: 0.2
+prompt_ratio: 1.0
 
 # 自定义天气 prompt (YAML 直接写 dict, 比 CLI 字符串更清晰)
 weather_prompts:
-  rain: "rainy scene, rain streaks on the image, wet surfaces, overcast sky"
-  snow: "snowy scene, snowflakes covering the image, cold atmosphere, white noise"
-  haze: "hazy scene, foggy atmosphere, low visibility, grayish tone"
+  rain: "a clean, sharp, rain-free natural photograph with fine details"
+  snow: "a clean, sharp, snow-free natural photograph with fine details"
+  haze: "a clear, sharp, haze-free natural photograph with natural colors and fine details"
 
 # proportion_empty_prompts 在 --dataset_root 模式下会被强制设为 0 (天气 prompt 已在 dataset 解析)
 proportion_empty_prompts: 0

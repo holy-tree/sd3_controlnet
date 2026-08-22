@@ -343,7 +343,10 @@ def maybe_make_prompt(weather: str, args_config: dict) -> str:
     """根据 use_prompt / prompt_ratio 决定 prompt (与源 evaluate.py 一致)."""
     if not args_config.get("use_prompt", False):
         return ""
-    if random.random() < args_config.get("prompt_ratio", 0.2):
+    prompt_ratio = float(args_config.get("prompt_ratio", 0.2))
+    if prompt_ratio >= 1.0:
+        return DEFAULT_WEATHER_PROMPTS.get(weather, "")
+    if random.random() < prompt_ratio:
         return DEFAULT_WEATHER_PROMPTS.get(weather, "")
     return ""
 

@@ -595,10 +595,15 @@ def main() -> None:
     candidates_root.mkdir(parents=True, exist_ok=True)
 
     random.seed(args.seed)
-    prompts = {
-        weather: maybe_make_prompt(weather, args_config)
-        for weather in sorted({row["weather"] for row in sample_records})
-    }
+    use_prompt = bool(args_config.get("use_prompt", False))
+    weather_prompt_overrides = args_config.get("weather_prompts") or {}
+    prompts = {}
+    for weather in sorted({row["weather"] for row in sample_records}):
+        override = weather_prompt_overrides.get(weather)
+        if use_prompt and override:
+            prompts[weather] = override
+        else:
+            prompts[weather] = maybe_make_prompt(weather, args_config)
     if args.verify_reproducibility:
         test_records = [sample_records[0]]
         test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)

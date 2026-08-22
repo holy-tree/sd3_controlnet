@@ -5,9 +5,9 @@
 
 # Reused by filtering when weather prompts are enabled.
 weather_prompts:
-  rain: "rainy scene, rain streaks on the image, wet surfaces, overcast sky"
-  snow: "snowy scene, snowflakes covering the image, cold atmosphere, white noise"
-  haze: "hazy scene, foggy atmosphere, low visibility, grayish tone"
+  rain: "a clean, sharp, rain-free natural photograph with fine details"
+  snow: "a clean, sharp, snow-free natural photograph with fine details"
+  haze: "a clear, sharp, haze-free natural photograph with natural colors and fine details"
 
 # ==================== 1. Offline candidate generation ====================
 candidate_generation:
