@@ -95,7 +95,10 @@ def _pick_top_records(records: List[dict], samples_per_weather: int) -> List[dic
             print(f"[cfg-sweep] warning: no records for weather={weather}")
             continue
         selected.extend(weather_records[:samples_per_weather])
-    return selected
+    return [
+        {**record, "global_index": index}
+        for index, record in enumerate(selected)
+    ]
 
 
 def _prepare_batch(record: dict, resolution: int, device: torch.device):
