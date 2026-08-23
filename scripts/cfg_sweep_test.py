@@ -59,7 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/root/autodl-tmp/sd3/experiment/cfg_sweep"),
+        default=Path("/root/autodl-tmp/sd3/experiment/eval_sd3/cfg_sweep"),
+        help="Hard-coded default writes into eval output_dir/cfg_sweep",
     )
     parser.add_argument("--use-prompt", action="store_true")
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=None)
