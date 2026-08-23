@@ -56,6 +56,13 @@ def parse_args() -> argparse.Namespace:
         default="/root/autodl-tmp/sd3/experiment/randomness_results",
     )
     parser.add_argument("--num_candidates_per_image", type=int, default=8)
+    parser.add_argument(
+        "--candidate_guidance_scales",
+        type=float,
+        nargs="+",
+        default=None,
+        help="One guidance scale per candidate; candidates are run sequentially",
+    )
     parser.add_argument("--seed", type=int, default=20240805)
     parser.add_argument(
         "--verify_reproducibility",
@@ -177,6 +184,26 @@ def candidate_seed(base_seed: int, candidate_index: int, sample_index: int) -> i
     """Derive a stable seed independent of batch size and processing order."""
     payload = f"{base_seed}:{candidate_index}:{sample_index}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "little") % (2 ** 63 - 1)
+
+
+def resolve_candidate_guidance_scales(
+    values: Sequence[float] | None,
+    num_candidates: int,
+    default_guidance_scale: float,
+) -> List[float]:
+    scales = (
+        [float(default_guidance_scale)] * num_candidates
+        if values is None
+        else [float(value) for value in values]
+    )
+    if len(scales) != num_candidates:
+        raise ValueError(
+            "candidate_guidance_scales must contain one value per candidate: "
+            f"expected {num_candidates}, got {len(scales)}"
+        )
+    if any(value < 0.0 for value in scales):
+        raise ValueError("candidate_guidance_scales must be non-negative")
+    return scales
 
 
 def make_candidate_noise(
@@ -439,6 +466,39 @@ def run_with_initial_noise(
     ])
 
 
+def run_candidate_group_with_guidance(
+    pipeline,
+    args_config: dict,
+    device,
+    dtype,
+    lq_pil: Image.Image,
+    prompt: str,
+    initial_noise: torch.Tensor,
+    guidance_scales: Sequence[float],
+    strength: float,
+    num_inference_steps: int,
+    use_ra_fusion: bool,
+) -> torch.Tensor:
+    predictions = []
+    for candidate_index, guidance_scale in enumerate(guidance_scales):
+        candidate_config = dict(args_config)
+        candidate_config["guidance_scale"] = float(guidance_scale)
+        prediction = run_with_initial_noise(
+            pipeline,
+            candidate_config,
+            device,
+            dtype,
+            [lq_pil],
+            prompt,
+            initial_noise[candidate_index : candidate_index + 1],
+            strength,
+            num_inference_steps,
+            use_ra_fusion,
+        )
+        predictions.append(prediction[0])
+    return torch.stack(predictions)
+
+
 def main() -> None:
     args = parse_args()
     args_config = load_config(args.config)
@@ -466,6 +526,11 @@ def main() -> None:
 
     if args.num_candidates_per_image < 2:
         raise ValueError("Candidate generation requires num_candidates_per_image >= 2")
+    candidate_guidance_scales = resolve_candidate_guidance_scales(
+        args.candidate_guidance_scales,
+        args.num_candidates_per_image,
+        float(args_config.get("guidance_scale", 1.5)),
+    )
     if args.max_saved_groups_per_weather <= 0:
         raise ValueError("max_saved_groups_per_weather must be positive")
     weather_thresholds = {
@@ -608,13 +673,17 @@ def main() -> None:
         test_records = [sample_records[0]]
         test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)
         test_noise, _ = make_candidate_noise(test_records, 0, latent_shape, args.seed)
+        reproducibility_config = {
+            **args_config,
+            "guidance_scale": candidate_guidance_scales[0],
+        }
         first_output = run_with_initial_noise(
-            pipeline, args_config, device, dtype, test_lq_pils,
+            pipeline, reproducibility_config, device, dtype, test_lq_pils,
             prompts[test_records[0]["weather"]], test_noise, strength,
             num_inference_steps, use_ra_fusion,
         )
         second_output = run_with_initial_noise(
-            pipeline, args_config, device, dtype, test_lq_pils,
+            pipeline, reproducibility_config, device, dtype, test_lq_pils,
             prompts[test_records[0]["weather"]], test_noise, strength,
             num_inference_steps, use_ra_fusion,
         )
@@ -653,7 +722,6 @@ def main() -> None:
             continue
 
         lq_pils, lq_batch, gt_batch = load_image_batch([record], preprocess, device)
-        candidate_lq_pils = lq_pils * args.num_candidates_per_image
         candidate_gt_batch = gt_batch.repeat(args.num_candidates_per_image, 1, 1, 1)
         initial_noise, candidate_seeds = make_candidate_group_noise(
             record,
@@ -661,14 +729,15 @@ def main() -> None:
             latent_shape,
             args.seed,
         )
-        predictions = run_with_initial_noise(
+        predictions = run_candidate_group_with_guidance(
             pipeline,
             args_config,
             device,
             dtype,
-            candidate_lq_pils,
+            lq_pils[0],
             prompts[weather],
             initial_noise,
+            candidate_guidance_scales,
             strength,
             num_inference_steps,
             use_ra_fusion,
@@ -685,6 +754,7 @@ def main() -> None:
         psnr_gap = max(psnrs) - min(psnrs)
         group_record = {
             **record,
+            "candidate_guidance_scales": candidate_guidance_scales,
             "psnr_gap": psnr_gap,
             "psnr_gap_threshold": threshold,
         }
@@ -718,6 +788,7 @@ def main() -> None:
                 "candidate_index": candidate_index,
                 "candidate_seed": candidate_seeds[candidate_index],
                 "noise_index": candidate_index,
+                "guidance_scale": candidate_guidance_scales[candidate_index],
                 "psnr": psnrs[candidate_index],
                 "ssim": ssims[candidate_index],
                 "lpips": lpips_values[candidate_index],
@@ -740,7 +811,9 @@ def main() -> None:
             "best_worst_psnr_gap": psnr_gap,
             "best_worst_lpips_gap": max(lpips_values) - min(lpips_values),
             "best_psnr_noise_index": best_psnr_index,
+            "best_psnr_guidance_scale": candidate_guidance_scales[best_psnr_index],
             "best_lpips_noise_index": best_lpips_index,
+            "best_lpips_guidance_scale": candidate_guidance_scales[best_lpips_index],
         })
         progress.set_postfix(
             weather=weather,
@@ -777,6 +850,7 @@ def main() -> None:
             dataset_per_noise_rows.append({
                 "scope": scope,
                 "noise_index": noise_index,
+                "guidance_scale": candidate_guidance_scales[noise_index],
                 "n_images": len(scoped_rows),
                 "psnr": finite_stats([row["psnr"] for row in scoped_rows])["mean"],
                 "ssim": finite_stats([row["ssim"] for row in scoped_rows])["mean"],
@@ -819,6 +893,7 @@ def main() -> None:
         "candidate_seed": args.seed,
         "candidate_seed_strategy": "sha256(base_seed:candidate_index:global_index)",
         "num_candidates_per_image": args.num_candidates_per_image,
+        "candidate_guidance_scales": candidate_guidance_scales,
         "latent_shape": list(latent_shape),
         "n_generated_images": len(sample_records),
         "n_retained_images": len(retained_records),
@@ -849,8 +924,10 @@ def main() -> None:
         "base_model": args_config.get("pretrained_model_name_or_path"),
         "resolution": resolution,
         "dtype": str(dtype),
-        "pipeline_batch_size": args.num_candidates_per_image,
+        "pipeline_batch_size": 1,
+        "candidate_execution": "sequential_per_guidance_scale",
         "controlnet_vae_conditioning": "posterior_mode",
+        "candidate_guidance_scales": candidate_guidance_scales,
         "reward_available": True,
         "reward_metrics": ["psnr", "ssim", "lpips"],
         "groups_per_weather": {
@@ -899,6 +976,8 @@ def main() -> None:
         "ra_fusion_scale": ra_fusion_scale,
         "load_transformer_lora": bool(args_config.get("load_transformer_lora", False)),
         "controlnet_vae_conditioning": "posterior_mode",
+        "candidate_guidance_scales": candidate_guidance_scales,
+        "candidate_noise_strategy": "independent_seed_per_candidate",
     }
     with (output_root / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(

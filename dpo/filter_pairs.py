@@ -122,6 +122,8 @@ def build_preference_pairs(
                 "rejected_path": rejected["candidate_path"],
                 "chosen_noise_index": int(chosen["noise_index"]),
                 "rejected_noise_index": int(rejected["noise_index"]),
+                "chosen_guidance_scale": float(chosen.get("guidance_scale", 1.0)),
+                "rejected_guidance_scale": float(rejected.get("guidance_scale", 1.0)),
                 "chosen_reward": float(chosen["_reward"]),
                 "rejected_reward": float(rejected["_reward"]),
                 "reward_gap": float(reward_gap),

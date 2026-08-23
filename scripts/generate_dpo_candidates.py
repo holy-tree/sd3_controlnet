@@ -46,9 +46,12 @@ def main() -> None:
         "--ra_fusion_path",
         str(model["ra_fusion_path"]),
         "--controlnet_conditioning_scale",
-        str(model.get("controlnet_conditioning_scale", 1.0)),
+        str(generation.get(
+            "controlnet_conditioning_scale",
+            model.get("controlnet_conditioning_scale", 1.0),
+        )),
         "--ra_fusion_scale",
-        str(model.get("ra_fusion_scale", 1.0)),
+        str(generation.get("ra_fusion_scale", model.get("ra_fusion_scale", 1.0))),
         "--no-load_transformer_lora",
     ]
     optional = {
@@ -72,6 +75,10 @@ def main() -> None:
     if splits:
         command.append("--splits")
         command.extend(str(split) for split in splits)
+    guidance_scales = generation.get("candidate_guidance_scales")
+    if guidance_scales:
+        command.append("--candidate_guidance_scales")
+        command.extend(str(value) for value in guidance_scales)
     for key in ("revision", "variant"):
         if model.get(key) is not None:
             command.extend([f"--{key}", str(model[key])])

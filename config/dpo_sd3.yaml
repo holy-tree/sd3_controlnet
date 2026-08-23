@@ -25,27 +25,28 @@ candidate_generation:
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
   # Generate exactly six candidates for every source image.
   num_candidates_per_image: 6
+  # Each candidate uses a different CFG and independently seeded initial noise.
+  candidate_guidance_scales: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
   # Input limits are sampled from the curated manifest with a fixed seed.
   sample_mode: "random"
   rain_max_samples: 2000
-  snow_max_samples: 1500
-  haze_max_samples: 1000
-  # Keep a group only when max(candidate PSNR) - min(candidate PSNR) reaches
-  # its weather threshold. Values are in dB.
+  snow_max_samples: 2000
+  haze_max_samples: 2000
+  # Save all generated groups here; preference_filter applies quality gaps later.
   weather_psnr_gap_thresholds:
-    rain: 0.1
-    snow: 0.4
-    haze: 2
+    rain: 0.0
+    snow: 0.0
+    haze: 0.0
   # Applied independently to rain, snow, and haze after gap filtering.
-  max_saved_groups_per_weather: 4000
+  max_saved_groups_per_weather: 2000
   num_inference_steps: 30
   strength: 1.0
   controlnet_conditioning_scale: 1.0
   use_ra_fusion: true
   ra_fusion_scale: 0.1
-  use_prompt: false
+  use_prompt: true
   # null uses paths in eval_config; set them here for one-off overrides.
   controlnet_model_path: null
   ra_fusion_path: null
@@ -84,9 +85,9 @@ reward:
 # ==================== 4. DPO model ====================
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
-  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/controlnet"
+  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Prompt_Joint-5000"
   # Reference model is the immutable initial snapshot loaded from this path.
-  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/ra_fusion"
+  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Prompt_Joint-5000/ra_fusion"
   ra_fusion_scale: 0.1
   controlnet_conditioning_scale: 1.0
   revision: null

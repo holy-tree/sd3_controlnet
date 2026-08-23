@@ -27,9 +27,9 @@ output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3"
 # ==================== 数据集配置 ====================
 # 各天气类型的 test 集根目录 (相互独立)
 # 与源 config/eval.yaml 完全相同的 key 命名, 直接可平迁
-dataset_rain: "/root/autodl-tmp/datasets/rain"
-dataset_snow: "/root/autodl-tmp/datasets/snow"
-dataset_haze: "/root/autodl-tmp/datasets/haze"
+dataset_rain: "/root/autodl-tmp/datasets2/test/rain"
+dataset_snow: "/root/autodl-tmp/datasets2/test/snow"
+dataset_haze: "/root/autodl-tmp/datasets2/test/haze"
 # 也支持 dataset_root + weather 子目录的方式:
 # dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
 # 待评估的天气类型
@@ -64,15 +64,19 @@ rss_weight: 0.01
 rss_threshold: 0.8
 
 # 推理时使用的 prompt (留空则全部使用空 prompt)
-use_prompt: false
-prompt_ratio: 0.2
+use_prompt: true
+prompt_ratio: 1.0
+weather_prompts:
+  rain: "a clean, sharp, rain-free natural photograph with fine details"
+  snow: "a clean, sharp, snow-free natural photograph with fine details"
+  haze: "a clear, sharp, haze-free natural photograph with natural colors and fine details"
 
 # ==================== 评估参数 ====================
 # === 评估采样数 (用于计算指标, 默认 0 = 使用全部 test 集) ===
 # 与源 config/eval.yaml 同语义:
 #   0  或负数: 不限制, 跑完整 test 集 (默认, 指标统计更准确)
 #   正数:      仅跑前 N 张 (用于快速调试)
-max_samples_per_weather: 20
+max_samples_per_weather: 200
 # 截断模式 (与 max_samples_per_weather 配合)
 #   head   : 取前 N 张, 可复现 (默认, 推荐)
 #   random : 随机抽 N 张, 可复现 (若 yaml 设 seed)

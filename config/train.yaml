@@ -27,7 +27,7 @@ revision: null
 variant: null
 
 # ==================== 输出与缓存 ====================
-output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint"
+output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Prompt_Joint-5000"
 cache_dir: null
 
 # 接续训练 (从 checkpoint 恢复 optimizer / scheduler / global_step):
@@ -38,7 +38,7 @@ resume_from_checkpoint:  null
 
 # ==================== 数据集 (源项目布局, 与 --dataset_root 配合) ====================
 # 数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/
-dataset_root: "/root/autodl-tmp/datasets"
+dataset_root: "/root/autodl-tmp/datasets2/train"
 
 # 参与训练的天气类型与划分
 weather_types: ["rain", "snow", "haze"]
@@ -51,7 +51,7 @@ haze_num: null
 
 # ==================== 文本 prompt (天气感知) ====================
 # 是否启用天气 prompt (与源 train.yaml 一致)
-use_prompt: false
+use_prompt: true
 prompt_ratio: 1.0
 
 # 自定义天气 prompt (YAML 直接写 dict, 比 CLI 字符串更清晰)
@@ -74,7 +74,7 @@ dataloader_num_workers: 0
 
 # ==================== 训练步数 ====================
 num_train_epochs: 1
-max_train_steps: 20000
+max_train_steps: 5000
 checkpointing_steps: 1000
 # 最多保存几个 checkpoint (旧的会被自动删除以节省磁盘)
 checkpoints_total_limit: 3
@@ -126,8 +126,8 @@ lora_target_modules: ["to_q", "to_k", "to_v", "to_out.0"]
 lora_learning_rate: 1.0e-6
 
 # ==================== RA-inspired ControlNet Fusion ====================
-# 第一阶段加载已有 ControlNet 并冻结，只训练零初始化 RA Fusion。
-train_controlnet: 0
+# 从已有 Joint-5000 warm-start，联合对齐 ControlNet、RA 和目标域 prompt。
+train_controlnet: 1
 use_ra_fusion: 1
 ra_fusion_interval: 4
 ra_fusion_hidden_dim: 256
