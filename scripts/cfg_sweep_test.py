@@ -1,4 +1,4 @@
-"""Sweep guidance_scale values and measure per-image PSNR/SSIM spread."""
+"""Generate one candidate per CFG value and measure cross-CFG PSNR/SSIM spread."""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--cfg-values",
         type=float,
         nargs="+",
-        default=[1.0, 1.5, 2.0, 3.0, 4.0],
+        default=[1.0, 1.5, 2.0, 2.5, 3.0, 4.0],
     )
     parser.add_argument(
         "--samples-per-weather",
@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
         help="Defaults to use_prompt from --config",
     )
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=None)
+    parser.add_argument(
+        "--same-noise-across-cfg",
+        action="store_true",
+        help="Reuse one initial noise to isolate CFG; default uses different noise per candidate",
+    )
     parser.add_argument("--no-ra-fusion", action="store_true")
     return parser.parse_args()
 
@@ -112,8 +117,8 @@ def _prepare_batch(record: dict, preprocess, device: torch.device):
     return lq_pil, gt_tensor.unsqueeze(0).to(device)
 
 
-def _expand_candidate_batch(lq_pil: Image.Image, gt_batch: torch.Tensor, count: int):
-    return [lq_pil] * count, gt_batch.repeat(count, 1, 1, 1)
+def _candidate_noise_indices(count: int, same_noise_across_cfg: bool) -> List[int]:
+    return [0] * count if same_noise_across_cfg else list(range(count))
 
 
 def _finite(values: List[float]) -> Dict[str, float]:
@@ -137,6 +142,11 @@ def main() -> None:
         raise ValueError("--samples-per-weather must be positive")
     if not args.cfg_values or any(value < 0.0 for value in args.cfg_values):
         raise ValueError("--cfg-values must contain non-negative values")
+    if len(args.cfg_values) != args.num_candidates:
+        raise ValueError(
+            "--cfg-values must contain exactly --num-candidates values; "
+            f"got {len(args.cfg_values)} CFG values for {args.num_candidates} candidates"
+        )
     args_config = load_config(args.config)
     use_prompt = (
         bool(args_config.get("use_prompt", False))
@@ -191,9 +201,6 @@ def main() -> None:
 
     for record in sample_records:
         lq_pil, gt_batch = _prepare_batch(record, preprocess, device)
-        candidate_lq_pils, candidate_gt_batch = _expand_candidate_batch(
-            lq_pil, gt_batch, args.num_candidates
-        )
         noise, seeds = make_candidate_group_noise(
             record, args.num_candidates, latent_shape, args.seed
         )
@@ -201,64 +208,77 @@ def main() -> None:
         sample_dir.mkdir(parents=True, exist_ok=True)
         lq_pil.save(sample_dir / "lq.png")
         tensor_to_pil(gt_batch[0]).save(sample_dir / "gt.png")
-        for cfg in args.cfg_values:
+        candidate_dir = sample_dir / "mixed_cfg"
+        candidate_dir.mkdir(parents=True, exist_ok=True)
+        psnrs = []
+        ssims = []
+        noise_indices = _candidate_noise_indices(
+            args.num_candidates, args.same_noise_across_cfg
+        )
+        for candidate_index, (cfg, noise_index) in enumerate(
+            zip(args.cfg_values, noise_indices)
+        ):
             args_config["guidance_scale"] = float(cfg)
             predictions = run_with_initial_noise(
                 pipeline,
                 args_config,
                 device,
                 dtype,
-                candidate_lq_pils,
+                [lq_pil],
                 prompts.get(record["weather"], ""),
-                noise,
+                noise[noise_index : noise_index + 1],
                 strength,
                 num_inference_steps,
                 use_ra_fusion,
             )
-            psnrs = [float(value) for value in psnr_batch(predictions, candidate_gt_batch)]
-            ssims = [float(value) for value in ssim_batch(predictions, candidate_gt_batch)]
-            psnr_stats = _finite(psnrs)
-            ssim_stats = _finite(ssims)
-            summary_rows.append({
+            psnr = float(psnr_batch(predictions, gt_batch)[0])
+            ssim = float(ssim_batch(predictions, gt_batch)[0])
+            psnrs.append(psnr)
+            ssims.append(ssim)
+            tensor_to_pil(predictions[0]).save(
+                candidate_dir / f"candidate_{candidate_index:02d}_cfg_{cfg:g}.png"
+            )
+            detail_rows.append({
                 "weather": record["weather"],
                 "pair_id": record["pair_id"],
+                "candidate_index": candidate_index,
                 "cfg": float(cfg),
-                "num_candidates": args.num_candidates,
-                "psnr_mean": psnr_stats["mean"],
-                "psnr_std": psnr_stats["std"],
-                "psnr_min": psnr_stats["min"],
-                "psnr_max": psnr_stats["max"],
-                "psnr_gap": psnr_stats["max"] - psnr_stats["min"],
-                "ssim_mean": ssim_stats["mean"],
-                "ssim_std": ssim_stats["std"],
-                "ssim_min": ssim_stats["min"],
-                "ssim_max": ssim_stats["max"],
-                "ssim_gap": ssim_stats["max"] - ssim_stats["min"],
-                "seed": int(seeds[0]),
+                "noise_index": noise_index,
+                "seed": int(seeds[noise_index]),
+                "psnr": psnr,
+                "ssim": ssim,
             })
-            cfg_dir = sample_dir / f"cfg_{cfg:g}".replace(".", "p")
-            cfg_dir.mkdir(parents=True, exist_ok=True)
-            for candidate_index, (prediction, psnr, ssim) in enumerate(
-                zip(predictions, psnrs, ssims)
-            ):
-                tensor_to_pil(prediction).save(
-                    cfg_dir / f"candidate_{candidate_index:02d}.png"
-                )
-                detail_rows.append({
-                    "weather": record["weather"],
-                    "pair_id": record["pair_id"],
-                    "cfg": float(cfg),
-                    "candidate_index": candidate_index,
-                    "seed": int(seeds[candidate_index]),
-                    "psnr": psnr,
-                    "ssim": ssim,
-                })
             print(
-                f"[cfg-sweep] {record['weather']}/{record['pair_id']} cfg={cfg:.2f} "
-                f"psnr={psnr_stats['mean']:.2f}±{psnr_stats['std']:.2f} "
-                f"ssim={ssim_stats['mean']:.4f}±{ssim_stats['std']:.4f} "
-                f"psnr_gap={psnr_stats['max'] - psnr_stats['min']:.3f}"
+                f"[cfg-sweep] {record['weather']}/{record['pair_id']} "
+                f"candidate={candidate_index} cfg={cfg:.2f} "
+                f"psnr={psnr:.2f} ssim={ssim:.4f}"
             )
+        psnr_stats = _finite(psnrs)
+        ssim_stats = _finite(ssims)
+        summary_rows.append({
+            "weather": record["weather"],
+            "pair_id": record["pair_id"],
+            "num_candidates": args.num_candidates,
+            "cfg_values": ",".join(f"{value:g}" for value in args.cfg_values),
+            "same_noise_across_cfg": args.same_noise_across_cfg,
+            "psnr_mean": psnr_stats["mean"],
+            "psnr_std": psnr_stats["std"],
+            "psnr_min": psnr_stats["min"],
+            "psnr_max": psnr_stats["max"],
+            "psnr_gap": psnr_stats["max"] - psnr_stats["min"],
+            "ssim_mean": ssim_stats["mean"],
+            "ssim_std": ssim_stats["std"],
+            "ssim_min": ssim_stats["min"],
+            "ssim_max": ssim_stats["max"],
+            "ssim_gap": ssim_stats["max"] - ssim_stats["min"],
+        })
+        print(
+            f"[cfg-sweep:summary] {record['weather']}/{record['pair_id']} "
+            f"psnr={psnr_stats['mean']:.2f}±{psnr_stats['std']:.2f} "
+            f"psnr_gap={psnr_stats['max'] - psnr_stats['min']:.3f} "
+            f"ssim={ssim_stats['mean']:.4f}±{ssim_stats['std']:.4f} "
+            f"ssim_gap={ssim_stats['max'] - ssim_stats['min']:.4f}"
+        )
 
     with (output_dir / "cfg_sweep_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
@@ -268,6 +288,7 @@ def main() -> None:
                 "num_candidates": args.num_candidates,
                 "samples_per_weather": args.samples_per_weather,
                 "cfg_values": list(args.cfg_values),
+                "same_noise_across_cfg": args.same_noise_across_cfg,
                 "use_prompt": use_prompt,
                 "use_ra_fusion": use_ra_fusion,
                 "summary": summary_rows,
