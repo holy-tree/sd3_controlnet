@@ -1,4 +1,4 @@
-"""Sweep guidance_scale values and measure per-image PSNR/SSIM/LPIPS spread."""
+"""Sweep guidance_scale values and measure per-image PSNR/SSIM spread."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Dict, List
 
 import numpy as np
 import torch
-import yaml
 from PIL import Image
 from torchvision import transforms
 
@@ -19,19 +18,19 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.evaluate_sd3 import (  # noqa: E402
-    _get_lpips_model,
     build_dataset_for_eval,
     build_pipeline,
     load_config,
-    lpips_batch,
+    maybe_make_prompt,
     psnr_batch,
     ssim_batch,
 )
 from utils.randomness_check import (  # noqa: E402
-    candidate_seed,
+    infer_latent_shape,
     load_selection_manifest,
     make_candidate_group_noise,
     run_with_initial_noise,
+    tensor_to_pil,
 )
 
 
@@ -62,7 +61,12 @@ def parse_args() -> argparse.Namespace:
         default=Path("/root/autodl-tmp/sd3/experiment/eval_sd3/cfg_sweep"),
         help="Hard-coded default writes into eval output_dir/cfg_sweep",
     )
-    parser.add_argument("--use-prompt", action="store_true")
+    parser.add_argument(
+        "--use-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Defaults to use_prompt from --config",
+    )
     parser.add_argument("--controlnet-conditioning-scale", type=float, default=None)
     parser.add_argument("--no-ra-fusion", action="store_true")
     return parser.parse_args()
@@ -101,20 +105,15 @@ def _pick_top_records(records: List[dict], samples_per_weather: int) -> List[dic
     ]
 
 
-def _prepare_batch(record: dict, resolution: int, device: torch.device):
-    preprocess = transforms.Compose([
-        transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(resolution),
-        transforms.ToTensor(),
-    ])
+def _prepare_batch(record: dict, preprocess, device: torch.device):
     lq_tensor = preprocess(Image.open(record["lq_path"]).convert("RGB"))
     gt_tensor = preprocess(Image.open(record["gt_path"]).convert("RGB"))
     lq_pil = transforms.ToPILImage()(lq_tensor)
-    return (
-        lq_pil,
-        lq_tensor.unsqueeze(0).to(device),
-        gt_tensor.unsqueeze(0).to(device),
-    )
+    return lq_pil, gt_tensor.unsqueeze(0).to(device)
+
+
+def _expand_candidate_batch(lq_pil: Image.Image, gt_batch: torch.Tensor, count: int):
+    return [lq_pil] * count, gt_batch.repeat(count, 1, 1, 1)
 
 
 def _finite(values: List[float]) -> Dict[str, float]:
@@ -132,13 +131,24 @@ def _finite(values: List[float]) -> Dict[str, float]:
 
 def main() -> None:
     args = parse_args()
+    if args.num_candidates < 2:
+        raise ValueError("--num-candidates must be at least 2")
+    if args.samples_per_weather <= 0:
+        raise ValueError("--samples-per-weather must be positive")
+    if not args.cfg_values or any(value < 0.0 for value in args.cfg_values):
+        raise ValueError("--cfg-values must contain non-negative values")
     args_config = load_config(args.config)
-    if args.use_prompt:
-        args_config["use_prompt"] = True
+    use_prompt = (
+        bool(args_config.get("use_prompt", False))
+        if args.use_prompt is None else args.use_prompt
+    )
+    args_config["use_prompt"] = use_prompt
+    if use_prompt:
         args_config.setdefault("prompt_ratio", 1.0)
     if args.controlnet_conditioning_scale is not None:
         args_config["controlnet_conditioning_scale"] = args.controlnet_conditioning_scale
-    use_ra_fusion = not args.no_ra_fusion
+    use_ra_fusion = bool(args_config.get("use_ra_fusion", False)) and not args.no_ra_fusion
+    args_config["use_ra_fusion"] = use_ra_fusion
 
     records = _resolve_records(args_config, args.selection_manifest)
     sample_records = _pick_top_records(records, args.samples_per_weather)
@@ -159,9 +169,8 @@ def main() -> None:
     resolution = int(args_config.get("resolution", 512))
     strength = float(args_config.get("strength", 1.0))
     num_inference_steps = int(args_config.get("num_inference_steps", 30))
-    weather_prompts = args_config.get("weather_prompts") or {}
     prompts = {
-        weather: weather_prompts.get(weather, "") if args.use_prompt else ""
+        weather: maybe_make_prompt(weather, args_config) if use_prompt else ""
         for weather in WEATHERS
     }
 
@@ -172,14 +181,7 @@ def main() -> None:
     ])
     first_lq = preprocess(Image.open(sample_records[0]["lq_path"]).convert("RGB"))
     first_lq_pil = transforms.ToPILImage()(first_lq)
-    latent = pipeline.vae.encode(
-        pipeline.image_processor.preprocess(
-            [first_lq_pil], height=resolution, width=resolution
-        ).to(device=device, dtype=pipeline.vae.dtype)
-    ).latent_dist.mode()
-    latent_shape = tuple(int(value) for value in latent.shape[1:])
-
-    lpips_model = _get_lpips_model(args_config.get("lpips_net", "alex"), device=device)
+    latent_shape = infer_latent_shape(pipeline, first_lq_pil, resolution, device)
 
     output_dir = args.output_dir.expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -188,10 +190,17 @@ def main() -> None:
     detail_rows: List[Dict] = []
 
     for record in sample_records:
-        lq_pil, _, gt_batch = _prepare_batch(record, resolution, device)
+        lq_pil, gt_batch = _prepare_batch(record, preprocess, device)
+        candidate_lq_pils, candidate_gt_batch = _expand_candidate_batch(
+            lq_pil, gt_batch, args.num_candidates
+        )
         noise, seeds = make_candidate_group_noise(
             record, args.num_candidates, latent_shape, args.seed
         )
+        sample_dir = output_dir / record["weather"] / record["pair_id"]
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        lq_pil.save(sample_dir / "lq.png")
+        tensor_to_pil(gt_batch[0]).save(sample_dir / "gt.png")
         for cfg in args.cfg_values:
             args_config["guidance_scale"] = float(cfg)
             predictions = run_with_initial_noise(
@@ -199,21 +208,17 @@ def main() -> None:
                 args_config,
                 device,
                 dtype,
-                [lq_pil],
+                candidate_lq_pils,
                 prompts.get(record["weather"], ""),
                 noise,
                 strength,
                 num_inference_steps,
                 use_ra_fusion,
             )
-            psnrs = [float(value) for value in psnr_batch(predictions, gt_batch)]
-            ssims = [float(value) for value in ssim_batch(predictions, gt_batch)]
-            lpips_values = [float(value) for value in lpips_batch(
-                lpips_model, predictions, gt_batch, device, dtype
-            )]
+            psnrs = [float(value) for value in psnr_batch(predictions, candidate_gt_batch)]
+            ssims = [float(value) for value in ssim_batch(predictions, candidate_gt_batch)]
             psnr_stats = _finite(psnrs)
             ssim_stats = _finite(ssims)
-            lpips_stats = _finite(lpips_values)
             summary_rows.append({
                 "weather": record["weather"],
                 "pair_id": record["pair_id"],
@@ -229,16 +234,16 @@ def main() -> None:
                 "ssim_min": ssim_stats["min"],
                 "ssim_max": ssim_stats["max"],
                 "ssim_gap": ssim_stats["max"] - ssim_stats["min"],
-                "lpips_mean": lpips_stats["mean"],
-                "lpips_std": lpips_stats["std"],
-                "lpips_min": lpips_stats["min"],
-                "lpips_max": lpips_stats["max"],
-                "lpips_gap": lpips_stats["max"] - lpips_stats["min"],
                 "seed": int(seeds[0]),
             })
-            for candidate_index, (psnr, ssim, lpips_value) in enumerate(
-                zip(psnrs, ssims, lpips_values)
+            cfg_dir = sample_dir / f"cfg_{cfg:g}".replace(".", "p")
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            for candidate_index, (prediction, psnr, ssim) in enumerate(
+                zip(predictions, psnrs, ssims)
             ):
+                tensor_to_pil(prediction).save(
+                    cfg_dir / f"candidate_{candidate_index:02d}.png"
+                )
                 detail_rows.append({
                     "weather": record["weather"],
                     "pair_id": record["pair_id"],
@@ -247,13 +252,11 @@ def main() -> None:
                     "seed": int(seeds[candidate_index]),
                     "psnr": psnr,
                     "ssim": ssim,
-                    "lpips": lpips_value,
                 })
             print(
                 f"[cfg-sweep] {record['weather']}/{record['pair_id']} cfg={cfg:.2f} "
                 f"psnr={psnr_stats['mean']:.2f}±{psnr_stats['std']:.2f} "
                 f"ssim={ssim_stats['mean']:.4f}±{ssim_stats['std']:.4f} "
-                f"lpips={lpips_stats['mean']:.4f}±{lpips_stats['std']:.4f} "
                 f"psnr_gap={psnr_stats['max'] - psnr_stats['min']:.3f}"
             )
 
@@ -265,7 +268,7 @@ def main() -> None:
                 "num_candidates": args.num_candidates,
                 "samples_per_weather": args.samples_per_weather,
                 "cfg_values": list(args.cfg_values),
-                "use_prompt": bool(args.use_prompt),
+                "use_prompt": use_prompt,
                 "use_ra_fusion": use_ra_fusion,
                 "summary": summary_rows,
             },
