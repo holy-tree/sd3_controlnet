@@ -39,6 +39,7 @@ from dpo.dataset import PreferencePairDataset, collate_preference_pairs
 from dpo.ema import ModelEMA
 from dpo.losses import diffusion_dpo_loss, flow_matching_gt_losses
 from dpo.provenance import checkpoint_checksum
+from dpo.validation import summarize_validation_rows, validation_prompt_for_record
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from train_controlnet_sd3 import encode_prompt, import_model_class_from_model_name_or_path
 from transformers import CLIPTokenizer, T5TokenizerFast
@@ -58,6 +59,7 @@ from utils.randomness_check import (
     load_image_batch,
     make_candidate_noise,
     run_with_initial_noise,
+    tensor_to_pil,
 )
 
 
@@ -485,7 +487,7 @@ def run_checkpoint_validation(
         raise ValueError("Checkpoint validation is enabled but no validation images were found")
     if float(validation_config.get("guidance_scale", 1.0)) != 1.0:
         raise ValueError(
-            "Checkpoint validation reuses cached empty-prompt embeddings and requires "
+            "Checkpoint validation reuses cached prompt embeddings and requires "
             "validation_guidance_scale=1.0"
         )
     controlnet_was_training = controlnet.training
@@ -510,9 +512,8 @@ def run_checkpoint_validation(
         validation_config.get("lpips_net", "alex"), device=device
     )
     per_image_rows = []
-    metrics_by_weather: dict[str, dict[str, list[float]]] = defaultdict(
-        lambda: {"psnr": [], "ssim": [], "lpips": []}
-    )
+    save_images = bool(validation_config.get("validation_save_images", True))
+    validation_image_root = checkpoint_dir / "validation" / weights_name
     try:
         first_lq_pils, _, _ = load_image_batch(
             [validation_records[0]], preprocess, device
@@ -537,7 +538,7 @@ def run_checkpoint_validation(
                 latent_shape,
                 int(validation_config.get("validation_seed", 42)),
             )
-            prompt = ""
+            prompt = validation_prompt_for_record(record, validation_config)
             prompt_embeds, pooled_embeds = prompt_cache[prompt]
             prediction = run_with_initial_noise(
                 pipeline,
@@ -558,17 +559,39 @@ def run_checkpoint_validation(
             lpips = float(lpips_batch(
                 lpips_model, prediction, gt_batch, device, weight_dtype
             )[0])
+            prediction_path = ""
+            lq_path = ""
+            gt_path = ""
+            if save_images:
+                image_dir = (
+                    validation_image_root
+                    / record["weather"]
+                    / record["subdataset"]
+                )
+                image_dir.mkdir(parents=True, exist_ok=True)
+                stem = f"{int(record['global_index']):04d}_{Path(record['gt_path']).stem}"
+                prediction_file = image_dir / f"{stem}_pred.png"
+                lq_file = image_dir / f"{stem}_lq.png"
+                gt_file = image_dir / f"{stem}_gt.png"
+                tensor_to_pil(prediction[0]).save(prediction_file)
+                lq_pils[0].save(lq_file)
+                tensor_to_pil(gt_batch[0]).save(gt_file)
+                prediction_path = str(prediction_file)
+                lq_path = str(lq_file)
+                gt_path = str(gt_file)
             row = {
                 "weather": record["weather"],
                 "subdataset": record["subdataset"],
                 "name": Path(record["gt_path"]).stem,
+                "prompt": prompt,
                 "psnr": psnr,
                 "ssim": ssim,
                 "lpips": lpips,
+                "prediction_path": prediction_path,
+                "lq_path": lq_path,
+                "gt_path": gt_path,
             }
             per_image_rows.append(row)
-            for metric in ("psnr", "ssim", "lpips"):
-                metrics_by_weather[record["weather"]][metric].append(row[metric])
             progress.set_postfix(
                 weather=record["weather"],
                 psnr=f"{psnr:.2f}",
@@ -583,19 +606,10 @@ def run_checkpoint_validation(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    per_weather = {}
-    for weather, values in metrics_by_weather.items():
-        per_weather[weather] = {
-            "n": len(values["psnr"]),
-            "psnr": sum(values["psnr"]) / len(values["psnr"]),
-            "ssim": sum(values["ssim"]) / len(values["ssim"]),
-            "lpips": sum(values["lpips"]) / len(values["lpips"]),
-        }
-    overall = {"n": len(per_image_rows)}
-    overall.update({
-        metric: sum(row[metric] for row in per_image_rows) / len(per_image_rows)
-        for metric in ("psnr", "ssim", "lpips")
-    })
+    per_weather, overall = summarize_validation_rows(
+        per_image_rows,
+        validation_config.get("weather_types", ["rain", "snow", "haze"]),
+    )
     result = {
         "step": step,
         "weights": weights_name,
@@ -610,6 +624,16 @@ def run_checkpoint_validation(
         writer = csv.DictWriter(handle, fieldnames=list(per_image_rows[0]))
         writer.writeheader()
         writer.writerows(per_image_rows)
+    weather_rows = [
+        {"scope": weather, **metrics}
+        for weather, metrics in per_weather.items()
+    ] + [{"scope": "overall", **overall}]
+    with (checkpoint_dir / "validation_weather_metrics.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(weather_rows[0]))
+        writer.writeheader()
+        writer.writerows(weather_rows)
     return result
 
 
@@ -910,6 +934,9 @@ def main() -> None:
                 train_config.get("validation_num_inference_steps", 20)
             ),
             "validation_seed": int(train_config.get("validation_seed", seed)),
+            "validation_save_images": bool(
+                train_config.get("validation_save_images", True)
+            ),
             "lpips_net": train_config.get("validation_lpips_net", "alex"),
         })
         validation_records = build_validation_records(validation_config)
@@ -922,6 +949,12 @@ def main() -> None:
     )
     prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     unique_prompts = list(dict.fromkeys(str(row.get("prompt", "")) for row in dataset.records))
+    if validation_enabled:
+        unique_prompts.extend(
+            validation_prompt_for_record(record, validation_config)
+            for record in validation_records
+        )
+        unique_prompts = list(dict.fromkeys(unique_prompts))
     with torch.no_grad():
         for prompt in unique_prompts:
             embeds, pooled = encode_prompt(
@@ -992,10 +1025,16 @@ def main() -> None:
             accelerator.log(validation_logs, step=step)
         print(
             f"[validation][weights={weights_name}][step={step}] "
-            f"PSNR={result['overall']['psnr']:.4f} "
+            f"overall PSNR={result['overall']['psnr']:.4f} "
             f"SSIM={result['overall']['ssim']:.4f} "
             f"LPIPS={result['overall']['lpips']:.4f}"
         )
+        for weather, metrics in result["per_weather"].items():
+            print(
+                f"[validation][weights={weights_name}][step={step}][{weather}] "
+                f"n={metrics['n']} PSNR={metrics['psnr']:.4f} "
+                f"SSIM={metrics['ssim']:.4f} LPIPS={metrics['lpips']:.4f}"
+            )
         return result
 
     scheduler_timesteps = scheduler.timesteps.to(device)
@@ -1285,6 +1324,9 @@ def main() -> None:
                 latest_checkpoint = output_dir / f"checkpoint-{global_step}"
                 latest_metrics = latest_checkpoint / "validation_metrics.json"
                 latest_per_image = latest_checkpoint / "validation_per_image.csv"
+                latest_weather_metrics = (
+                    latest_checkpoint / "validation_weather_metrics.csv"
+                )
                 can_copy_latest = False
                 if (
                     checkpointing_steps > 0
@@ -1298,6 +1340,18 @@ def main() -> None:
                 if can_copy_latest:
                     shutil.copy2(latest_metrics, output_dir / "validation_metrics.json")
                     shutil.copy2(latest_per_image, output_dir / "validation_per_image.csv")
+                    if latest_weather_metrics.is_file():
+                        shutil.copy2(
+                            latest_weather_metrics,
+                            output_dir / "validation_weather_metrics.csv",
+                        )
+                    latest_validation_images = latest_checkpoint / "validation"
+                    if latest_validation_images.is_dir():
+                        shutil.copytree(
+                            latest_validation_images,
+                            output_dir / "validation",
+                            dirs_exist_ok=True,
+                        )
                 else:
                     validate_current_policy(output_dir, global_step, final_weights_name)
         with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
