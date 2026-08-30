@@ -66,7 +66,9 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.training_losses import (
+    build_online_degradation_targets,
     extend_optimizer_state_for_appended_params,
+    load_degradation_statistics,
     select_image_loss_inputs,
     weighted_spatial_smooth_l1,
 )
@@ -886,6 +888,9 @@ def parse_args(input_args=None):
     parser.add_argument("--ra_spatial_loss_weight", type=float, default=0.0)
     parser.add_argument("--ra_aux_smooth_l1_beta", type=float, default=0.1)
     parser.add_argument("--ra_spatial_focus_weight", type=float, default=2.0)
+    parser.add_argument("--ra_spatial_top_fraction", type=float, default=0.1)
+    parser.add_argument("--ra_spatial_mean_weight", type=float, default=0.5)
+    parser.add_argument("--ra_degradation_stats_path", type=str, default=None)
     parser.add_argument("--ra_spatial_enabled", type=int, default=0)
     parser.add_argument("--ra_deformable_enabled", type=int, default=0)
     parser.add_argument("--ra_deformable_kernel_size", type=int, default=3)
@@ -1016,12 +1021,6 @@ def parse_args(input_args=None):
         help="源项目数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/. "
              "与 --dataset_name / --train_data_dir 互斥. 启用后会自动从本地读取 "
              "{weather}/{split}/{GT,LQ} 结构, 并按 weather 注入 weather-aware prompt.",
-    )
-    parser.add_argument(
-        "--ra_targets_manifest",
-        type=str,
-        default=None,
-        help="Offline JSONL with per-pair severity_target and spatial_map_path.",
     )
     parser.add_argument(
         "--weather_types",
@@ -1432,7 +1431,6 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
             resolution=args.resolution,
             weather_num_samples=weather_num_samples,
             defer_transforms=False,           # eager 模式, __getitem__ 返回 tensor
-            degradation_targets_manifest=args.ra_targets_manifest,
         )
 
         # max_train_samples 截断 (用 torch Subset, 不动 dataset 内部)
@@ -1575,20 +1573,6 @@ def collate_fn(examples):
     weather = [example.get("weather") for example in examples]
     if all(value is not None for value in weather):
         batch["weather"] = weather
-    target_flags = [
-        "severity_target" in example and "spatial_map_target" in example
-        for example in examples
-    ]
-    if any(target_flags) and not all(target_flags):
-        raise ValueError("A batch cannot mix samples with and without degradation targets")
-    if all(target_flags):
-        batch["severity_target"] = torch.stack(
-            [example["severity_target"] for example in examples]
-        ).float()
-        batch["spatial_map_target"] = torch.stack(
-            [example["spatial_map_target"] for example in examples]
-        ).float()
-        batch["pair_id"] = [example["pair_id"] for example in examples]
     return batch
 
 
@@ -1786,6 +1770,10 @@ def main(args):
         raise ValueError("ra_aux_smooth_l1_beta must be positive")
     if args.ra_spatial_focus_weight < 0.0:
         raise ValueError("ra_spatial_focus_weight must be non-negative")
+    if not 0.0 < args.ra_spatial_top_fraction <= 1.0:
+        raise ValueError("ra_spatial_top_fraction must be in (0, 1]")
+    if not 0.0 <= args.ra_spatial_mean_weight <= 1.0:
+        raise ValueError("ra_spatial_mean_weight must be in [0, 1]")
     if args.image_loss_batch_size < 0:
         raise ValueError("image_loss_batch_size must be non-negative")
     if args.lpips_interval <= 0:
@@ -1799,16 +1787,32 @@ def main(args):
         raise ValueError("Spatial supervision requires ra_spatial_enabled=1")
     if args.ra_spatial_loss_weight > 0.0 and args.resolution % 16 != 0:
         raise ValueError("Spatial supervision requires resolution divisible by 16")
-    if auxiliary_targets_enabled and not args.ra_targets_manifest:
-        raise ValueError("Severity/spatial supervision requires ra_targets_manifest")
-    if args.ra_targets_manifest and args.dataset_root is None:
-        raise ValueError("ra_targets_manifest currently requires the paired dataset_root path")
+    if auxiliary_targets_enabled and not args.ra_degradation_stats_path:
+        raise ValueError("Severity/spatial supervision requires ra_degradation_stats_path")
+    if args.ra_degradation_stats_path and args.dataset_root is None:
+        raise ValueError("Online degradation supervision currently requires dataset_root")
     unknown_weather = sorted(set(args.weather_types) - set(WEATHER_CLASS_IDS))
     if args.ra_degradation_enabled and unknown_weather:
         raise ValueError(
             f"Degradation-aware RA only supports {sorted(WEATHER_CLASS_IDS)}; "
             f"unknown weather types: {unknown_weather}"
         )
+    degradation_statistics = None
+    if auxiliary_targets_enabled:
+        degradation_statistics = load_degradation_statistics(
+            args.ra_degradation_stats_path,
+            args.weather_types,
+        )
+        if int(degradation_statistics["resolution"]) != args.resolution:
+            raise ValueError(
+                "Degradation statistics resolution mismatch: "
+                f"stats={degradation_statistics['resolution']}, training={args.resolution}"
+            )
+        if degradation_statistics["split"] not in args.splits:
+            raise ValueError(
+                "Degradation statistics split is not part of training splits: "
+                f"stats={degradation_statistics['split']}, training={args.splits}"
+            )
 
     # 数据源三选一校验 (下移到 main() 头部, YAML 加载后执行)
     if args.dataset_name is None and args.train_data_dir is None and args.dataset_root is None:
@@ -2743,7 +2747,8 @@ def main(args):
                 models_to_accumulate.append(transformer)
             with accelerator.accumulate(*models_to_accumulate):
                 # Convert images to latent space
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                gt_pixels_for_targets = batch["pixel_values"]
+                pixel_values = gt_pixels_for_targets.to(dtype=vae.dtype)
                 model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
@@ -2776,7 +2781,8 @@ def main(args):
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
 
                 # controlnet(s) inference
-                conditioning_pixels = batch["conditioning_pixel_values"].to(dtype=vae.dtype)
+                lq_pixels_for_targets = batch["conditioning_pixel_values"]
+                conditioning_pixels = lq_pixels_for_targets.to(dtype=vae.dtype)
                 lq_posterior = vae.encode(conditioning_pixels).latent_dist
                 controlnet_image = lq_posterior.sample()
                 controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
@@ -2873,8 +2879,28 @@ def main(args):
                 spatial_mae = torch.tensor(0.0, device=model_pred.device)
                 spatial_pred_mean = torch.tensor(0.0, device=model_pred.device)
                 spatial_gt_mean = torch.tensor(0.0, device=model_pred.device)
+                weather_names = batch.get("weather")
+                severity_target = None
+                spatial_target = None
+                if auxiliary_targets_enabled:
+                    if weather_names is None:
+                        raise ValueError(
+                            "Weather labels are required for online degradation supervision"
+                        )
+                    spatial_logits_for_target = ra_diagnostics_model.get_last_ra_spatial_logits()
+                    if spatial_logits_for_target is None:
+                        raise RuntimeError("Degradation-aware RA did not produce spatial logits")
+                    severity_target, spatial_target = build_online_degradation_targets(
+                        lq_pixels_for_targets,
+                        gt_pixels_for_targets,
+                        weather_names,
+                        degradation_statistics,
+                        spatial_size=spatial_logits_for_target.shape[-2:],
+                        spatial_top_fraction=args.ra_spatial_top_fraction,
+                        spatial_mean_weight=args.ra_spatial_mean_weight,
+                    )
+                    severity_target = severity_target.view(-1, 1)
                 if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
-                    weather_names = batch.get("weather")
                     if weather_names is None:
                         raise ValueError(
                             "Weather labels are required when ra_weather_loss_weight > 0"
@@ -2895,12 +2921,6 @@ def main(args):
                     raise_if_nonfinite("RA weather classification loss", loss_weather, global_step + 1)
 
                 if args.ra_degradation_enabled and args.ra_severity_loss_weight > 0.0:
-                    severity_target = batch.get("severity_target")
-                    if severity_target is None:
-                        raise ValueError("severity_target is required for RA severity supervision")
-                    severity_target = severity_target.to(
-                        device=model_pred.device, dtype=torch.float32
-                    ).view(-1, 1)
                     severity_logits = ra_diagnostics_model.get_last_ra_severity_logits()
                     if severity_logits is None:
                         raise RuntimeError("Degradation-aware RA did not produce severity logits")
@@ -2919,12 +2939,6 @@ def main(args):
                     raise_if_nonfinite("RA severity regression loss", loss_severity, global_step + 1)
 
                 if args.ra_degradation_enabled and args.ra_spatial_loss_weight > 0.0:
-                    spatial_target = batch.get("spatial_map_target")
-                    if spatial_target is None:
-                        raise ValueError("spatial_map_target is required for RA spatial supervision")
-                    spatial_target = spatial_target.to(
-                        device=model_pred.device, dtype=torch.float32
-                    )
                     spatial_logits = ra_diagnostics_model.get_last_ra_spatial_logits()
                     if spatial_logits is None:
                         raise RuntimeError("Degradation-aware RA did not produce spatial logits")

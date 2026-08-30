@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,79 +7,23 @@ import numpy as np
 import torch
 from PIL import Image
 
-from dataloaders.paired_dataset import PairedCaptionDataset, load_degradation_targets
 from scripts.precompute_degradation_targets import (
     histogram_percentile,
     main as precompute_targets,
-    raw_severity,
 )
 from utils.training_losses import (
+    build_online_degradation_targets,
     extend_optimizer_state_for_appended_params,
+    load_degradation_statistics,
+    residual_severity,
     select_image_loss_inputs,
+    smoothed_rgb_residual,
     weighted_spatial_smooth_l1,
 )
 
 
 class DegradationTargetTest(unittest.TestCase):
-    def test_manifest_joins_by_weather_and_pair_id(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            for directory in (root / "rain/train/GT", root / "rain/train/LQ"):
-                directory.mkdir(parents=True)
-            Image.new("RGB", (32, 32), color=(64, 64, 64)).save(root / "rain/train/GT/a.png")
-            Image.new("RGB", (32, 32), color=(128, 128, 128)).save(root / "rain/train/LQ/a.png")
-            map_path = root / "targets/maps/rain/a.png"
-            map_path.parent.mkdir(parents=True)
-            Image.fromarray(np.full((2, 2), 128, dtype=np.uint8)).save(map_path)
-            manifest_path = root / "targets/degradation_targets.jsonl"
-            manifest_path.write_text(
-                json.dumps(
-                    {
-                        "weather": "rain",
-                        "split": "train",
-                        "pair_id": "a",
-                        "severity_target": 0.625,
-                        "spatial_map_path": "maps/rain/a.png",
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-
-            dataset = PairedCaptionDataset(
-                dataset_root=str(root),
-                weather_types=["rain"],
-                splits=["train"],
-                resolution=32,
-                degradation_targets_manifest=str(manifest_path),
-            )
-            dataset.attach_precomputed(
-                [torch.zeros(3, 4)],
-                [torch.zeros(4)],
-                [""],
-            )
-            example = dataset[0]
-
-        self.assertEqual(example["pair_id"], "a")
-        self.assertAlmostEqual(float(example["severity_target"]), 0.625)
-        self.assertEqual(example["spatial_map_target"].shape, (1, 2, 2))
-        self.assertAlmostEqual(float(example["spatial_map_target"].mean()), 128.0 / 255.0)
-
-    def test_manifest_rejects_duplicate_targets(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            path = Path(temporary_directory) / "targets.jsonl"
-            row = {
-                "weather": "rain",
-                "split": "train",
-                "pair_id": "a",
-                "severity_target": 0.5,
-                "spatial_map_path": "a.png",
-            }
-            path.write_text(json.dumps(row) + "\n" + json.dumps(row) + "\n", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "Duplicate degradation target"):
-                load_degradation_targets(path)
-
-    def test_precompute_writes_weather_normalized_targets(self):
+    def test_precompute_writes_only_weather_statistics(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             gt_dir = root / "dataset/rain/train/GT"
@@ -90,13 +33,13 @@ class DegradationTargetTest(unittest.TestCase):
             for pair_id, lq_value in (("a", 64), ("b", 192)):
                 Image.new("RGB", (32, 32), color=(0, 0, 0)).save(gt_dir / f"{pair_id}.png")
                 Image.new("RGB", (32, 32), color=(lq_value,) * 3).save(lq_dir / f"{pair_id}.png")
-            output_dir = root / "targets"
+            output_path = root / "targets/degradation_stats.json"
             arguments = [
                 "precompute_degradation_targets.py",
                 "--dataset_root",
                 str(root / "dataset"),
-                "--output_dir",
-                str(output_dir),
+                "--output_path",
+                str(output_path),
                 "--weather_types",
                 "rain",
                 "--resolution",
@@ -106,21 +49,81 @@ class DegradationTargetTest(unittest.TestCase):
             ]
             with mock.patch("sys.argv", arguments):
                 precompute_targets()
-            targets = load_degradation_targets(output_dir / "degradation_targets.jsonl")
+            statistics = load_degradation_statistics(output_path, ["rain"])
+            output_files = [path.name for path in output_path.parent.iterdir()]
 
-        self.assertEqual(len(targets), 2)
-        self.assertEqual(targets[("rain", "train", "a")]["severity_target"], 0.0)
-        self.assertEqual(targets[("rain", "train", "b")]["severity_target"], 1.0)
+        rain = statistics["statistics"]["rain"]
+        self.assertEqual(rain["count"], 2)
+        self.assertGreater(rain["residual_p99"], 0.0)
+        self.assertGreater(rain["severity_p95"], rain["severity_p5"])
+        self.assertEqual(output_files, [output_path.name])
 
     def test_severity_combines_global_mean_and_sparse_peak(self):
-        uniform = np.full((10, 10), 0.1, dtype=np.float32)
-        sparse = np.zeros((10, 10), dtype=np.float32)
-        sparse.reshape(-1)[-10:] = 0.5
+        uniform = torch.full((1, 1, 10, 10), 0.1)
+        sparse = torch.zeros(1, 1, 10, 10)
+        sparse.view(-1)[-10:] = 0.5
 
-        self.assertGreater(raw_severity(sparse, 0.1), raw_severity(uniform, 0.1))
+        self.assertGreater(
+            float(residual_severity(sparse, 0.1)),
+            float(residual_severity(uniform, 0.1)),
+        )
         histogram = np.array([90, 0, 0, 10], dtype=np.int64)
-        self.assertEqual(histogram_percentile(histogram, 90.0), 0.0)
-        self.assertEqual(histogram_percentile(histogram, 99.0), 0.75)
+        self.assertEqual(histogram_percentile(histogram, 90.0), 0.125)
+        self.assertEqual(histogram_percentile(histogram, 99.0), 0.875)
+
+    def test_online_targets_preserve_sparse_local_intensity(self):
+        gt = torch.full((1, 3, 32, 32), -1.0)
+        lq = gt.clone()
+        lq[:, :, 2:4, 2:4] = 1.0
+        statistics = {
+            "version": 2,
+            "resolution": 32,
+            "gaussian_kernel_size": 1,
+            "gaussian_sigma": 1.0,
+            "severity_top_fraction": 0.1,
+            "statistics": {
+                "rain": {
+                    "residual_p99": 0.5,
+                    "severity_p5": 0.0,
+                    "severity_p95": 0.2,
+                }
+            },
+        }
+        severity, spatial = build_online_degradation_targets(
+            lq,
+            gt,
+            ["rain"],
+            statistics,
+            spatial_size=(2, 2),
+            spatial_top_fraction=0.1,
+            spatial_mean_weight=0.5,
+        )
+
+        self.assertEqual(severity.shape, (1,))
+        self.assertEqual(spatial.shape, (1, 1, 2, 2))
+        self.assertGreater(float(spatial[0, 0, 0, 0]), float(spatial[0, 0, 1, 1]))
+        self.assertGreater(float(spatial[0, 0, 0, 0]), 0.01)
+
+    def test_offline_and_online_residual_ranges_are_equivalent(self):
+        torch.manual_seed(7)
+        gt_01 = torch.rand(2, 3, 16, 16)
+        lq_01 = torch.rand(2, 3, 16, 16)
+        offline = smoothed_rgb_residual(
+            lq_01,
+            gt_01,
+            input_value_range=1.0,
+            gaussian_kernel_size=5,
+            gaussian_sigma=1.0,
+        )
+        online = smoothed_rgb_residual(
+            lq_01 * 2.0 - 1.0,
+            gt_01 * 2.0 - 1.0,
+            input_value_range=2.0,
+            gaussian_kernel_size=5,
+            gaussian_sigma=1.0,
+        )
+
+        torch.testing.assert_close(online, offline)
 
     def test_image_loss_batch_cap_keeps_full_latent_graph_available(self):
         pred_x0 = torch.arange(4.0).view(4, 1, 1, 1).requires_grad_()
