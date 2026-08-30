@@ -65,6 +65,11 @@ from diffusers.utils import check_min_version, is_wandb_available, make_image_gr
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
+from utils.training_losses import (
+    extend_optimizer_state_for_appended_params,
+    select_image_loss_inputs,
+    weighted_spatial_smooth_l1,
+)
 from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
 
 try:
@@ -751,6 +756,9 @@ def parse_args(input_args=None):
         action="store_true",
         help="Whether or not to upcast vae to fp32",
     )
+    parser.add_argument("--vae_gradient_checkpointing", action="store_true")
+    parser.add_argument("--vae_slicing", action="store_true")
+    parser.add_argument("--vae_tiling", action="store_true")
     parser.add_argument(
         "--learning_rate",
         type=float,
@@ -874,6 +882,10 @@ def parse_args(input_args=None):
     parser.add_argument("--ra_degradation_hidden_dim", type=int, default=64)
     parser.add_argument("--ra_degradation_global_dim", type=int, default=128)
     parser.add_argument("--ra_weather_loss_weight", type=float, default=0.1)
+    parser.add_argument("--ra_severity_loss_weight", type=float, default=0.0)
+    parser.add_argument("--ra_spatial_loss_weight", type=float, default=0.0)
+    parser.add_argument("--ra_aux_smooth_l1_beta", type=float, default=0.1)
+    parser.add_argument("--ra_spatial_focus_weight", type=float, default=2.0)
     parser.add_argument("--ra_spatial_enabled", type=int, default=0)
     parser.add_argument("--ra_deformable_enabled", type=int, default=0)
     parser.add_argument("--ra_deformable_kernel_size", type=int, default=3)
@@ -1004,6 +1016,12 @@ def parse_args(input_args=None):
         help="源项目数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/. "
              "与 --dataset_name / --train_data_dir 互斥. 启用后会自动从本地读取 "
              "{weather}/{split}/{GT,LQ} 结构, 并按 weather 注入 weather-aware prompt.",
+    )
+    parser.add_argument(
+        "--ra_targets_manifest",
+        type=str,
+        default=None,
+        help="Offline JSONL with per-pair severity_target and spatial_map_path.",
     )
     parser.add_argument(
         "--weather_types",
@@ -1208,6 +1226,12 @@ def parse_args(input_args=None):
                   "其余步置 0, 降低显存开销",
     )
     parser.add_argument(
+        "--image_loss_batch_size",
+        type=int,
+        default=0,
+        help="Per-device RGB-loss decode batch cap; 0 keeps the full microbatch.",
+    )
+    parser.add_argument(
         "--image_loss_start_step",
         type=int,
         default=0,
@@ -1408,6 +1432,7 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
             resolution=args.resolution,
             weather_num_samples=weather_num_samples,
             defer_transforms=False,           # eager 模式, __getitem__ 返回 tensor
+            degradation_targets_manifest=args.ra_targets_manifest,
         )
 
         # max_train_samples 截断 (用 torch Subset, 不动 dataset 内部)
@@ -1550,6 +1575,20 @@ def collate_fn(examples):
     weather = [example.get("weather") for example in examples]
     if all(value is not None for value in weather):
         batch["weather"] = weather
+    target_flags = [
+        "severity_target" in example and "spatial_map_target" in example
+        for example in examples
+    ]
+    if any(target_flags) and not all(target_flags):
+        raise ValueError("A batch cannot mix samples with and without degradation targets")
+    if all(target_flags):
+        batch["severity_target"] = torch.stack(
+            [example["severity_target"] for example in examples]
+        ).float()
+        batch["spatial_map_target"] = torch.stack(
+            [example["spatial_map_target"] for example in examples]
+        ).float()
+        batch["pair_id"] = [example["pair_id"] for example in examples]
     return batch
 
 
@@ -1741,6 +1780,29 @@ def main(args):
         raise ValueError("ra_deformable_enabled=1 requires ra_spatial_enabled=1")
     if args.ra_weather_loss_weight < 0.0:
         raise ValueError("ra_weather_loss_weight must be non-negative")
+    if args.ra_severity_loss_weight < 0.0 or args.ra_spatial_loss_weight < 0.0:
+        raise ValueError("RA severity/spatial loss weights must be non-negative")
+    if args.ra_aux_smooth_l1_beta <= 0.0:
+        raise ValueError("ra_aux_smooth_l1_beta must be positive")
+    if args.ra_spatial_focus_weight < 0.0:
+        raise ValueError("ra_spatial_focus_weight must be non-negative")
+    if args.image_loss_batch_size < 0:
+        raise ValueError("image_loss_batch_size must be non-negative")
+    if args.lpips_interval <= 0:
+        raise ValueError("lpips_interval must be positive")
+    auxiliary_targets_enabled = (
+        args.ra_severity_loss_weight > 0.0 or args.ra_spatial_loss_weight > 0.0
+    )
+    if auxiliary_targets_enabled and not args.ra_degradation_enabled:
+        raise ValueError("Severity/spatial supervision requires ra_degradation_enabled=1")
+    if args.ra_spatial_loss_weight > 0.0 and not args.ra_spatial_enabled:
+        raise ValueError("Spatial supervision requires ra_spatial_enabled=1")
+    if args.ra_spatial_loss_weight > 0.0 and args.resolution % 16 != 0:
+        raise ValueError("Spatial supervision requires resolution divisible by 16")
+    if auxiliary_targets_enabled and not args.ra_targets_manifest:
+        raise ValueError("Severity/spatial supervision requires ra_targets_manifest")
+    if args.ra_targets_manifest and args.dataset_root is None:
+        raise ValueError("ra_targets_manifest currently requires the paired dataset_root path")
     unknown_weather = sorted(set(args.weather_types) - set(WEATHER_CLASS_IDS))
     if args.ra_degradation_enabled and unknown_weather:
         raise ValueError(
@@ -1919,6 +1981,12 @@ def main(args):
 
     transformer.requires_grad_(False)
     vae.requires_grad_(False)
+    if args.vae_gradient_checkpointing:
+        vae.enable_gradient_checkpointing()
+    if args.vae_slicing:
+        vae.enable_slicing()
+    if args.vae_tiling:
+        vae.enable_tiling()
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     text_encoder_three.requires_grad_(False)
@@ -2167,6 +2235,15 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+    if args.use_ra_fusion:
+        optimizer.register_load_state_dict_pre_hook(
+            lambda current_optimizer, state: extend_optimizer_state_for_appended_params(
+                current_optimizer,
+                state,
+                group_name="ra_fusion",
+                expected_appended_count=4,
+            )
+        )
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
@@ -2591,6 +2668,41 @@ def main(args):
                     bad.append(f"{prefix}.{name}")
         return bad
 
+    def collect_ra_gradient_diagnostics() -> dict[str, float]:
+        groups: dict[str, list[float | int]] = {}
+        ra_model = unwrap_model(transformer)
+        for name, parameter in ra_model.named_parameters():
+            if not name.startswith("ra_") or parameter.grad is None:
+                continue
+            if name.startswith("ra_degradation_encoder."):
+                group = "degradation_encoder"
+            elif name.startswith("ra_weather_classifier."):
+                group = "weather_classifier"
+            elif name.startswith("ra_severity_head."):
+                group = "severity_head"
+            elif name.startswith("ra_spatial_head."):
+                group = "spatial_head"
+            elif name.startswith("ra_deformable_tokenizer.offset_proj."):
+                group = "deform_offset"
+            elif name.startswith("ra_deformable_tokenizer.weight_proj."):
+                group = "deform_weight"
+            elif name.startswith("ra_deformable_tokenizer.output_proj."):
+                group = "spatial_output"
+            elif ".global_modulation." in name:
+                group = "global_modulation"
+            elif ".output_proj." in name:
+                group = "fusion_output"
+            else:
+                group = "fusion_core"
+            gradient = parameter.grad.detach().float()
+            totals = groups.setdefault(group, [0.0, 0])
+            totals[0] += gradient.square().sum().item()
+            totals[1] += gradient.numel()
+        return {
+            group: math.sqrt(float(sum_square) / max(int(count), 1))
+            for group, (sum_square, count) in groups.items()
+        }
+
     def check_trainable_parameters(step_number: int) -> None:
         bad_detail = None
         for group in optimizer.param_groups:
@@ -2623,6 +2735,7 @@ def main(args):
             )
         )
         for step, batch in enumerate(epoch_train_dataloader):
+            ra_gradient_diagnostics = None
             models_to_accumulate = []
             if args.train_controlnet:
                 models_to_accumulate.append(controlnet)
@@ -2750,7 +2863,16 @@ def main(args):
                 raise_if_nonfinite("flow MSE loss", loss_mse, global_step + 1)
 
                 loss_weather = torch.tensor(0.0, device=model_pred.device)
+                loss_severity = torch.tensor(0.0, device=model_pred.device)
+                loss_spatial = torch.tensor(0.0, device=model_pred.device)
+                loss_deg = torch.tensor(0.0, device=model_pred.device)
                 weather_accuracy = torch.tensor(0.0, device=model_pred.device)
+                severity_mae = torch.tensor(0.0, device=model_pred.device)
+                severity_pred_mean = torch.tensor(0.0, device=model_pred.device)
+                severity_gt_mean = torch.tensor(0.0, device=model_pred.device)
+                spatial_mae = torch.tensor(0.0, device=model_pred.device)
+                spatial_pred_mean = torch.tensor(0.0, device=model_pred.device)
+                spatial_gt_mean = torch.tensor(0.0, device=model_pred.device)
                 if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
                     weather_names = batch.get("weather")
                     if weather_names is None:
@@ -2769,8 +2891,65 @@ def main(args):
                     weather_accuracy = (
                         weather_logits.detach().argmax(dim=-1) == weather_labels
                     ).float().mean()
-                    loss = loss + args.ra_weather_loss_weight * loss_weather
+                    loss_deg = loss_deg + args.ra_weather_loss_weight * loss_weather
                     raise_if_nonfinite("RA weather classification loss", loss_weather, global_step + 1)
+
+                if args.ra_degradation_enabled and args.ra_severity_loss_weight > 0.0:
+                    severity_target = batch.get("severity_target")
+                    if severity_target is None:
+                        raise ValueError("severity_target is required for RA severity supervision")
+                    severity_target = severity_target.to(
+                        device=model_pred.device, dtype=torch.float32
+                    ).view(-1, 1)
+                    severity_logits = ra_diagnostics_model.get_last_ra_severity_logits()
+                    if severity_logits is None:
+                        raise RuntimeError("Degradation-aware RA did not produce severity logits")
+                    severity_prediction = torch.sigmoid(severity_logits.float())
+                    loss_severity = F.smooth_l1_loss(
+                        severity_prediction,
+                        severity_target,
+                        beta=args.ra_aux_smooth_l1_beta,
+                    )
+                    severity_mae = F.l1_loss(
+                        severity_prediction.detach(), severity_target
+                    )
+                    severity_pred_mean = severity_prediction.detach().mean()
+                    severity_gt_mean = severity_target.mean()
+                    loss_deg = loss_deg + args.ra_severity_loss_weight * loss_severity
+                    raise_if_nonfinite("RA severity regression loss", loss_severity, global_step + 1)
+
+                if args.ra_degradation_enabled and args.ra_spatial_loss_weight > 0.0:
+                    spatial_target = batch.get("spatial_map_target")
+                    if spatial_target is None:
+                        raise ValueError("spatial_map_target is required for RA spatial supervision")
+                    spatial_target = spatial_target.to(
+                        device=model_pred.device, dtype=torch.float32
+                    )
+                    spatial_logits = ra_diagnostics_model.get_last_ra_spatial_logits()
+                    if spatial_logits is None:
+                        raise RuntimeError("Degradation-aware RA did not produce spatial logits")
+                    spatial_prediction = torch.sigmoid(spatial_logits.float())
+                    if spatial_prediction.shape != spatial_target.shape:
+                        raise ValueError(
+                            "RA spatial target mismatch: "
+                            f"prediction={tuple(spatial_prediction.shape)}, "
+                            f"target={tuple(spatial_target.shape)}"
+                        )
+                    loss_spatial = weighted_spatial_smooth_l1(
+                        spatial_prediction,
+                        spatial_target,
+                        beta=args.ra_aux_smooth_l1_beta,
+                        focus_weight=args.ra_spatial_focus_weight,
+                    )
+                    spatial_mae = F.l1_loss(
+                        spatial_prediction.detach(), spatial_target
+                    )
+                    spatial_pred_mean = spatial_prediction.detach().mean()
+                    spatial_gt_mean = spatial_target.mean()
+                    loss_deg = loss_deg + args.ra_spatial_loss_weight * loss_spatial
+                    raise_if_nonfinite("RA spatial regression loss", loss_spatial, global_step + 1)
+
+                loss = loss + loss_deg
 
                 # ============================================================
                 # RGB 图像域重建损失 (Charbonnier + Edge + LPIPS)
@@ -2817,14 +2996,20 @@ def main(args):
                         torch.cuda.empty_cache()
                         scaling = vae.config.scaling_factor
                         shift = vae.config.shift_factor
+                        pred_x0_img, gt_pixels_img, img_weight_img = select_image_loss_inputs(
+                            pred_x0,
+                            pixel_values,
+                            img_weight,
+                            args.image_loss_batch_size,
+                        )
 
                         # pred: 保留梯度, 反传到 ControlNet (VAE 自身已冻结, 不会更新)
-                        pred_latent = pred_x0.to(vae.dtype) / scaling + shift
+                        pred_latent = pred_x0_img.to(vae.dtype) / scaling + shift
                         pred_rgb = vae.decode(pred_latent).sample.float()
                         pred_01 = (pred_rgb + 1.0) / 2.0
 
                         # 直接使用原始 GT，避免随机 posterior latent 二次解码引入目标噪声。
-                        gt_rgb = pixel_values.float()
+                        gt_rgb = gt_pixels_img.float()
                         gt_01 = (gt_rgb + 1.0) / 2.0
 
                         image_loss = torch.tensor(0.0, device=model_pred.device)
@@ -2832,7 +3017,7 @@ def main(args):
                         # Charbonnier 像素重建 (per-sample, 按 img_weight 加权)
                         if args.pixel_charbonnier_weight > 0.0:
                             loss_c = charbonnier_per_sample(pred_01, gt_01)
-                            loss_pixel = (loss_c * img_weight.flatten()).mean()
+                            loss_pixel = (loss_c * img_weight_img).mean()
                             image_loss = image_loss + args.pixel_charbonnier_weight * loss_pixel
 
                         # Sobel 边缘 L1 (RGB 域)
@@ -2841,19 +3026,19 @@ def main(args):
                             gt_edge = sobel_edge_magnitude(gt_01)
                             edge_per_sample = F.l1_loss(pred_edge, gt_edge,
                                                         reduction="none").mean(dim=[1, 2, 3])
-                            loss_edge = (edge_per_sample * img_weight.flatten()).mean()
+                            loss_edge = (edge_per_sample * img_weight_img).mean()
                             image_loss = image_loss + args.edge_loss_weight * loss_edge
 
                         # LPIPS (pred 保留梯度, GT 已 no_grad)
                         if args.lpips_weight > 0.0 and lpips_model is not None:
                             d = lpips_model(pred_rgb.clamp(-1.0, 1.0), gt_rgb).view(-1)
-                            loss_lpips = (d * img_weight.flatten()).mean()
+                            loss_lpips = (d * img_weight_img).mean()
                             image_loss = image_loss + args.lpips_weight * loss_lpips
 
                         loss = loss + image_loss
                         raise_if_nonfinite("image-domain loss", image_loss, global_step + 1)
 
-                        del pred_01, gt_01, pred_rgb, gt_rgb
+                        del pred_01, gt_01, pred_rgb, gt_rgb, pred_x0_img, gt_pixels_img
 
                     except torch.OutOfMemoryError as e:
                         logger.warning(f"[图像域损失] CUDA OOM ({e}), 跳过本步图像损失")
@@ -2868,6 +3053,7 @@ def main(args):
 
                 # Deprecated frequency loss remains disabled.
                 loss_freq = torch.tensor(0.0, device=model_pred.device)
+                loss_rest = loss - loss_deg
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -2877,6 +3063,8 @@ def main(args):
                         for parameter in group["params"]
                     ]
                     accelerator.unscale_gradients(optimizer)
+                    if collect_ra_diagnostics:
+                        ra_gradient_diagnostics = collect_ra_gradient_diagnostics()
                     try:
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             params_to_clip,
@@ -2977,14 +3165,39 @@ def main(args):
                     accelerator.wait_for_everyone()
 
             current_lrs = lr_scheduler.get_last_lr()
-            logs = {"loss": loss.detach().item(), "lr": current_lrs[0]}
+            logs = {
+                "loss": loss.detach().item(),
+                "loss_total": loss.detach().item(),
+                "lr": current_lrs[0],
+            }
             for group, group_lr in zip(optimizer.param_groups, current_lrs):
                 logs[f"{group.get('name', 'group')}_lr"] = group_lr
             # 拆解各项, 便于 tensorboard 对照
+            logs["loss_rest"] = loss_rest.detach().item()
             logs["loss_mse"] = loss_mse.detach().item()
+            logs["ra/loss_deg"] = loss_deg.detach().item()
             if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
                 logs["ra/loss_weather"] = loss_weather.detach().item()
+                logs["ra/loss_weather_weighted"] = (
+                    args.ra_weather_loss_weight * loss_weather.detach().item()
+                )
                 logs["ra/weather_accuracy"] = weather_accuracy.detach().item()
+            if args.ra_degradation_enabled and args.ra_severity_loss_weight > 0.0:
+                logs["ra/loss_severity"] = loss_severity.detach().item()
+                logs["ra/loss_severity_weighted"] = (
+                    args.ra_severity_loss_weight * loss_severity.detach().item()
+                )
+                logs["ra/severity_mae"] = severity_mae.detach().item()
+                logs["ra/severity_pred_mean"] = severity_pred_mean.detach().item()
+                logs["ra/severity_gt_mean"] = severity_gt_mean.detach().item()
+            if args.ra_degradation_enabled and args.ra_spatial_loss_weight > 0.0:
+                logs["ra/loss_spatial"] = loss_spatial.detach().item()
+                logs["ra/loss_spatial_weighted"] = (
+                    args.ra_spatial_loss_weight * loss_spatial.detach().item()
+                )
+                logs["ra/spatial_mae"] = spatial_mae.detach().item()
+                logs["ra/spatial_pred_mean"] = spatial_pred_mean.detach().item()
+                logs["ra/spatial_gt_mean"] = spatial_gt_mean.detach().item()
             if args.latent_l1_weight > 0.0:
                 logs["loss_latent_l1"] = loss_l1.detach().item()
             if ra_diagnostics is not None:
@@ -2992,6 +3205,14 @@ def main(args):
                 logs["ra/output_rms"] = output_stats["rms"]
                 logs["ra/output_abs_max"] = output_stats["abs_max"]
                 summaries = []
+                for feature_name, feature_stats in ra_diagnostics["features"].items():
+                    if feature_stats is not None:
+                        logs[f"ra/{feature_name}_rms"] = feature_stats["rms"]
+                deformable_stats = ra_diagnostics.get("deformable")
+                if deformable_stats is not None:
+                    for key, value in deformable_stats.items():
+                        if key != "enabled":
+                            logs[f"ra/deform_{key}"] = value
                 for block_stats in ra_diagnostics["blocks"]:
                     index = block_stats["block"]
                     delta_rms = block_stats["delta"]["rms"]
@@ -3003,9 +3224,21 @@ def main(args):
                 if accelerator.is_main_process:
                     logger.info(
                         f"[RA diagnostics][Step {global_step}] scale={ra_diagnostics['scale']}, "
+                        f"runtime={ra_diagnostics['runtime']}, "
                         + ", ".join(summaries)
                         + f", output_rms={output_stats['rms']:.3e}, "
                         f"output_max={output_stats['abs_max']:.3e}"
+                    )
+            if ra_gradient_diagnostics is not None:
+                for group, gradient_rms in ra_gradient_diagnostics.items():
+                    logs[f"ra/grad_{group}_rms"] = gradient_rms
+                if accelerator.is_main_process:
+                    logger.info(
+                        f"[RA gradients][Step {global_step}] "
+                        + ", ".join(
+                            f"{group}={gradient_rms:.3e}"
+                            for group, gradient_rms in sorted(ra_gradient_diagnostics.items())
+                        )
                     )
             if args.pixel_charbonnier_weight > 0.0:
                 logs["loss_pixel"] = loss_pixel.detach().item()

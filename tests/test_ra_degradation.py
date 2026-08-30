@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 import warnings
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from safetensors.torch import load_file, save_file
 
 from models.ra_fusion_sd3 import (
     RADeformableTokenizer,
@@ -49,6 +51,8 @@ class DegradationAwareFusionTest(unittest.TestCase):
         legacy = RAFusionBlock(16, 8, 1, 3, stabilize=True)
         aware = RAFusionBlock(16, 8, 1, 3, stabilize=True, global_dim=6)
         aware.load_state_dict(legacy.state_dict(), strict=False)
+        torch.nn.init.zeros_(aware.global_modulation[-1].weight)
+        torch.nn.init.zeros_(aware.global_modulation[-1].bias)
 
         main = torch.randn(2, 4, 16)
         control = torch.randn_like(main)
@@ -103,14 +107,18 @@ class DegradationAwareFusionTest(unittest.TestCase):
         )
         spatial = torch.randn(2, 4, 4, 4, requires_grad=True)
 
-        zero_tokens = tokenizer(spatial, deformable=True)
-        self.assertEqual(zero_tokens.shape, (2, 16, 8))
-        self.assertEqual(float(zero_tokens.detach().abs().max()), 0.0)
+        tokenizer.enable_diagnostics(True)
+        tokens = tokenizer(spatial, deformable=True)
+        self.assertEqual(tokens.shape, (2, 16, 8))
+        self.assertGreater(float(tokens.detach().abs().max()), 0.0)
 
-        torch.nn.init.normal_(tokenizer.output_proj.weight, std=0.02)
         tokenizer(spatial, deformable=True).square().mean().backward()
         self.assertIsNotNone(tokenizer.offset_proj.weight.grad)
         self.assertTrue(torch.isfinite(tokenizer.offset_proj.weight.grad).all())
+        self.assertGreater(float(tokenizer.offset_proj.weight.grad.abs().sum()), 0.0)
+        diagnostics = tokenizer.get_last_diagnostics()
+        self.assertEqual(diagnostics["offset_rms"], 0.0)
+        self.assertGreater(diagnostics["center_weight"], 0.8)
 
     def test_full_g_m_deformable_forward(self):
         model = make_small_transformer(
@@ -129,14 +137,39 @@ class DegradationAwareFusionTest(unittest.TestCase):
 
         self.assertEqual(output.shape, (2, 4, 8, 8))
         self.assertEqual(model.get_last_ra_weather_logits().shape, (2, 3))
+        self.assertEqual(model.get_last_ra_severity_logits().shape, (2, 1))
+        self.assertEqual(model.get_last_ra_spatial_logits().shape, (2, 1, 4, 4))
+
+    def test_auxiliary_predictions_train_only_heads_and_shared_encoder(self):
+        model = make_small_transformer(
+            degradation_enabled=True,
+            spatial_enabled=True,
+            deformable_enabled=True,
+        )
+        model(
+            hidden_states=torch.randn(2, 4, 8, 8),
+            encoder_hidden_states=torch.randn(2, 5, 32),
+            pooled_projections=torch.randn(2, 16),
+            timestep=torch.tensor([1, 2]),
+            restoration_cond=torch.randn(2, 4, 8, 8),
+            return_dict=False,
+        )
+        severity = torch.sigmoid(model.get_last_ra_severity_logits())
+        spatial = torch.sigmoid(model.get_last_ra_spatial_logits())
+        (severity.square().mean() + spatial.square().mean()).backward()
+
+        for parameter in (
+            model.ra_severity_head.weight,
+            model.ra_spatial_head.weight,
+            model.ra_degradation_encoder.global_proj.weight,
+            model.ra_degradation_encoder.features[0].weight,
+        ):
+            self.assertIsNotNone(parameter.grad)
+            self.assertGreater(float(parameter.grad.abs().sum()), 0.0)
 
     def test_full_model_is_legacy_equivalent_at_initialization(self):
         torch.manual_seed(11)
         legacy = make_small_transformer(degradation_enabled=False).eval()
-        with torch.no_grad():
-            for block in legacy.ra_fusion_blocks.values():
-                torch.nn.init.normal_(block.output_proj.weight, std=0.02)
-                torch.nn.init.normal_(block.output_proj.bias, std=0.02)
         aware = make_small_transformer(
             degradation_enabled=True,
             spatial_enabled=True,
@@ -157,6 +190,79 @@ class DegradationAwareFusionTest(unittest.TestCase):
             aware_output = aware(**inputs)[0]
 
         torch.testing.assert_close(aware_output, legacy_output)
+
+    def test_runtime_ablation_switches_global_spatial_and_deformable_features(self):
+        torch.manual_seed(19)
+        model = make_small_transformer(
+            degradation_enabled=True,
+            spatial_enabled=True,
+            deformable_enabled=True,
+        ).eval()
+        with torch.no_grad():
+            for block in model.ra_fusion_blocks.values():
+                torch.nn.init.normal_(block.output_proj.weight, std=0.02)
+
+        inputs = {
+            "hidden_states": torch.randn(2, 4, 8, 8),
+            "encoder_hidden_states": torch.randn(2, 5, 32),
+            "pooled_projections": torch.randn(2, 16),
+            "timestep": torch.tensor([1, 2]),
+            "restoration_cond": torch.randn(2, 4, 8, 8),
+            "return_dict": False,
+        }
+        with torch.no_grad():
+            full = model(**inputs)[0]
+            model.set_ra_degradation_runtime(global_enabled=False)
+            without_global = model(**inputs)[0]
+            model.set_ra_degradation_runtime(
+                global_enabled=True,
+                spatial_enabled=True,
+                deformable_enabled=False,
+            )
+            without_deformable = model(**inputs)[0]
+            model.set_ra_degradation_runtime(
+                global_enabled=True,
+                spatial_enabled=False,
+                deformable_enabled=False,
+            )
+            without_spatial = model(**inputs)[0]
+
+        self.assertFalse(torch.allclose(full, without_global))
+        self.assertFalse(torch.allclose(full, without_deformable))
+        self.assertFalse(torch.allclose(without_deformable, without_spatial))
+        self.assertEqual(
+            model.get_ra_degradation_runtime(),
+            {"global": True, "spatial": False, "deformable": False},
+        )
+
+    def test_diagnostics_expose_g_m_and_deformable_sampling(self):
+        model = make_small_transformer(
+            degradation_enabled=True,
+            spatial_enabled=True,
+            deformable_enabled=True,
+        ).eval()
+        model.enable_ra_diagnostics(True)
+        with torch.no_grad():
+            model(
+                hidden_states=torch.randn(2, 4, 8, 8),
+                encoder_hidden_states=torch.randn(2, 5, 32),
+                pooled_projections=torch.randn(2, 16),
+                timestep=torch.tensor([1, 2]),
+                restoration_cond=torch.randn(2, 4, 8, 8),
+                return_dict=False,
+            )
+        model.enable_ra_diagnostics(False)
+        diagnostics = model.get_last_ra_diagnostics()
+
+        self.assertEqual(
+            diagnostics["runtime"],
+            {"global": True, "spatial": True, "deformable": True},
+        )
+        self.assertGreater(diagnostics["features"]["global"]["rms"], 0.0)
+        self.assertGreater(diagnostics["features"]["spatial"]["rms"], 0.0)
+        self.assertGreater(diagnostics["features"]["spatial_tokens"]["rms"], 0.0)
+        self.assertEqual(diagnostics["deformable"]["offset_rms"], 0.0)
+        self.assertGreater(diagnostics["deformable"]["center_weight"], 0.8)
 
     def test_legacy_sidecar_initializes_only_new_branch(self):
         legacy = make_small_transformer(degradation_enabled=False)
@@ -179,6 +285,10 @@ class DegradationAwareFusionTest(unittest.TestCase):
         for block in aware.ra_fusion_blocks.values():
             self.assertEqual(float(block.global_modulation[-1].weight.detach().abs().max()), 0.0)
             self.assertEqual(float(block.global_modulation[-1].bias.detach().abs().max()), 0.0)
+        self.assertEqual(
+            float(aware.ra_deformable_tokenizer.output_proj.weight.detach().abs().max()),
+            0.0,
+        )
 
     def test_new_sidecar_round_trip(self):
         source = make_small_transformer(
@@ -188,6 +298,8 @@ class DegradationAwareFusionTest(unittest.TestCase):
         )
         with torch.no_grad():
             source.ra_weather_classifier.bias.copy_(torch.tensor([1.0, 2.0, 3.0]))
+            source.ra_severity_head.bias.fill_(0.375)
+            source.ra_spatial_head.bias.fill_(0.625)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory)
@@ -198,11 +310,64 @@ class DegradationAwareFusionTest(unittest.TestCase):
                 deformable_enabled=True,
             )
             loaded.load_ra_fusion(path)
+            with open(path / "config.json", "r", encoding="utf-8") as file:
+                prediction_heads_version = json.load(file)["ra_prediction_heads_version"]
 
         torch.testing.assert_close(
             loaded.ra_weather_classifier.bias,
             source.ra_weather_classifier.bias,
         )
+        torch.testing.assert_close(loaded.ra_severity_head.bias, source.ra_severity_head.bias)
+        torch.testing.assert_close(loaded.ra_spatial_head.bias, source.ra_spatial_head.bias)
+        self.assertEqual(prediction_heads_version, 1)
+
+    def test_old_degradation_sidecar_initializes_only_prediction_heads(self):
+        source = make_small_transformer(
+            degradation_enabled=True,
+            spatial_enabled=True,
+            deformable_enabled=True,
+        )
+        with torch.no_grad():
+            source.ra_degradation_encoder.global_proj.weight.fill_(0.125)
+            source.ra_deformable_tokenizer.output_proj.weight.fill_(0.25)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory)
+            source.save_ra_fusion(path)
+            weight_path = path / "ra_fusion.safetensors"
+            state = load_file(str(weight_path))
+            old_state = {
+                key: value
+                for key, value in state.items()
+                if not source._is_ra_prediction_head_key(key)
+            }
+            save_file(old_state, str(weight_path))
+            with open(path / "config.json", "r", encoding="utf-8") as file:
+                config = json.load(file)
+            config.pop("ra_prediction_heads_version")
+            with open(path / "config.json", "w", encoding="utf-8") as file:
+                json.dump(config, file)
+
+            loaded = make_small_transformer(
+                degradation_enabled=True,
+                spatial_enabled=True,
+                deformable_enabled=True,
+            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                loaded.load_ra_fusion(path)
+
+        torch.testing.assert_close(
+            loaded.ra_degradation_encoder.global_proj.weight,
+            source.ra_degradation_encoder.global_proj.weight,
+        )
+        torch.testing.assert_close(
+            loaded.ra_deformable_tokenizer.output_proj.weight,
+            source.ra_deformable_tokenizer.output_proj.weight,
+        )
+        self.assertTrue(torch.isfinite(loaded.ra_severity_head.weight).all())
+        self.assertTrue(torch.isfinite(loaded.ra_spatial_head.weight).all())
+        self.assertTrue(any("prediction heads" in str(item.message) for item in caught))
 
 
 if __name__ == "__main__":

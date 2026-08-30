@@ -140,6 +140,11 @@ ra_degradation_enabled: 1               # P1: 从 LQ latent 预测全局退化�
 ra_degradation_hidden_dim: 64            # LQ latent encoder 的中间通道数
 ra_degradation_global_dim: 128           # 全局退化向量 g 的维度
 ra_weather_loss_weight: 0.1              # rain/snow/haze 辅助分类损失权重
+ra_severity_loss_weight: 0.1             # 连续强度回归；target 在每种天气训练集内归一化
+ra_spatial_loss_weight: 0.1              # M 的 32x32 soft degradation map 监督
+ra_aux_smooth_l1_beta: 0.1               # severity/spatial 共用的 Smooth L1 beta
+ra_spatial_focus_weight: 2.0             # 1 + weight*M_gt，避免稀疏雨雪被背景淹没
+ra_targets_manifest: "/root/autodl-tmp/datasets2/manifests/degradation_targets/degradation_targets.jsonl"
 ra_spatial_enabled: 1                    # 将空间退化图 M 注入 LQ condition tokens
 ra_deformable_enabled: 1                 # 对 M 使用可学习偏移的局部采样
 ra_deformable_kernel_size: 3             # 每个位置采样 3x3=9 个点
@@ -166,6 +171,7 @@ edge_loss_weight: 0.0
 lpips_weight: 0.0                       # PSNR 敏感任务建议 ≤0.02
 lpips_interval: 4                      # 每 N 步算一次图像域损失, 其余步置 0
 image_loss_start_step: 1000             # 避免 zero-init RA 的首次更新经过 VAE decoder backward
+image_loss_batch_size: 1                # RGB loss 仅解码每卡前1个样本；latent/flow仍使用完整batch
 lpips_net: "alex"                      # alex=快, vgg=准
 
 # dataset.map(compute_embeddings_fn) 的 batch_size (预计算 prompt embeddings 用)
@@ -175,8 +181,12 @@ dataset_preprocess_batch_size: 1000
 # no / fp16 / bf16 (fp16 配 GradScaler, bf16 跳过; SD3 推荐 bf16)
 mixed_precision: "bf16"
 
-# 是否 upcast VAE 到 fp32 (避免显存压力但牺牲精度)
+# 是否 upcast VAE 到 fp32。更稳定但显存更高；先保留 true，验证后再尝试 bf16。
 upcast_vae: true
+# 三项均可能改变执行路径，默认关闭；逐项验证 PSNR 与峰值显存后再启用。
+vae_gradient_checkpointing: false
+vae_slicing: false
+vae_tiling: false
 
 # 梯度检查点 (用时间换显存)
 gradient_checkpointing: true

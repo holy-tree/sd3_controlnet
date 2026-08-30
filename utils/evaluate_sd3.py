@@ -83,6 +83,21 @@ def parse_args():
     )
     parser.add_argument("--controlnet_model_path", type=str, default=None)
     parser.add_argument("--ra_fusion_path", type=str, default=None)
+    parser.add_argument(
+        "--ra_disable_global",
+        action="store_true",
+        help="消融全局退化向量 g，同时保留基础 RA 和可选空间分支.",
+    )
+    parser.add_argument(
+        "--ra_disable_spatial",
+        action="store_true",
+        help="消融空间退化图 M；同时关闭依赖 M 的 deformable tokenization.",
+    )
+    parser.add_argument(
+        "--ra_disable_deformable",
+        action="store_true",
+        help="保留 M，但改用普通 1x1 tokenization，消融 deformable sampling.",
+    )
     parser.add_argument("--max_samples_per_weather", type=int, default=None)
     parser.add_argument("--disable_fid", action="store_true")
     return parser.parse_args()
@@ -278,8 +293,21 @@ def build_pipeline(args_config: dict, device, dtype):
         transformer.load_ra_fusion(ra_path)
         if configured_scale is not None:
             transformer.set_ra_fusion_scale(configured_scale)
+        if transformer.ra_degradation_enabled:
+            spatial_enabled = not bool(args_config.get("ra_disable_spatial", False))
+            transformer.set_ra_degradation_runtime(
+                global_enabled=not bool(args_config.get("ra_disable_global", False)),
+                spatial_enabled=spatial_enabled and transformer.ra_spatial_enabled,
+                deformable_enabled=(
+                    spatial_enabled
+                    and transformer.ra_deformable_enabled
+                    and not bool(args_config.get("ra_disable_deformable", False))
+                ),
+            )
         print(f"[eval] 加载 RA Fusion: {ra_path}")
         print(f"[eval] RA Fusion scale: {transformer.ra_fusion_scale}")
+        if transformer.ra_degradation_enabled:
+            print(f"[eval] RA degradation runtime: {transformer.get_ra_degradation_runtime()}")
 
     pipeline_components = {
         "controlnet": controlnet,
@@ -953,6 +981,12 @@ if __name__ == "__main__":
         cfg["controlnet_model_path"] = args.controlnet_model_path
     if args.ra_fusion_path is not None:
         cfg["ra_fusion_path"] = args.ra_fusion_path
+    if args.ra_disable_global:
+        cfg["ra_disable_global"] = True
+    if args.ra_disable_spatial:
+        cfg["ra_disable_spatial"] = True
+    if args.ra_disable_deformable:
+        cfg["ra_disable_deformable"] = True
     if args.max_samples_per_weather is not None:
         cfg["max_samples_per_weather"] = args.max_samples_per_weather
     if args.disable_fid:

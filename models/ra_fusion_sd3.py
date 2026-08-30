@@ -117,9 +117,11 @@ class RADeformableTokenizer(nn.Module):
         )
         base_offsets = torch.stack((offsets_x.flatten(), offsets_y.flatten()), dim=-1)
         self.register_buffer("base_offsets", base_offsets, persistent=False)
+        self._diagnostics_enabled = False
+        self._last_diagnostics: dict[str, float | bool] | None = None
         self.reset_parameters()
 
-    def reset_parameters(self) -> None:
+    def reset_parameters(self, zero_output: bool = False) -> None:
         self.offset_proj.reset_parameters()
         self.weight_proj.reset_parameters()
         self.output_proj.reset_parameters()
@@ -127,11 +129,27 @@ class RADeformableTokenizer(nn.Module):
         nn.init.zeros_(self.offset_proj.bias)
         nn.init.zeros_(self.weight_proj.weight)
         nn.init.zeros_(self.weight_proj.bias)
-        nn.init.zeros_(self.output_proj.weight)
+        # Start close to identity sampling instead of uniformly blurring a 3x3 area.
+        with torch.no_grad():
+            self.weight_proj.bias[self.num_samples // 2] = 4.0
+        if zero_output:
+            nn.init.zeros_(self.output_proj.weight)
+        else:
+            nn.init.normal_(self.output_proj.weight, std=0.02)
         nn.init.zeros_(self.output_proj.bias)
+
+    def enable_diagnostics(self, enabled: bool = True) -> None:
+        self._diagnostics_enabled = bool(enabled)
+        if enabled:
+            self._last_diagnostics = None
+
+    def get_last_diagnostics(self) -> dict[str, float | bool] | None:
+        return self._last_diagnostics
 
     def forward(self, spatial: torch.Tensor, deformable: bool = True) -> torch.Tensor:
         batch, channels, height, width = spatial.shape
+        learned_offsets = None
+        sample_weights = None
         if deformable:
             learned_offsets = self.offset_proj(spatial).view(
                 batch, self.num_samples, 2, height, width
@@ -172,6 +190,22 @@ class RADeformableTokenizer(nn.Module):
             spatial = (sampled * sample_weights).sum(dim=1)
 
         tokens = self.output_proj(spatial).flatten(2).transpose(1, 2)
+        if self._diagnostics_enabled:
+            diagnostics: dict[str, float | bool] = {
+                "enabled": bool(deformable),
+                "token_rms": tokens.detach().float().square().mean().sqrt().item(),
+            }
+            if learned_offsets is not None and sample_weights is not None:
+                offsets = learned_offsets.detach().float()
+                weights = sample_weights.detach().float().squeeze(2)
+                entropy = -(weights * weights.clamp_min(1e-8).log()).sum(dim=1)
+                diagnostics.update(
+                    offset_rms=offsets.square().mean().sqrt().item(),
+                    offset_abs_max=offsets.abs().max().item(),
+                    weight_entropy=(entropy.mean() / math.log(self.num_samples)).item(),
+                    center_weight=weights[:, self.num_samples // 2].mean().item(),
+                )
+            self._last_diagnostics = diagnostics
         return tokens
 
 
@@ -208,7 +242,7 @@ class RAFusionBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(global_dim, hidden_dim * 3),
             )
-            nn.init.zeros_(self.global_modulation[-1].weight)
+            nn.init.normal_(self.global_modulation[-1].weight, std=0.02)
             nn.init.zeros_(self.global_modulation[-1].bias)
         self.stabilize = bool(stabilize)
 
@@ -222,6 +256,7 @@ class RAFusionBlock(nn.Module):
         width: int,
         output_scale: float,
         degradation_global: torch.Tensor | None = None,
+        global_modulation_enabled: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         condition = self.condition_norm(condition_state) if self.stabilize else condition_state
         time_input = self.time_norm(temb) if self.stabilize else temb
@@ -236,7 +271,7 @@ class RAFusionBlock(nn.Module):
             # keeps the fusion RMS close to one instead of growing across stages.
             fused = fused * 0.5
         output_gate = None
-        if self.global_modulation is not None:
+        if self.global_modulation is not None and global_modulation_enabled:
             if degradation_global is None:
                 raise ValueError("Degradation-aware RA block requires degradation_global")
             shift, scale, output_gate = self.global_modulation(degradation_global).chunk(3, dim=-1)
@@ -369,6 +404,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         )
         self.ra_degradation_encoder = None
         self.ra_weather_classifier = None
+        self.ra_severity_head = None
+        self.ra_spatial_head = None
         self.ra_deformable_tokenizer = None
         if self.ra_degradation_enabled:
             self.ra_degradation_encoder = RADegradationEncoder(
@@ -387,11 +424,20 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                 ra_deformable_kernel_size,
                 ra_deformable_max_offset,
             )
+            # Keep all legacy RA modules in their original registration order so
+            # old optimizer state remains aligned; append auxiliary heads last.
+            self.ra_severity_head = nn.Linear(ra_degradation_global_dim, 1)
+            self.ra_spatial_head = nn.Conv2d(ra_degradation_hidden_dim, 1, kernel_size=1)
         self._runtime_restoration_condition: torch.Tensor | None = None
         self._ra_fusion_scale = float(ra_fusion_scale)
         self._ra_diagnostics_enabled = False
         self._last_ra_diagnostics: dict[str, Any] | None = None
         self._last_ra_weather_logits: torch.Tensor | None = None
+        self._last_ra_severity_logits: torch.Tensor | None = None
+        self._last_ra_spatial_logits: torch.Tensor | None = None
+        self._ra_global_runtime_enabled = bool(ra_degradation_enabled)
+        self._ra_spatial_runtime_enabled = bool(ra_spatial_enabled)
+        self._ra_deformable_runtime_enabled = bool(ra_deformable_enabled)
 
     @staticmethod
     def _is_ra_degradation_key(key: str) -> bool:
@@ -404,6 +450,10 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
     @staticmethod
     def _is_ra_spatial_key(key: str) -> bool:
         return key.startswith("ra_deformable_tokenizer.")
+
+    @staticmethod
+    def _is_ra_prediction_head_key(key: str) -> bool:
+        return key.startswith(("ra_severity_head.", "ra_spatial_head."))
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
@@ -425,16 +475,22 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             spatial_keys = {
                 key for key in expected_ra_keys if model._is_ra_spatial_key(key)
             }
+            prediction_head_keys = {
+                key for key in expected_ra_keys if model._is_ra_prediction_head_key(key)
+            }
             if missing_ra_keys == expected_ra_keys:
                 model.reset_ra_fusion_parameters()
             else:
                 remaining = set(missing_ra_keys)
                 if global_degradation_keys and global_degradation_keys.issubset(remaining):
-                    model.reset_ra_degradation_parameters()
+                    model.reset_ra_degradation_parameters(zero_modulation=True)
                     remaining -= global_degradation_keys
                 if spatial_keys and spatial_keys.issubset(remaining):
-                    model.reset_ra_spatial_parameters()
+                    model.reset_ra_spatial_parameters(zero_output=True)
                     remaining -= spatial_keys
+                if prediction_head_keys and prediction_head_keys.issubset(remaining):
+                    model.reset_ra_prediction_heads_parameters()
+                    remaining -= prediction_head_keys
                 if not remaining:
                     model.validate_ra_fusion_parameters("partial branch initialization")
                 else:
@@ -468,6 +524,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         self.ra_condition_proj.reset_parameters()
         if self.ra_degradation_enabled:
             self.reset_ra_degradation_parameters()
+            self.reset_ra_prediction_heads_parameters()
             self.reset_ra_spatial_parameters()
         for fusion_block in self.ra_fusion_blocks.values():
             for module in fusion_block.modules():
@@ -479,11 +536,11 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             nn.init.zeros_(fusion_block.output_proj.weight)
             nn.init.zeros_(fusion_block.output_proj.bias)
             if fusion_block.global_modulation is not None:
-                nn.init.zeros_(fusion_block.global_modulation[-1].weight)
+                nn.init.normal_(fusion_block.global_modulation[-1].weight, std=0.02)
                 nn.init.zeros_(fusion_block.global_modulation[-1].bias)
         self.validate_ra_fusion_parameters("explicit initialization")
 
-    def reset_ra_degradation_parameters(self) -> None:
+    def reset_ra_degradation_parameters(self, zero_modulation: bool = False) -> None:
         if not self.ra_degradation_enabled:
             return
         for module in (self.ra_degradation_encoder, self.ra_weather_classifier):
@@ -494,12 +551,21 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         for fusion_block in self.ra_fusion_blocks.values():
             if fusion_block.global_modulation is not None:
                 fusion_block.global_modulation[-1].reset_parameters()
-                nn.init.zeros_(fusion_block.global_modulation[-1].weight)
+                if zero_modulation:
+                    nn.init.zeros_(fusion_block.global_modulation[-1].weight)
+                else:
+                    nn.init.normal_(fusion_block.global_modulation[-1].weight, std=0.02)
                 nn.init.zeros_(fusion_block.global_modulation[-1].bias)
 
-    def reset_ra_spatial_parameters(self) -> None:
+    def reset_ra_spatial_parameters(self, zero_output: bool = False) -> None:
         if self.ra_deformable_tokenizer is not None:
-            self.ra_deformable_tokenizer.reset_parameters()
+            self.ra_deformable_tokenizer.reset_parameters(zero_output=zero_output)
+
+    def reset_ra_prediction_heads_parameters(self) -> None:
+        if self.ra_severity_head is not None:
+            self.ra_severity_head.reset_parameters()
+        if self.ra_spatial_head is not None:
+            self.ra_spatial_head.reset_parameters()
 
     def validate_ra_fusion_parameters(self, stage: str) -> None:
         invalid = []
@@ -526,6 +592,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         if self.ra_degradation_enabled:
             self.ra_degradation_encoder.to(dtype=dtype)
             self.ra_weather_classifier.to(dtype=dtype)
+            self.ra_severity_head.to(dtype=dtype)
+            self.ra_spatial_head.to(dtype=dtype)
             self.ra_deformable_tokenizer.to(dtype=dtype)
         self.validate_ra_fusion_parameters(f"dtype conversion to {dtype}")
 
@@ -540,6 +608,8 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
 
     def enable_ra_diagnostics(self, enabled: bool = True) -> None:
         self._ra_diagnostics_enabled = bool(enabled)
+        if self.ra_deformable_tokenizer is not None:
+            self.ra_deformable_tokenizer.enable_diagnostics(enabled)
         if enabled:
             self._last_ra_diagnostics = None
 
@@ -548,6 +618,50 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
 
     def get_last_ra_weather_logits(self) -> torch.Tensor | None:
         return self._last_ra_weather_logits
+
+    def get_last_ra_severity_logits(self) -> torch.Tensor | None:
+        return self._last_ra_severity_logits
+
+    def get_last_ra_spatial_logits(self) -> torch.Tensor | None:
+        return self._last_ra_spatial_logits
+
+    def set_ra_degradation_runtime(
+        self,
+        *,
+        global_enabled: bool | None = None,
+        spatial_enabled: bool | None = None,
+        deformable_enabled: bool | None = None,
+    ) -> None:
+        """Toggle trained degradation features for inference-time ablations."""
+        global_enabled = (
+            self._ra_global_runtime_enabled if global_enabled is None else bool(global_enabled)
+        )
+        spatial_enabled = (
+            self._ra_spatial_runtime_enabled if spatial_enabled is None else bool(spatial_enabled)
+        )
+        deformable_enabled = (
+            self._ra_deformable_runtime_enabled
+            if deformable_enabled is None
+            else bool(deformable_enabled)
+        )
+        if global_enabled and not self.ra_degradation_enabled:
+            raise ValueError("Global degradation conditioning is not configured")
+        if spatial_enabled and not self.ra_spatial_enabled:
+            raise ValueError("Spatial degradation conditioning is not configured")
+        if deformable_enabled and not self.ra_deformable_enabled:
+            raise ValueError("Deformable degradation tokenization is not configured")
+        if deformable_enabled and not spatial_enabled:
+            raise ValueError("Deformable tokenization requires spatial conditioning at runtime")
+        self._ra_global_runtime_enabled = global_enabled
+        self._ra_spatial_runtime_enabled = spatial_enabled
+        self._ra_deformable_runtime_enabled = deformable_enabled
+
+    def get_ra_degradation_runtime(self) -> dict[str, bool]:
+        return {
+            "global": self._ra_global_runtime_enabled,
+            "spatial": self._ra_spatial_runtime_enabled,
+            "deformable": self._ra_deformable_runtime_enabled,
+        }
 
     @staticmethod
     def _tensor_diagnostics(tensor: torch.Tensor) -> dict[str, float]:
@@ -601,6 +715,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             "ra_degradation_global_dim": self.config.ra_degradation_global_dim,
             "ra_degradation_num_classes": self.config.ra_degradation_num_classes,
             "ra_spatial_version": 1 if self.ra_degradation_enabled else 0,
+            "ra_prediction_heads_version": 1 if self.ra_degradation_enabled else 0,
             "ra_spatial_enabled": self.config.ra_spatial_enabled,
             "ra_deformable_enabled": self.config.ra_deformable_enabled,
             "ra_deformable_kernel_size": self.config.ra_deformable_kernel_size,
@@ -678,6 +793,9 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         loaded_keys = set(state)
         degradation_keys = {key for key in expected_keys if self._is_ra_degradation_key(key)}
         spatial_keys = {key for key in expected_keys if self._is_ra_spatial_key(key)}
+        prediction_head_keys = {
+            key for key in expected_keys if self._is_ra_prediction_head_key(key)
+        }
         accepted_missing = set()
         if not saved_degradation_enabled:
             accepted_missing.update(degradation_keys)
@@ -692,6 +810,25 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                     raise ValueError(
                         f"RA Fusion config mismatch for {key}: saved={saved}, expected={expected}"
                     )
+        saved_prediction_heads_version = int(
+            saved_config.get("ra_prediction_heads_version", 0)
+        )
+        if saved_prediction_heads_version not in (0, 1):
+            raise ValueError(
+                "Unsupported ra_prediction_heads_version: "
+                f"{saved_prediction_heads_version}"
+            )
+        missing_prediction_head_keys = prediction_head_keys - loaded_keys
+        if saved_prediction_heads_version == 0:
+            if (
+                missing_prediction_head_keys
+                and missing_prediction_head_keys != prediction_head_keys
+            ):
+                raise ValueError(
+                    "Partial RA prediction-head state is not supported: "
+                    f"missing={sorted(missing_prediction_head_keys)}"
+                )
+            accepted_missing.update(prediction_head_keys)
         missing_keys = expected_keys - loaded_keys
         unexpected_keys = loaded_keys - expected_keys
         if unexpected_keys or not missing_keys.issubset(accepted_missing):
@@ -700,14 +837,21 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             raise ValueError(f"RA Fusion state mismatch: missing={missing}, unexpected={unexpected}")
         self.load_state_dict(state, strict=False)
         if self.ra_degradation_enabled and not saved_degradation_enabled:
-            self.reset_ra_degradation_parameters()
+            self.reset_ra_degradation_parameters(zero_modulation=True)
+        if missing_prediction_head_keys:
+            warnings.warn(
+                "Loading an RA Fusion checkpoint without severity/spatial prediction heads; "
+                "only those heads will be initialized from scratch.",
+                stacklevel=2,
+            )
+            self.reset_ra_prediction_heads_parameters()
         if self.ra_degradation_enabled and saved_spatial_version == 0:
             warnings.warn(
                 "Loading an RA Fusion checkpoint without spatial degradation weights; "
                 "M and deformable tokenization will be initialized from scratch.",
                 stacklevel=2,
             )
-            self.reset_ra_spatial_parameters()
+            self.reset_ra_spatial_parameters(zero_output=True)
         self.validate_ra_fusion_parameters("checkpoint load")
         # Legacy checkpoints predate this field and were trained with an
         # implicit scale of 1.0.
@@ -752,7 +896,10 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         condition_state = None
         degradation_global = None
         degradation_spatial = None
+        spatial_tokens = None
         self._last_ra_weather_logits = None
+        self._last_ra_severity_logits = None
+        self._last_ra_spatial_logits = None
         if restoration_cond is not None:
             condition_tokens = self.pos_embed(restoration_cond)
             ra_dtype = self.ra_condition_proj.weight.dtype
@@ -766,7 +913,9 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                         restoration_cond.to(dtype=degradation_dtype)
                     )
                     self._last_ra_weather_logits = self.ra_weather_classifier(degradation_global)
-                    if self.ra_spatial_enabled:
+                    self._last_ra_severity_logits = self.ra_severity_head(degradation_global)
+                    self._last_ra_spatial_logits = self.ra_spatial_head(degradation_spatial)
+                    if self.ra_spatial_enabled and self._ra_spatial_runtime_enabled:
                         if degradation_spatial.shape[-2:] != (token_height, token_width):
                             degradation_spatial = F.interpolate(
                                 degradation_spatial,
@@ -776,7 +925,10 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                             )
                         spatial_tokens = self.ra_deformable_tokenizer(
                             degradation_spatial,
-                            deformable=self.ra_deformable_enabled,
+                            deformable=(
+                                self.ra_deformable_enabled
+                                and self._ra_deformable_runtime_enabled
+                            ),
                         )
                         if spatial_tokens.shape != condition_state.shape:
                             raise ValueError(
@@ -830,6 +982,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                         token_width,
                         self._ra_fusion_scale,
                         degradation_global.to(dtype=ra_dtype) if degradation_global is not None else None,
+                        self._ra_global_runtime_enabled,
                     )
                 if ra_diagnostics is not None:
                     ra_diagnostics.append(
@@ -863,8 +1016,32 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         )
 
         if ra_diagnostics is not None:
+            features = {
+                "global": (
+                    self._tensor_diagnostics(degradation_global)
+                    if degradation_global is not None
+                    else None
+                ),
+                "spatial": (
+                    self._tensor_diagnostics(degradation_spatial)
+                    if degradation_spatial is not None
+                    else None
+                ),
+                "spatial_tokens": (
+                    self._tensor_diagnostics(spatial_tokens)
+                    if spatial_tokens is not None
+                    else None
+                ),
+            }
             self._last_ra_diagnostics = {
                 "scale": self._ra_fusion_scale,
+                "runtime": self.get_ra_degradation_runtime(),
+                "features": features,
+                "deformable": (
+                    self.ra_deformable_tokenizer.get_last_diagnostics()
+                    if self.ra_deformable_tokenizer is not None
+                    else None
+                ),
                 "blocks": ra_diagnostics,
                 "output": self._tensor_diagnostics(output),
             }

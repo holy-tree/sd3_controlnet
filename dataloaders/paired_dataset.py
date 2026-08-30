@@ -35,10 +35,13 @@
         再由 dataset.map(compute_embeddings_fn, batched=True) 做 3-编码器 prompt 预编码.
 """
 
+import json
+import math
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils import data as data
@@ -56,6 +59,37 @@ DEFAULT_WEATHER_PROMPTS: Dict[str, str] = {
 
 def is_image(path: Path) -> bool:
     return path.suffix.lower() in IMG_EXTENSIONS
+
+
+def load_degradation_targets(manifest_path: str | Path) -> dict[tuple[str, str, str], dict]:
+    manifest_path = Path(manifest_path)
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Degradation target manifest not found: {manifest_path}")
+    targets = {}
+    with manifest_path.open("r", encoding="utf-8") as file:
+        for line_number, line in enumerate(file, start=1):
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            weather = str(row["weather"])
+            split = str(row["split"])
+            pair_id = str(row["pair_id"])
+            key = (weather, split, pair_id)
+            if key in targets:
+                raise ValueError(f"Duplicate degradation target {key} at line {line_number}")
+            severity = float(row["severity_target"])
+            if not math.isfinite(severity) or not 0.0 <= severity <= 1.0:
+                raise ValueError(f"Invalid severity_target for {key}: {severity}")
+            spatial_path = Path(row["spatial_map_path"])
+            if not spatial_path.is_absolute():
+                spatial_path = manifest_path.parent / spatial_path
+            targets[key] = {
+                "severity_target": severity,
+                "spatial_map_path": spatial_path,
+            }
+    if not targets:
+        raise ValueError(f"Degradation target manifest is empty: {manifest_path}")
+    return targets
 
 
 class PairedCaptionDataset(data.Dataset):
@@ -90,6 +124,7 @@ class PairedCaptionDataset(data.Dataset):
         resolution: int = 512,
         weather_num_samples: Dict[str, int] = None,
         defer_transforms: bool = False,
+        degradation_targets_manifest: str | None = None,
     ):
         super().__init__()
 
@@ -101,6 +136,12 @@ class PairedCaptionDataset(data.Dataset):
         self.resolution = resolution
         self.weather_num_samples = weather_num_samples or {}
         self.defer_transforms = defer_transforms
+        self.target_map_size = self.resolution // 16
+        self.degradation_targets = (
+            load_degradation_targets(degradation_targets_manifest)
+            if degradation_targets_manifest
+            else None
+        )
 
         if weather_types is None:
             weather_types = ["rain", "snow", "haze"]
@@ -164,6 +205,22 @@ class PairedCaptionDataset(data.Dataset):
                 cnt = sum(1 for s in self.samples if s[2] == w)
                 limit_str = f"/{self.weather_num_samples[w]}" if self.weather_num_samples.get(w, -1) > 0 else ""
                 print(f"  - {w}: {cnt}{limit_str}")
+
+        if self.degradation_targets is not None:
+            missing = [
+                (weather, gt_path.parent.parent.name, gt_path.stem)
+                for gt_path, _, weather in self.samples
+                if (
+                    weather,
+                    gt_path.parent.parent.name,
+                    gt_path.stem,
+                ) not in self.degradation_targets
+            ]
+            if missing:
+                raise ValueError(
+                    f"Degradation target manifest is missing {len(missing)} selected pairs; "
+                    f"examples={missing[:10]}"
+                )
 
         # ===== 图像预处理 (仅 defer_transforms=False 模式使用) =====
         # SD3 训练脚本会在 preprocess_train 里自行应用同样的 transform, 故 defer 模式下不构建.
@@ -248,12 +305,20 @@ class PairedCaptionDataset(data.Dataset):
 
         if self.defer_transforms:
             # SD3 旧 HF imagefolder 路径 (保留以兼容)
-            return {
+            result = {
                 "image":              str(gt_path),
                 "conditioning_image": str(lq_path),
                 "text":               prompt,
                 "weather":            weather,
             }
+            if self.degradation_targets is not None:
+                result["pair_id"] = gt_path.stem
+                result.update(
+                    self._load_degradation_target(
+                        weather, gt_path.parent.parent.name, gt_path.stem
+                    )
+                )
+            return result
 
         # eager 模式: 同步返回 tensor, 内部完成预处理.
         gt_img = Image.open(gt_path).convert("RGB")
@@ -269,6 +334,13 @@ class PairedCaptionDataset(data.Dataset):
             "pixel_values":              gt_img * 2.0 - 1.0,  # GT, [-1, 1]
             "weather":                   weather,
         }
+        if self.degradation_targets is not None:
+            result["pair_id"] = gt_path.stem
+            result.update(
+                self._load_degradation_target(
+                    weather, gt_path.parent.parent.name, gt_path.stem
+                )
+            )
 
         # 优先返回 SD3 预计算的 prompt_embeds / pooled_prompt_embeds
         if getattr(self, "_prompt_embeds", None) is not None:
@@ -280,6 +352,23 @@ class PairedCaptionDataset(data.Dataset):
                 result["input_ids"] = self.tokenize_caption(prompt).squeeze(0)
 
         return result
+
+    def _load_degradation_target(self, weather: str, split: str, pair_id: str) -> dict:
+        target = self.degradation_targets[(weather, split, pair_id)]
+        with Image.open(target["spatial_map_path"]) as image:
+            spatial_map = np.asarray(image.convert("L"), dtype=np.float32) / 255.0
+        expected_shape = (self.target_map_size, self.target_map_size)
+        if spatial_map.shape != expected_shape:
+            raise ValueError(
+                f"Spatial target for {(weather, pair_id)} has shape {spatial_map.shape}; "
+                f"expected {expected_shape}"
+            )
+        if not np.isfinite(spatial_map).all():
+            raise ValueError(f"Spatial target for {(weather, pair_id)} contains non-finite values")
+        return {
+            "severity_target": torch.tensor(target["severity_target"], dtype=torch.float32),
+            "spatial_map_target": torch.from_numpy(spatial_map.copy()).unsqueeze(0),
+        }
 
     def __len__(self):
         return len(self.samples)

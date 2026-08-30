@@ -19,6 +19,10 @@ use_ra_fusion: true
 ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/ra_fusion"
 # 可覆盖 checkpoint 保存的 RA 输出尺度。排查色块时依次测试 0.0 / 0.01 / 0.1 / 1.0。
 ra_fusion_scale: 0.1
+# 运行时消融开关，不改变 checkpoint；依次仅开启一个即可定位 g / M / deform 的贡献。
+ra_disable_global: false
+ra_disable_spatial: false
+ra_disable_deformable: false
 controlnet_conditioning_scale: 1.0
 
 # 评估结果输出目录
