@@ -264,6 +264,56 @@ class DegradationAwareFusionTest(unittest.TestCase):
         self.assertEqual(diagnostics["deformable"]["offset_rms"], 0.0)
         self.assertGreater(diagnostics["deformable"]["center_weight"], 0.8)
 
+    def test_spatial_test_modes_and_base_token_ratio(self):
+        torch.manual_seed(23)
+        model = make_small_transformer(
+            degradation_enabled=True,
+            spatial_enabled=True,
+            deformable_enabled=True,
+        ).eval()
+        with torch.no_grad():
+            torch.nn.init.normal_(model.ra_deformable_tokenizer.output_proj.weight, std=0.2)
+            for block in model.ra_fusion_blocks.values():
+                torch.nn.init.normal_(block.output_proj.weight, std=0.2)
+
+        inputs = {
+            "hidden_states": torch.randn(2, 4, 8, 8),
+            "encoder_hidden_states": torch.randn(2, 5, 32),
+            "pooled_projections": torch.randn(2, 16),
+            "timestep": torch.tensor([1, 2]),
+            "restoration_cond": torch.randn(2, 4, 8, 8),
+            "return_dict": False,
+        }
+        model.enable_ra_diagnostics(True)
+        with torch.no_grad():
+            normal = model(**inputs)[0]
+        diagnostics = model.get_last_ra_diagnostics()
+        model.enable_ra_diagnostics(False)
+
+        model.set_ra_spatial_test_mode("zero")
+        with torch.no_grad():
+            zero = model(**inputs)[0]
+        model.set_ra_spatial_test_mode("shuffle")
+        with torch.no_grad():
+            shuffled = model(**inputs)[0]
+        model.set_ra_spatial_test_mode("normal")
+
+        base_rms = diagnostics["features"]["base_condition"]["rms"]
+        spatial_rms = diagnostics["features"]["spatial_tokens"]["rms"]
+        self.assertGreater(base_rms, 0.0)
+        self.assertGreater(spatial_rms, 0.0)
+        self.assertAlmostEqual(
+            diagnostics["spatial_token_base_ratio"],
+            spatial_rms / base_rms,
+        )
+        self.assertEqual(diagnostics["spatial_test_mode"], "normal")
+        self.assertFalse(torch.allclose(normal, zero))
+        self.assertFalse(torch.allclose(normal, shuffled))
+        self.assertEqual(model.ra_spatial_test_mode, "normal")
+
+        with self.assertRaisesRegex(ValueError, "Unsupported RA spatial test mode"):
+            model.set_ra_spatial_test_mode("invalid")
+
     def test_legacy_sidecar_initializes_only_new_branch(self):
         legacy = make_small_transformer(degradation_enabled=False)
         with torch.no_grad():

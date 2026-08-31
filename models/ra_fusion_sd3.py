@@ -438,6 +438,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         self._ra_global_runtime_enabled = bool(ra_degradation_enabled)
         self._ra_spatial_runtime_enabled = bool(ra_spatial_enabled)
         self._ra_deformable_runtime_enabled = bool(ra_deformable_enabled)
+        self._ra_spatial_test_mode = "normal"
 
     @staticmethod
     def _is_ra_degradation_key(key: str) -> bool:
@@ -663,6 +664,18 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             "deformable": self._ra_deformable_runtime_enabled,
         }
 
+    def set_ra_spatial_test_mode(self, mode: str) -> None:
+        """Set an inference-only M ablation without changing trained parameters."""
+        if mode not in {"normal", "zero", "shuffle"}:
+            raise ValueError(f"Unsupported RA spatial test mode: {mode}")
+        if mode != "normal" and not self.ra_spatial_enabled:
+            raise ValueError("M ablation requires configured spatial conditioning")
+        self._ra_spatial_test_mode = mode
+
+    @property
+    def ra_spatial_test_mode(self) -> str:
+        return self._ra_spatial_test_mode
+
     @staticmethod
     def _tensor_diagnostics(tensor: torch.Tensor) -> dict[str, float]:
         values = tensor.detach().float()
@@ -877,6 +890,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         restoration_cond = restoration_cond if restoration_cond is not None else self._runtime_restoration_condition
         if self.ra_fusion_enabled and restoration_cond is None:
             raise ValueError("RA Fusion is enabled but restoration_cond was not provided")
+        restoration_condition_batch = restoration_cond.shape[0] if restoration_cond is not None else 0
         if restoration_cond is not None:
             restoration_cond = self._align_condition_batch(restoration_cond, hidden_states.shape[0])
             # pos_embed belongs to the low-precision frozen backbone. RA casts
@@ -897,6 +911,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         degradation_global = None
         degradation_spatial = None
         spatial_tokens = None
+        base_condition_state = None
         self._last_ra_weather_logits = None
         self._last_ra_severity_logits = None
         self._last_ra_spatial_logits = None
@@ -906,6 +921,7 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
             with torch.autocast(device_type=condition_tokens.device.type, enabled=False):
                 normed = self.ra_condition_norm(condition_tokens.to(dtype=ra_dtype))
                 condition_state = self.ra_condition_proj(normed)
+            base_condition_state = condition_state
             if self.ra_degradation_enabled:
                 degradation_dtype = self.ra_degradation_encoder.global_proj.weight.dtype
                 with torch.autocast(device_type=restoration_cond.device.type, enabled=False):
@@ -923,8 +939,15 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                                 mode="bilinear",
                                 align_corners=False,
                             )
+                        spatial_for_tokens = degradation_spatial
+                        if self._ra_spatial_test_mode == "zero":
+                            spatial_for_tokens = torch.zeros_like(spatial_for_tokens)
+                        elif self._ra_spatial_test_mode == "shuffle":
+                            if restoration_condition_batch < 2:
+                                raise ValueError("shuffle M requires an inference batch size of at least 2")
+                            spatial_for_tokens = torch.roll(spatial_for_tokens, shifts=1, dims=0)
                         spatial_tokens = self.ra_deformable_tokenizer(
-                            degradation_spatial,
+                            spatial_for_tokens,
                             deformable=(
                                 self.ra_deformable_enabled
                                 and self._ra_deformable_runtime_enabled
@@ -1016,7 +1039,18 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
         )
 
         if ra_diagnostics is not None:
+            base_condition_stats = (
+                self._tensor_diagnostics(base_condition_state)
+                if base_condition_state is not None
+                else None
+            )
+            spatial_token_stats = (
+                self._tensor_diagnostics(spatial_tokens)
+                if spatial_tokens is not None
+                else None
+            )
             features = {
+                "base_condition": base_condition_stats,
                 "global": (
                     self._tensor_diagnostics(degradation_global)
                     if degradation_global is not None
@@ -1028,14 +1062,18 @@ class RAFusionSD3Transformer2DModel(SD3Transformer2DModel):
                     else None
                 ),
                 "spatial_tokens": (
-                    self._tensor_diagnostics(spatial_tokens)
-                    if spatial_tokens is not None
-                    else None
+                    spatial_token_stats
                 ),
             }
             self._last_ra_diagnostics = {
                 "scale": self._ra_fusion_scale,
                 "runtime": self.get_ra_degradation_runtime(),
+                "spatial_test_mode": self._ra_spatial_test_mode,
+                "spatial_token_base_ratio": (
+                    spatial_token_stats["rms"] / max(base_condition_stats["rms"], 1e-8)
+                    if spatial_token_stats is not None and base_condition_stats is not None
+                    else None
+                ),
                 "features": features,
                 "deformable": (
                     self.ra_deformable_tokenizer.get_last_diagnostics()

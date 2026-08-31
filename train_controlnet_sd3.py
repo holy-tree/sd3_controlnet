@@ -3190,6 +3190,9 @@ def main(args):
             logs["loss_rest"] = loss_rest.detach().item()
             logs["loss_mse"] = loss_mse.detach().item()
             logs["ra/loss_deg"] = loss_deg.detach().item()
+            logs["ra/loss_deg_rest_ratio"] = (
+                loss_deg.detach() / loss_rest.detach().clamp_min(1e-8)
+            ).item()
             if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
                 logs["ra/loss_weather"] = loss_weather.detach().item()
                 logs["ra/loss_weather_weighted"] = (
@@ -3223,10 +3226,21 @@ def main(args):
                     if feature_stats is not None:
                         logs[f"ra/{feature_name}_rms"] = feature_stats["rms"]
                 deformable_stats = ra_diagnostics.get("deformable")
+                deformable_summary = ""
                 if deformable_stats is not None:
                     for key, value in deformable_stats.items():
                         if key != "enabled":
                             logs[f"ra/deform_{key}"] = value
+                    deformable_summary = (
+                        f", deform_token_rms={deformable_stats['token_rms']:.3e}"
+                    )
+                    if "offset_rms" in deformable_stats:
+                        deformable_summary += (
+                            f", deform_offset_rms={deformable_stats['offset_rms']:.3e}, "
+                            f"deform_offset_max={deformable_stats['offset_abs_max']:.3e}, "
+                            f"deform_center_weight={deformable_stats['center_weight']:.3f}, "
+                            f"deform_weight_entropy={deformable_stats['weight_entropy']:.3f}"
+                        )
                 for block_stats in ra_diagnostics["blocks"]:
                     index = block_stats["block"]
                     delta_rms = block_stats["delta"]["rms"]
@@ -3242,6 +3256,25 @@ def main(args):
                         + ", ".join(summaries)
                         + f", output_rms={output_stats['rms']:.3e}, "
                         f"output_max={output_stats['abs_max']:.3e}"
+                        + deformable_summary
+                    )
+                    auxiliary_losses = [f"deg={loss_deg.detach().item():.3e}"]
+                    if args.ra_degradation_enabled and args.ra_weather_loss_weight > 0.0:
+                        auxiliary_losses.append(
+                            f"weather_w={args.ra_weather_loss_weight * loss_weather.detach().item():.3e}"
+                        )
+                    if args.ra_degradation_enabled and args.ra_severity_loss_weight > 0.0:
+                        auxiliary_losses.append(
+                            f"severity_w={args.ra_severity_loss_weight * loss_severity.detach().item():.3e}"
+                        )
+                    if args.ra_degradation_enabled and args.ra_spatial_loss_weight > 0.0:
+                        auxiliary_losses.append(
+                            f"spatial_w={args.ra_spatial_loss_weight * loss_spatial.detach().item():.3e}"
+                        )
+                    logger.info(
+                        f"[RA losses][Step {global_step}] rest={loss_rest.detach().item():.3e}, "
+                        + ", ".join(auxiliary_losses)
+                        + f", deg/rest={logs['ra/loss_deg_rest_ratio']:.3f}"
                     )
             if ra_gradient_diagnostics is not None:
                 for group, gradient_rms in ra_gradient_diagnostics.items():
@@ -3260,7 +3293,17 @@ def main(args):
                 logs["loss_edge"] = loss_edge.detach().item()
             if args.lpips_weight > 0.0:
                 logs["loss_lpips"] = loss_lpips.detach().item()
-            progress_bar.set_postfix(**logs)
+            progress_logs = {
+                "loss": logs["loss"],
+                "loss_rest": logs["loss_rest"],
+                "loss_deg": logs["ra/loss_deg"],
+                "deg/rest": logs["ra/loss_deg_rest_ratio"],
+                "lr": logs["lr"],
+            }
+            for learning_rate_name in ("controlnet_lr", "ra_fusion_lr", "transformer_lora_lr"):
+                if learning_rate_name in logs:
+                    progress_logs[learning_rate_name] = logs[learning_rate_name]
+            progress_bar.set_postfix(**progress_logs)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
