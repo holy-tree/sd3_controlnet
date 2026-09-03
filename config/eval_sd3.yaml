@@ -111,6 +111,13 @@ haze_num: 10
 # 是否启用预测图保存 (全局开关, false 则全部不保存, 覆盖每天气设置)
 save_predictions: true
 
+# ==================== Oracle 误差分析 ====================
+# 仅使用 GT 分解当前预测误差，不修改模型、不参与训练，也不覆盖原始预测图。
+enable_oracle_analysis: true
+# 低频/高频分界。修改参数后不同实验之间必须保持一致。
+oracle_gaussian_kernel_size: 31
+oracle_gaussian_sigma: 7.0
+
 # ==================== LPIPS 配置 ====================
 # LPIPS 使用的 backbone: 'alex' | 'vgg' (默认 alex, 更快)
 lpips_net: "alex"

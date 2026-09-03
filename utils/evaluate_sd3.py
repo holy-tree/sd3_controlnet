@@ -43,6 +43,7 @@ import yaml
 import numpy as np
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms import functional as transform_functional
 from tqdm import tqdm
 
 from diffusers import StableDiffusion3ControlNetPipeline, SD3ControlNetModel
@@ -61,6 +62,21 @@ from utils.metrics import (
     _get_lpips_model,
 )
 from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
+
+
+ORACLE_MODES = ("baseline", "low_frequency", "high_frequency", "affine")
+ORACLE_LABELS = {
+    "baseline": "Baseline",
+    "low_frequency": "Low-frequency Oracle",
+    "high_frequency": "High-frequency Oracle",
+    "affine": "Affine Oracle",
+}
+ORACLE_INTERPRETATION = (
+    "Interpretation:\n"
+    "- Large Low-frequency delta: illumination, color, or low-frequency structure dominates.\n"
+    "- Large High-frequency delta: texture, edges, or residual degradation dominates.\n"
+    "- Large Affine delta: per-channel brightness, contrast, or color bias is substantial."
+)
 
 
 # ============================================================
@@ -421,6 +437,110 @@ def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_
     return (*result, initial_noise) if return_noise else result
 
 
+def build_oracle_predictions(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    gaussian_kernel_size: int,
+    gaussian_sigma: float,
+) -> dict[str, torch.Tensor]:
+    """Build GT-assisted predictions for error analysis only."""
+    if gaussian_kernel_size <= 0 or gaussian_kernel_size % 2 == 0:
+        raise ValueError("oracle_gaussian_kernel_size must be a positive odd integer")
+    if gaussian_sigma <= 0.0:
+        raise ValueError("oracle_gaussian_sigma must be positive")
+    if prediction.shape != target.shape or prediction.ndim != 4:
+        raise ValueError(
+            "Oracle inputs must have the same [B,C,H,W] shape, got "
+            f"prediction={tuple(prediction.shape)}, target={tuple(target.shape)}"
+        )
+
+    prediction = prediction.detach().float().clamp(0.0, 1.0)
+    target = target.detach().float().clamp(0.0, 1.0)
+    residual = target - prediction
+    low_residual = transform_functional.gaussian_blur(
+        residual,
+        kernel_size=[gaussian_kernel_size, gaussian_kernel_size],
+        sigma=[gaussian_sigma, gaussian_sigma],
+    )
+
+    flat_prediction = prediction.flatten(2)
+    flat_target = target.flatten(2)
+    prediction_mean = flat_prediction.mean(dim=-1, keepdim=True)
+    target_mean = flat_target.mean(dim=-1, keepdim=True)
+    centered_prediction = flat_prediction - prediction_mean
+    centered_target = flat_target - target_mean
+    variance = centered_prediction.square().mean(dim=-1, keepdim=True)
+    covariance = (centered_prediction * centered_target).mean(dim=-1, keepdim=True)
+    affine_scale = torch.where(
+        variance > 1e-12,
+        covariance / variance.clamp_min(1e-12),
+        torch.zeros_like(variance),
+    )
+    affine_bias = target_mean - affine_scale * prediction_mean
+    affine_prediction = (affine_scale * flat_prediction + affine_bias).view_as(prediction)
+
+    return {
+        "baseline": prediction,
+        "low_frequency": (prediction + low_residual).clamp(0.0, 1.0),
+        "high_frequency": (prediction + residual - low_residual).clamp(0.0, 1.0),
+        "affine": affine_prediction.clamp(0.0, 1.0),
+    }
+
+
+def aggregate_oracle_records(records: list[dict], weather_types: list[str]) -> dict[str, dict]:
+    """Aggregate per-image oracle records by weather and over all samples."""
+    summaries = {}
+    for weather in [*weather_types, "ALL"]:
+        weather_records = (
+            records if weather == "ALL" else [r for r in records if r["weather"] == weather]
+        )
+        if not weather_records:
+            continue
+        mode_summaries = {}
+        for mode in ORACLE_MODES:
+            mode_records = [r for r in weather_records if r["mode"] == mode]
+            finite_lpips = [r["lpips"] for r in mode_records if np.isfinite(r["lpips"])]
+            mode_summaries[mode] = {
+                "n": len(mode_records),
+                "psnr": sum(r["psnr"] for r in mode_records) / len(mode_records),
+                "ssim": sum(r["ssim"] for r in mode_records) / len(mode_records),
+                "lpips": (
+                    sum(finite_lpips) / len(finite_lpips) if finite_lpips else float("nan")
+                ),
+            }
+        baseline_psnr = mode_summaries["baseline"]["psnr"]
+        for metrics in mode_summaries.values():
+            metrics["delta_psnr"] = metrics["psnr"] - baseline_psnr
+        summaries[weather] = mode_summaries
+    return summaries
+
+
+def format_oracle_table(summaries: dict[str, dict], weather_types: list[str]) -> str:
+    lines = [
+        "=" * 100,
+        "Oracle Error Analysis (GT-assisted; analysis only)",
+        "=" * 100,
+        f"{'Weather':<10} {'Mode':<24} {'N':>6} {'PSNR':>10} {'Delta PSNR':>12} "
+        f"{'SSIM':>10} {'LPIPS':>10}",
+        "-" * 100,
+    ]
+    for weather in [*weather_types, "ALL"]:
+        if weather not in summaries:
+            continue
+        for mode in ORACLE_MODES:
+            metrics = summaries[weather][mode]
+            lpips = metrics["lpips"]
+            lpips_text = f"{lpips:.4f}" if np.isfinite(lpips) else "N/A"
+            lines.append(
+                f"{weather:<10} {ORACLE_LABELS[mode]:<24} {metrics['n']:>6} "
+                f"{metrics['psnr']:>10.4f} {metrics['delta_psnr']:>12.4f} "
+                f"{metrics['ssim']:>10.4f} {lpips_text:>10}"
+            )
+        lines.append("-" * 100)
+    return "\n".join(lines)
+
+
 # ============================================================
 # 主评估流程
 # ============================================================
@@ -525,6 +645,18 @@ def evaluate(args_config: dict):
     fid_preds_weather: Dict[str, List[torch.Tensor]] = defaultdict(list)
     fid_gts_weather: Dict[str, List[torch.Tensor]] = defaultdict(list)
     enable_fid = args_config.get("enable_fid", True)
+    enable_oracle_analysis = bool(args_config.get("enable_oracle_analysis", False))
+    oracle_kernel_size = int(args_config.get("oracle_gaussian_kernel_size", 31))
+    oracle_sigma = float(args_config.get("oracle_gaussian_sigma", 7.0))
+    oracle_records: list[dict] = []
+    if enable_oracle_analysis:
+        if oracle_kernel_size <= 0 or oracle_kernel_size % 2 == 0:
+            raise ValueError("oracle_gaussian_kernel_size must be a positive odd integer")
+        if oracle_sigma <= 0.0:
+            raise ValueError("oracle_gaussian_sigma must be positive")
+        print(
+            f"[oracle] enabled: Gaussian kernel={oracle_kernel_size}, sigma={oracle_sigma}"
+        )
 
     if args_config.get("seed") is not None:
         random.seed(args_config["seed"])
@@ -674,6 +806,52 @@ def evaluate(args_config: dict):
                     print(f"[warn] LPIPS batch 失败: {e}")
                     lpipses = [float("nan")] * B
 
+                if enable_oracle_analysis:
+                    oracle_predictions = build_oracle_predictions(
+                        pred_batch,
+                        gt_batch,
+                        gaussian_kernel_size=oracle_kernel_size,
+                        gaussian_sigma=oracle_sigma,
+                    )
+                    oracle_batch_metrics = {
+                        "baseline": {"psnr": psnrs, "ssim": ssims, "lpips": lpipses}
+                    }
+                    for mode in ORACLE_MODES[1:]:
+                        corrected = oracle_predictions[mode]
+                        corrected_psnrs = psnr_batch(corrected, gt_batch)
+                        corrected_ssims = ssim_batch(corrected, gt_batch)
+                        try:
+                            corrected_lpips = lpips_batch(
+                                _LPIPS_MODEL,
+                                corrected,
+                                gt_batch,
+                                device,
+                                weight_dtype,
+                            )
+                        except Exception as e:
+                            print(f"[warn] {ORACLE_LABELS[mode]} LPIPS batch failed: {e}")
+                            corrected_lpips = [float("nan")] * B
+                        oracle_batch_metrics[mode] = {
+                            "psnr": corrected_psnrs,
+                            "ssim": corrected_ssims,
+                            "lpips": corrected_lpips,
+                        }
+                    for sample_index, stem in enumerate(stems):
+                        for mode in ORACLE_MODES:
+                            metrics = oracle_batch_metrics[mode]
+                            oracle_records.append(
+                                {
+                                    "weather": weather,
+                                    "subdataset": sub_name,
+                                    "name": stem,
+                                    "mode": mode,
+                                    "psnr": metrics["psnr"][sample_index],
+                                    "ssim": metrics["ssim"][sample_index],
+                                    "lpips": metrics["lpips"][sample_index],
+                                }
+                            )
+                    del oracle_predictions, oracle_batch_metrics
+
                 # ===== 5. 写指标 / 收集 FID / 保存 PNG =====
                 for i in range(B):
                     sample_idx_global = batch_start + i
@@ -814,6 +992,26 @@ def evaluate(args_config: dict):
             if not (isinstance(l, float) and l != l):
                 all_lpipss.append(l)
 
+    oracle_summaries = (
+        aggregate_oracle_records(oracle_records, args_config["weather_types"])
+        if enable_oracle_analysis
+        else {}
+    )
+    oracle_table = (
+        format_oracle_table(oracle_summaries, args_config["weather_types"])
+        if enable_oracle_analysis
+        else ""
+    )
+    if enable_oracle_analysis:
+        oracle_report_path = eval_root / "oracle_analysis.txt"
+        with open(oracle_report_path, "w", encoding="utf-8") as file:
+            file.write(
+                f"Gaussian kernel: {oracle_kernel_size}\n"
+                f"Gaussian sigma:  {oracle_sigma}\n\n"
+                f"{oracle_table}\n\n"
+                f"{ORACLE_INTERPRETATION}\n"
+            )
+
     def _fmt(v):
         return f"{v:.4f}" if v == v else "  N/A  "
 
@@ -845,6 +1043,9 @@ def evaluate(args_config: dict):
         f.write(f"Use prompt:       {args_config.get('use_prompt', False)}\n")
         f.write(f"LPIPS backbone:   {lpips_net}\n")
         f.write(f"FID enabled:      {enable_fid}\n")
+        f.write(f"Oracle analysis:  {enable_oracle_analysis}\n")
+        if enable_oracle_analysis:
+            f.write(f"Oracle Gaussian:  kernel={oracle_kernel_size}, sigma={oracle_sigma}\n")
 
         f.write("\n" + "-" * 90 + "\n")
         f.write("Per-Subdataset Metrics:\n")
@@ -880,6 +1081,8 @@ def evaluate(args_config: dict):
         f.write(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
                 f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10} {'-':>12}\n")
         f.write("=" * 90 + "\n")
+        if enable_oracle_analysis:
+            f.write(f"\n{oracle_table}\n\n{ORACLE_INTERPRETATION}\n")
 
     per_image_csv = eval_root / "per_image_metrics.csv"
     with open(per_image_csv, "w", newline="", encoding="utf-8") as f:
@@ -899,6 +1102,23 @@ def evaluate(args_config: dict):
                     "lpips": l,
                     "infer_time": infer_time,
                 })
+
+    if enable_oracle_analysis:
+        with open(eval_root / "oracle_per_image_metrics.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "weather",
+                    "subdataset",
+                    "name",
+                    "mode",
+                    "psnr",
+                    "ssim",
+                    "lpips",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(oracle_records)
 
     def _json_metric(value):
         value = float(value)
@@ -935,6 +1155,21 @@ def evaluate(args_config: dict):
             "lpips": _json_metric(avg_lpips),
             "fid": _json_metric(overall_fid),
         },
+        "oracle_analysis": {
+            "enabled": enable_oracle_analysis,
+            "gaussian_kernel_size": oracle_kernel_size,
+            "gaussian_sigma": oracle_sigma,
+            "results": {
+                weather: {
+                    mode: {
+                        key: int(value) if key == "n" else _json_metric(value)
+                        for key, value in mode_metrics.items()
+                    }
+                    for mode, mode_metrics in weather_metrics.items()
+                }
+                for weather, weather_metrics in oracle_summaries.items()
+            },
+        },
     }
     with open(eval_root / "metrics.json", "w", encoding="utf-8") as f:
         json.dump(metrics_json, f, indent=2, ensure_ascii=False, allow_nan=False)
@@ -966,6 +1201,8 @@ def evaluate(args_config: dict):
     print(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
           f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10}")
     print("=" * 90)
+    if enable_oracle_analysis:
+        print(f"\n{oracle_table}\n\n{ORACLE_INTERPRETATION}")
     print(f"\n[eval] 评估完成, 结果保存到: {eval_root}")
     print(f"[eval] 汇总指标: {summary_path}")
 

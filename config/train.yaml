@@ -139,9 +139,9 @@ ra_fusion_stabilize: 1                  # 对递归 condition、timestep 和输�
 ra_degradation_enabled: 1               # P1: 从 LQ latent 预测全局退化向量 g
 ra_degradation_hidden_dim: 64            # LQ latent encoder 的中间通道数
 ra_degradation_global_dim: 128           # 全局退化向量 g 的维度
-ra_weather_loss_weight: 0.1              # rain/snow/haze 辅助分类损失权重
-ra_severity_loss_weight: 0.1             # 连续强度回归；target 在每种天气训练集内归一化
-ra_spatial_loss_weight: 0.1              # M 的 32x32 soft degradation map 监督
+ra_weather_loss_weight: 0.01             # 辅助损失总量控制在 restoration loss 的约 10%-20%
+ra_severity_loss_weight: 0.01            # 连续强度回归；target 在每种天气训练集内归一化
+ra_spatial_loss_weight: 0.01             # M 的 32x32 soft degradation map 监督
 ra_aux_smooth_l1_beta: 0.1               # severity/spatial 共用的 Smooth L1 beta
 ra_spatial_focus_weight: 2.0             # 1 + weight*M_gt，避免稀疏雨雪被背景淹没
 ra_spatial_top_fraction: 0.1             # 每个16x16 cell取响应最高10%的均值
