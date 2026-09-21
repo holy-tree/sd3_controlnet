@@ -266,6 +266,8 @@ class PairedCaptionDataset(data.Dataset):
             "conditioning_pixel_values": lq_img * 2.0 - 1.0,  # LQ, [-1, 1] 跟 VAE 输入范围对齐
             "pixel_values":              gt_img * 2.0 - 1.0,  # GT, [-1, 1]
             "weather":                   weather,
+            "gt_path":                   str(gt_path),
+            "lq_path":                   str(lq_path),
         }
         # 优先返回 SD3 预计算的 prompt_embeds / pooled_prompt_embeds
         if getattr(self, "_prompt_embeds", None) is not None:

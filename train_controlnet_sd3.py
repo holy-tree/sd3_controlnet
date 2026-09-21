@@ -1284,6 +1284,10 @@ def collate_fn(examples):
     weather = [example.get("weather") for example in examples]
     if all(value is not None for value in weather):
         batch["weather"] = weather
+    for path_key in ("gt_path", "lq_path"):
+        paths = [example.get(path_key) for example in examples]
+        if all(value is not None for value in paths):
+            batch[path_key] = paths
     return batch
 
 
@@ -2362,7 +2366,12 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    def raise_if_nonfinite(name: str, tensor: torch.Tensor, step_number: int) -> None:
+    def raise_if_nonfinite(
+        name: str,
+        tensor: torch.Tensor,
+        step_number: int,
+        sample_paths: list[str] | None = None,
+    ) -> None:
         finite = torch.isfinite(tensor.detach())
         local_bad = (~finite).any().to(device=accelerator.device, dtype=torch.int32)
         global_bad = accelerator.reduce(local_bad, reduction="sum")
@@ -2376,11 +2385,16 @@ def main(args):
         finite_values = values[finite]
         finite_min = finite_values.min().item() if finite_values.numel() else float("nan")
         finite_max = finite_values.max().item() if finite_values.numel() else float("nan")
+        bad_samples = ""
+        if sample_paths is not None and tensor.ndim > 0 and len(sample_paths) == tensor.shape[0]:
+            sample_bad = (~finite).flatten(1).any(1).nonzero(as_tuple=False).flatten().tolist()
+            bad_samples = f", bad_samples={[sample_paths[index] for index in sample_bad]}"
         raise FloatingPointError(
             f"[Step {step_number}] {name} 出现非有限值: "
             f"shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
             f"nan={torch.isnan(values).sum().item()}, inf={torch.isinf(values).sum().item()}, "
             f"finite_range=[{finite_min:.4e}, {finite_max:.4e}]"
+            f"{bad_samples}"
         )
 
     def find_nonfinite_gradient_names() -> list[str]:
@@ -2477,7 +2491,7 @@ def main(args):
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=vae.dtype)
                 gt_posterior = vae.encode(pixel_values).latent_dist
-                model_input = gt_posterior.sample()
+                model_input = gt_posterior.mode()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
                 gt_restoration_latent = None
@@ -2489,7 +2503,12 @@ def main(args):
                     gt_restoration_latent = gt_restoration_latent.to(dtype=weight_dtype)
                 check_source_tensors = global_step < 10
                 if check_source_tensors:
-                    raise_if_nonfinite("GT latent", model_input, global_step + 1)
+                    raise_if_nonfinite(
+                        "GT pixels", pixel_values, global_step + 1, batch.get("gt_path")
+                    )
+                    raise_if_nonfinite(
+                        "GT latent", model_input, global_step + 1, batch.get("gt_path")
+                    )
                     if gt_restoration_latent is not None:
                         raise_if_nonfinite(
                             "GT restoration latent",
@@ -2525,16 +2544,26 @@ def main(args):
                 lq_pixels_for_targets = batch["conditioning_pixel_values"]
                 conditioning_pixels = lq_pixels_for_targets.to(dtype=vae.dtype)
                 lq_posterior = vae.encode(conditioning_pixels).latent_dist
-                controlnet_image = lq_posterior.sample()
+                lq_latent = lq_posterior.mode()
                 controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
-                controlnet_image = (controlnet_image - controlnet_shift) * vae.config.scaling_factor
+                controlnet_image = (lq_latent - controlnet_shift) * vae.config.scaling_factor
                 controlnet_image = controlnet_image.to(dtype=weight_dtype)
-                restoration_condition = lq_posterior.mode()
                 restoration_condition = (
-                    restoration_condition - vae.config.shift_factor
+                    lq_latent - vae.config.shift_factor
                 ) * vae.config.scaling_factor
                 if check_source_tensors:
-                    raise_if_nonfinite("LQ restoration latent", restoration_condition, global_step + 1)
+                    raise_if_nonfinite(
+                        "LQ pixels", conditioning_pixels, global_step + 1, batch.get("lq_path")
+                    )
+                    raise_if_nonfinite(
+                        "LQ latent", lq_latent, global_step + 1, batch.get("lq_path")
+                    )
+                    raise_if_nonfinite(
+                        "LQ restoration latent",
+                        restoration_condition,
+                        global_step + 1,
+                        batch.get("lq_path"),
+                    )
 
                 control_block_res_samples = controlnet(
                     hidden_states=noisy_model_input,
