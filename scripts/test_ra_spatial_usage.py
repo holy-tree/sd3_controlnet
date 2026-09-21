@@ -47,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="./config/eval_sd3.yaml")
     parser.add_argument("--controlnet_model_path", default=None)
     parser.add_argument("--ra_fusion_path", default=None)
+    parser.add_argument("--ra_spatial_gate_scale", type=float, default=None)
+    parser.add_argument("--ra_how_token_scale", type=float, default=None)
     parser.add_argument("--max_samples_per_weather", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--num_inference_steps", type=int, default=None)
@@ -173,6 +175,10 @@ def main() -> None:
         config["controlnet_model_path"] = args.controlnet_model_path
     if args.ra_fusion_path is not None:
         config["ra_fusion_path"] = args.ra_fusion_path
+    if args.ra_spatial_gate_scale is not None:
+        config["ra_spatial_gate_scale"] = args.ra_spatial_gate_scale
+    if args.ra_how_token_scale is not None:
+        config["ra_how_token_scale"] = args.ra_how_token_scale
     if args.num_inference_steps is not None:
         config["num_inference_steps"] = args.num_inference_steps
 
@@ -335,6 +341,8 @@ def main() -> None:
         "config": str(Path(args.config).resolve()),
         "controlnet_model_path": config["controlnet_model_path"],
         "ra_fusion_path": config.get("ra_fusion_path"),
+        "ra_spatial_gate_scale": transformer.ra_spatial_gate_scale,
+        "ra_how_token_scale": transformer.ra_how_token_scale,
         "seed": seed,
         "num_inference_steps": config["num_inference_steps"],
         "rms": rms_summaries,

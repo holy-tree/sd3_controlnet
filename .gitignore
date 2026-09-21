@@ -25,7 +25,9 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-docs
+# 文档目录只默认保留 Markdown；实验表格、图片和草稿继续留在本地。
+docs/*
+!docs/*.md
 
 # ---------- 虚拟环境 ----------
 .venv/
@@ -33,11 +35,8 @@ venv/
 env/
 ENV/
 .conda/
+# 项目使用 pip + pyproject.toml，不提交本地 uv 锁文件。
 uv.lock
-
-# ---------- uv 锁文件 (项目用 pip + pyproject.toml, 不锁版本) ----------
-# 注: 若团队用 uv 协同, 反注释下行; 当前保留 uv.lock 仅作本地记录
-# uv.lock
 
 # ---------- 模型权重 / Checkpoint ----------
 # 训练输出 (含 accelerate save_state 的 checkpoint-N/)

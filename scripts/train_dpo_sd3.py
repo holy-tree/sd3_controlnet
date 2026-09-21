@@ -122,12 +122,25 @@ def load_ra_transformer(config: dict, dtype: torch.dtype, train_ra_fusion: bool)
         ra_degradation_global_dim=int(ra_config.get("ra_degradation_global_dim", 128)),
         ra_degradation_num_classes=int(ra_config.get("ra_degradation_num_classes", 3)),
         ra_spatial_enabled=bool(ra_config.get("ra_spatial_enabled", False)),
+        ra_spatial_gate_scale=float(
+            config.get("ra_spatial_gate_scale", ra_config.get("ra_spatial_gate_scale", 0.0))
+        ),
+        ra_local_correction_enabled=bool(
+            ra_config.get("ra_local_correction_enabled", False)
+        ),
+        ra_how_token_scale=float(
+            config.get("ra_how_token_scale", ra_config.get("ra_how_token_scale", 0.0))
+        ),
         ra_deformable_enabled=bool(ra_config.get("ra_deformable_enabled", False)),
         ra_deformable_kernel_size=int(ra_config.get("ra_deformable_kernel_size", 3)),
         ra_deformable_max_offset=float(ra_config.get("ra_deformable_max_offset", 1.0)),
     )
     transformer.load_ra_fusion(ra_path)
     transformer.set_ra_fusion_scale(float(config.get("ra_fusion_scale", transformer.ra_fusion_scale)))
+    if "ra_spatial_gate_scale" in config:
+        transformer.set_ra_spatial_gate_scale(float(config["ra_spatial_gate_scale"]))
+    if "ra_how_token_scale" in config:
+        transformer.set_ra_how_token_scale(float(config["ra_how_token_scale"]))
     transformer.requires_grad_(False)
     transformer.set_ra_fusion_trainable(train_ra_fusion)
     transformer.to(config["device"])
@@ -155,6 +168,9 @@ def validate_candidate_policy(model_config: dict, train_config: dict) -> None:
             "Preference data has no candidate_policy provenance; regenerate candidates and pairs, "
             "or explicitly set training.require_candidate_provenance=false for legacy data."
         )
+    ra_path = Path(model_config["ra_fusion_path"])
+    with (ra_path / "config.json").open("r", encoding="utf-8") as handle:
+        ra_config = json.load(handle)
     expected = {
         "pretrained_model_name_or_path": model_config["pretrained_model_name_or_path"],
         "revision": model_config.get("revision"),
@@ -165,6 +181,15 @@ def validate_candidate_policy(model_config: dict, train_config: dict) -> None:
         "ra_fusion_checksum_sha256": checkpoint_checksum(model_config["ra_fusion_path"]),
         "controlnet_conditioning_scale": float(model_config.get("controlnet_conditioning_scale", 1.0)),
         "ra_fusion_scale": float(model_config.get("ra_fusion_scale", 1.0)),
+        "ra_spatial_gate_scale": float(
+            model_config.get(
+                "ra_spatial_gate_scale",
+                ra_config.get("ra_spatial_gate_scale", 0.0),
+            )
+        ),
+        "ra_how_token_scale": float(
+            model_config.get("ra_how_token_scale", ra_config.get("ra_how_token_scale", 0.0))
+        ),
         "load_transformer_lora": False,
         "controlnet_vae_conditioning": "posterior_mode",
     }
@@ -869,7 +894,25 @@ def main() -> None:
             del loaded_controlnet
         if train_ra_fusion:
             raw_transformer.load_ra_fusion(load_dir / "ra_fusion")
-            raw_transformer.set_ra_fusion_scale(float(model_config.get("ra_fusion_scale", 1.0)))
+            raw_transformer.set_ra_fusion_scale(
+                float(model_config.get("ra_fusion_scale", raw_transformer.ra_fusion_scale))
+            )
+            raw_transformer.set_ra_spatial_gate_scale(
+                float(
+                    model_config.get(
+                        "ra_spatial_gate_scale",
+                        raw_transformer.ra_spatial_gate_scale,
+                    )
+                )
+            )
+            raw_transformer.set_ra_how_token_scale(
+                float(
+                    model_config.get(
+                        "ra_how_token_scale",
+                        raw_transformer.ra_how_token_scale,
+                    )
+                )
+            )
         if ema is not None:
             ema.load(load_dir / "ema_state.pt")
         models.clear()

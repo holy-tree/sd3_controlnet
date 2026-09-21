@@ -12,6 +12,7 @@ from scripts.precompute_degradation_targets import (
     main as precompute_targets,
 )
 from utils.training_losses import (
+    build_local_correction_target,
     build_online_degradation_targets,
     extend_optimizer_state_for_appended_params,
     load_degradation_statistics,
@@ -23,6 +24,24 @@ from utils.training_losses import (
 
 
 class DegradationTargetTest(unittest.TestCase):
+    def test_local_correction_target_preserves_signed_latent_residual(self):
+        gt_latent = torch.linspace(-1.0, 1.0, 2 * 3 * 4 * 4).view(2, 3, 4, 4)
+        lq_latent = torch.flip(gt_latent, dims=(-1,))
+
+        target = build_local_correction_target(
+            gt_latent,
+            lq_latent,
+            spatial_size=(2, 2),
+        )
+
+        self.assertEqual(target.shape, (2, 12, 2, 2))
+        torch.testing.assert_close(
+            torch.nn.functional.pixel_shuffle(target, upscale_factor=2),
+            gt_latent - lq_latent,
+        )
+        self.assertLess(target.min().item(), 0.0)
+        self.assertGreater(target.max().item(), 0.0)
+
     def test_precompute_writes_only_weather_statistics(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

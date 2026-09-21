@@ -83,7 +83,6 @@ class PairedCaptionDataset(data.Dataset):
         weather_types: List[str] = None,
         splits: List[str] = None,
         tokenizer=None,
-        null_text_ratio: float = 0.5,
         use_prompt: bool = False,
         prompt_ratio: float = 0.2,
         weather_prompts: Dict[str, str] = None,
@@ -95,7 +94,6 @@ class PairedCaptionDataset(data.Dataset):
 
         self.dataset_root = Path(dataset_root)
         self.tokenizer = tokenizer
-        self.null_text_ratio = null_text_ratio
         self.use_prompt = use_prompt
         self.prompt_ratio = max(0.0, min(1.0, prompt_ratio))
         self.resolution = resolution
@@ -282,116 +280,3 @@ class PairedCaptionDataset(data.Dataset):
 
     def __len__(self):
         return len(self.samples)
-
-
-def hf_generator_from_paired(dataset: PairedCaptionDataset):
-    """
-    把 PairedCaptionDataset(defer_transforms=True) 包装成 HF Dataset.from_generator 可用的 generator.
-
-    字段映射 (yield 文件路径字符串, 调用方按需 .convert("RGB")):
-        image_column            (默认 "image")            ← GT 路径
-        conditioning_image_column (默认 "conditioning_image") ← LQ 路径
-        caption_column          (默认 "text")             ← 已解析 prompt
-        weather                                                ← 额外字段, 给评估/分析用
-
-    注意: generator 必须是无状态可重入的, PairedCaptionDataset 自身无状态.
-    """
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        yield {
-            "image":              item["image"],
-            "conditioning_image": item["conditioning_image"],
-            "text":               item["text"],
-            "weather":            item["weather"],
-        }
-
-
-def paired_pil_generator(dataset: PairedCaptionDataset):
-    """
-    Generator for datasets.Dataset.from_generator, 直接 yield PIL Image (RGB).
-
-    列 schema (与 SD3 脚本默认 image_column / conditioning_image_column / caption_column 对齐):
-        image              : PIL.Image (RGB GT)
-        conditioning_image : PIL.Image (RGB LQ)
-        text               : str (已解析的 prompt, weather-aware 随机化已完成)
-        weather            : str
-
-    SD3 训练脚本的 preprocess_train 会再做一次 .convert("RGB") + Resize/CenterCrop/ToTensor,
-    对已 RGB 的 PIL 是 no-op, 所以这里直接 yield RGB 即可.
-    """
-    for idx in range(len(dataset)):
-        item = dataset[idx]
-        yield {
-            "image":              Image.open(item["image"]).convert("RGB"),
-            "conditioning_image": Image.open(item["conditioning_image"]).convert("RGB"),
-            "text":               item["text"],
-            "weather":            item["weather"],
-        }
-
-
-def build_paired_hf_dataset(args) -> "datasets.DatasetDict":
-    """
-    构建 HF DatasetDict (与 SD3 训练脚本的 preprocess_train + with_transform + map 流程兼容).
-
-    数据流:
-        1. 扫描 args.dataset_root/{weather}/{split}/{GT,LQ}/
-        2. PairedCaptionDataset(defer_transforms=True) 返回路径 + 已解析 prompt
-        3. paired_pil_generator 加载 PIL, 通过 datasets.Dataset.from_generator 包装
-        4. 返回 DatasetDict({"train": Dataset}) 与 HF imagefolder 流程同 schema
-
-    副作用:
-        - 强制 args.proportion_empty_prompts = 0 (让 SD3 的 process_captions 变 passthrough,
-          因为天气 prompt 已经在 PairedCaptionDataset._make_prompt 里解析好了)
-
-    Returns:
-        datasets.DatasetDict with key "train" -> Dataset columns:
-            image (PIL.Image), conditioning_image (PIL.Image), text (str), weather (str)
-    """
-    from datasets import Dataset, DatasetDict, Features, Image as HFImage, Value
-
-    # 解析 weather_prompts (CLI 的 key:value 列表 → dict)
-    weather_prompts_dict = None
-    if args.weather_prompts:
-        weather_prompts_dict = {}
-        for item in args.weather_prompts:
-            if ":" in item:
-                k, v = item.split(":", 1)
-                weather_prompts_dict[k.strip()] = v.strip()
-
-    # 按 weather 限制样本数 (None / <=0 表示不限制)
-    weather_num_samples = {}
-    for w in args.weather_types:
-        attr = f"{w}_num"
-        v = getattr(args, attr, None)
-        if v is not None and v > 0:
-            weather_num_samples[w] = v
-
-    paired = PairedCaptionDataset(
-        dataset_root=args.dataset_root,
-        weather_types=args.weather_types,
-        splits=args.splits,
-        tokenizer=None,           # SD3 流程不依赖单 tokenizer, 由 3 编码器在 map() 中处理
-        use_prompt=args.use_prompt,
-        prompt_ratio=args.prompt_ratio,
-        weather_prompts=weather_prompts_dict,
-        resolution=args.resolution,
-        weather_num_samples=weather_num_samples,
-        defer_transforms=True,
-    )
-
-    # 强制 process_captions passthrough
-    # (避免 SD3 默认 proportion_empty_prompts 在我们的 prompt 上又做一次空串替换)
-    args.proportion_empty_prompts = 0
-
-    features = Features({
-        "image":              HFImage(),
-        "conditioning_image": HFImage(),
-        "text":               Value("string"),
-        "weather":            Value("string"),
-    })
-
-    hf_train = Dataset.from_generator(
-        lambda: paired_pil_generator(paired),
-        features=features,
-    )
-    return DatasetDict({"train": hf_train})

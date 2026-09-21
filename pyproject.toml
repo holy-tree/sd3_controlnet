@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "sd3-controlnet"
 version = "0.1.0"
@@ -11,16 +15,25 @@ dependencies = [
     "Pillow>=9.0.0",
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
+    "scipy>=1.10.0",
     "pyyaml>=6.0",
     "tensorboard>=2.14.0",
     "wandb>=0.15.0",
     "datasets>=3.1.0",
     "torchvision>=0.20.1",
     "lpips>=0.1.4",
+    "pyiqa>=0.1.10",
     "peft>=0.14.0",
     "sentencepiece==0.2.0",
     "huggingface-hub==0.36.0",
 ]
+
+[tool.setuptools]
+py-modules = ["train_controlnet_sd3"]
+
+[tool.setuptools.packages.find]
+include = ["dataloaders*", "dpo*", "models*", "utils*"]
+exclude = ["config*", "docs*", "scripts*", "tests*"]
 
 #[[tool.uv.index]]
 #url = "https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -30,11 +43,6 @@ dependencies = [
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
-
-[project.scripts]
-train_controlnet = "train_controlnet:main"
-test_controlnet = "test:main"
-
 
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"

@@ -169,6 +169,38 @@ def build_online_degradation_targets(
     return severity_target, spatial_target
 
 
+@torch.no_grad()
+def build_local_correction_target(
+    gt_latent: torch.Tensor,
+    lq_latent: torch.Tensor,
+    *,
+    spatial_size: tuple[int, int],
+) -> torch.Tensor:
+    """Patchify the deterministic signed GT-LQ latent residual without normalization."""
+    if gt_latent.shape != lq_latent.shape or gt_latent.ndim != 4:
+        raise ValueError(
+            f"Expected matching BCHW GT/LQ latents, got {gt_latent.shape} and {lq_latent.shape}"
+        )
+    output_height, output_width = spatial_size
+    latent_height, latent_width = gt_latent.shape[-2:]
+    if output_height <= 0 or output_width <= 0:
+        raise ValueError("Local correction spatial dimensions must be positive")
+    patch_height = latent_height // output_height
+    patch_width = latent_width // output_width
+    if (
+        patch_height != patch_width
+        or patch_height <= 0
+        or latent_height % output_height != 0
+        or latent_width % output_width != 0
+    ):
+        raise ValueError(
+            "Local correction target cannot align latent and M grids: "
+            f"latent={(latent_height, latent_width)}, spatial={spatial_size}"
+        )
+    signed_residual = gt_latent.detach().float() - lq_latent.detach().float()
+    return F.pixel_unshuffle(signed_residual, downscale_factor=patch_height)
+
+
 def select_image_loss_inputs(
     pred_x0: torch.Tensor,
     pixel_values: torch.Tensor,
@@ -239,7 +271,7 @@ def extend_optimizer_state_for_appended_params(
         if missing_count != expected_appended_count:
             raise ValueError(
                 f"Optimizer group {group_name} differs by {missing_count} parameters; "
-                f"only the {expected_appended_count} appended auxiliary-head parameters "
+                f"only the {expected_appended_count} expected appended RA parameters "
                 "can be migrated safely. Use a model sidecar warm start instead of a full "
                 "optimizer-state resume for architecture changes."
             )

@@ -66,6 +66,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.training_losses import (
+    build_local_correction_target,
     build_online_degradation_targets,
     extend_optimizer_state_for_appended_params,
     load_degradation_statistics,
@@ -821,12 +822,6 @@ def parse_args(input_args=None):
         default=1.29,
         help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
     )
-    parser.add_argument(
-        "--precondition_outputs",
-        type=int,
-        default=0,
-        help="Deprecated compatibility flag. Training now always supervises raw flow velocity.",
-    )
     # ==================== Transformer LoRA (SD3 主干) ====================
     parser.add_argument(
         "--use_transformer_lora",
@@ -892,6 +887,10 @@ def parse_args(input_args=None):
     parser.add_argument("--ra_spatial_mean_weight", type=float, default=0.5)
     parser.add_argument("--ra_degradation_stats_path", type=str, default=None)
     parser.add_argument("--ra_spatial_enabled", type=int, default=0)
+    parser.add_argument("--ra_spatial_gate_scale", type=float, default=0.0)
+    parser.add_argument("--ra_local_correction_enabled", type=int, default=0)
+    parser.add_argument("--ra_local_correction_loss_weight", type=float, default=0.0)
+    parser.add_argument("--ra_how_token_scale", type=float, default=0.0)
     parser.add_argument("--ra_deformable_enabled", type=int, default=0)
     parser.add_argument("--ra_deformable_kernel_size", type=int, default=3)
     parser.add_argument("--ra_deformable_max_offset", type=float, default=1.0)
@@ -1189,12 +1188,6 @@ def parse_args(input_args=None):
             type=float,
             default=0.0,
             help="Latent x0 L1 重建权重；使用 (1-sigma) 时序加权，0=关闭.",
-)
-    parser.add_argument(
-            "--freq_loss_weight",
-            type=float,
-            default=0.0,
-            help="[deprecated] 旧 rFFT 频域 L1 权重, 已被 edge_loss_weight 取代, 保留仅为兼容旧 yaml",
 )
     parser.add_argument(
             "--pixel_charbonnier_weight",
@@ -1748,7 +1741,7 @@ def main(args):
     elif isinstance(args.weather_prompts, dict):
         weather_prompts_dict = args.weather_prompts
     if weather_prompts_dict:
-        args.weather_prompts = weather_prompts_dict  # 透传给 build_paired_hf_dataset
+        args.weather_prompts = weather_prompts_dict
 
     # 安全校验: 纯 --config 启动时, YAML 必须提供 model 路径
     if args.pretrained_model_name_or_path is None:
@@ -1762,6 +1755,25 @@ def main(args):
         raise ValueError("ra_spatial_enabled=1 requires ra_degradation_enabled=1")
     if args.ra_deformable_enabled and not args.ra_spatial_enabled:
         raise ValueError("ra_deformable_enabled=1 requires ra_spatial_enabled=1")
+    if not math.isfinite(args.ra_spatial_gate_scale) or not 0.0 <= args.ra_spatial_gate_scale <= 1.0:
+        raise ValueError("ra_spatial_gate_scale must be finite and in [0, 1]")
+    if args.ra_spatial_gate_scale > 0.0 and not args.ra_spatial_enabled:
+        raise ValueError("ra_spatial_gate_scale > 0 requires ra_spatial_enabled=1")
+    if args.ra_local_correction_enabled and not args.ra_spatial_enabled:
+        raise ValueError("ra_local_correction_enabled=1 requires ra_spatial_enabled=1")
+    if (
+        not math.isfinite(args.ra_local_correction_loss_weight)
+        or args.ra_local_correction_loss_weight < 0.0
+    ):
+        raise ValueError("ra_local_correction_loss_weight must be finite and non-negative")
+    if args.ra_local_correction_loss_weight > 0.0 and not args.ra_local_correction_enabled:
+        raise ValueError(
+            "ra_local_correction_loss_weight > 0 requires ra_local_correction_enabled=1"
+        )
+    if not math.isfinite(args.ra_how_token_scale) or not 0.0 <= args.ra_how_token_scale <= 1.0:
+        raise ValueError("ra_how_token_scale must be finite and in [0, 1]")
+    if args.ra_how_token_scale > 0.0 and not args.ra_local_correction_enabled:
+        raise ValueError("ra_how_token_scale > 0 requires ra_local_correction_enabled=1")
     if args.ra_weather_loss_weight < 0.0:
         raise ValueError("ra_weather_loss_weight must be non-negative")
     if args.ra_severity_loss_weight < 0.0 or args.ra_spatial_loss_weight < 0.0:
@@ -1825,9 +1837,6 @@ def main(args):
         )
     if args.train_transformer_lora and not args.use_transformer_lora:
         raise ValueError("train_transformer_lora=1 要求 use_transformer_lora=1")
-    if args.precondition_outputs:
-        logger.warning("precondition_outputs 已弃用；当前训练始终使用 raw velocity MSE")
-
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -1946,6 +1955,9 @@ def main(args):
             ra_degradation_global_dim=args.ra_degradation_global_dim,
             ra_degradation_num_classes=len(WEATHER_CLASS_IDS),
             ra_spatial_enabled=bool(args.ra_spatial_enabled),
+            ra_spatial_gate_scale=args.ra_spatial_gate_scale,
+            ra_local_correction_enabled=bool(args.ra_local_correction_enabled),
+            ra_how_token_scale=args.ra_how_token_scale,
             ra_deformable_enabled=bool(args.ra_deformable_enabled),
             ra_deformable_kernel_size=args.ra_deformable_kernel_size,
             ra_deformable_max_offset=args.ra_deformable_max_offset,
@@ -1962,6 +1974,8 @@ def main(args):
         if args.ra_fusion_model_path:
             transformer.load_ra_fusion(args.ra_fusion_model_path)
             transformer.set_ra_fusion_scale(args.ra_fusion_scale)
+            transformer.set_ra_spatial_gate_scale(args.ra_spatial_gate_scale)
+            transformer.set_ra_how_token_scale(args.ra_how_token_scale)
             logger.info(f"[RA Fusion] 已加载权重: {args.ra_fusion_model_path}")
         else:
             logger.info("[RA Fusion] 已自动初始化 missing RA 参数并 zero-init 输出层")
@@ -2113,6 +2127,9 @@ def main(args):
             f"scale={transformer.ra_fusion_scale}, stabilize={bool(args.ra_fusion_stabilize)}, "
             f"degradation_aware={bool(args.ra_degradation_enabled)}, "
             f"spatial={bool(args.ra_spatial_enabled)}, "
+            f"spatial_gate_scale={args.ra_spatial_gate_scale}, "
+            f"local_correction={bool(args.ra_local_correction_enabled)}, "
+            f"how_token_scale={args.ra_how_token_scale}, "
             f"deformable={bool(args.ra_deformable_enabled)}, "
             f"可训练参数={sum(p.numel() for p in ra_fusion_layers):,}"
         )
@@ -2461,7 +2478,7 @@ def main(args):
     #  - freeze 权重, 不参与 optimizer
     #  - LPIPS 内部把 [0,1] 映射到 [-1,1], 这里与源项目保持一致:
     #    decode 后 clamp(-1, 1) 直接送入
-    #  - pred_x0 由 raw velocity 重建，不依赖 precondition_outputs
+                #  - pred_x0 由 raw velocity 直接重建
     # ============================================================
     lpips_model = None
     if args.lpips_weight > 0.0:
@@ -2518,6 +2535,8 @@ def main(args):
             if args.use_ra_fusion:
                 resumed_transformer = unwrap_model(transformer)
                 resumed_transformer.set_ra_fusion_scale(args.ra_fusion_scale)
+                resumed_transformer.set_ra_spatial_gate_scale(args.ra_spatial_gate_scale)
+                resumed_transformer.set_ra_how_token_scale(args.ra_how_token_scale)
                 resumed_transformer.validate_ra_fusion_parameters("Accelerate resume")
             invalid_optimizer_state = []
             for parameter_state in optimizer.state.values():
@@ -2686,6 +2705,10 @@ def main(args):
                 group = "severity_head"
             elif name.startswith("ra_spatial_head."):
                 group = "spatial_head"
+            elif name.startswith("ra_local_correction_head."):
+                group = "local_correction_head"
+            elif name.startswith("ra_how_projection."):
+                group = "how_projection"
             elif name.startswith("ra_deformable_tokenizer.offset_proj."):
                 group = "deform_offset"
             elif name.startswith("ra_deformable_tokenizer.weight_proj."):
@@ -2749,12 +2772,26 @@ def main(args):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=vae.dtype)
-                model_input = vae.encode(pixel_values).latent_dist.sample()
+                gt_posterior = vae.encode(pixel_values).latent_dist
+                model_input = gt_posterior.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
+                gt_restoration_latent = None
+                if args.ra_local_correction_loss_weight > 0.0:
+                    gt_restoration_latent = gt_posterior.mode()
+                    gt_restoration_latent = (
+                        gt_restoration_latent - vae.config.shift_factor
+                    ) * vae.config.scaling_factor
+                    gt_restoration_latent = gt_restoration_latent.to(dtype=weight_dtype)
                 check_source_tensors = global_step < 10
                 if check_source_tensors:
                     raise_if_nonfinite("GT latent", model_input, global_step + 1)
+                    if gt_restoration_latent is not None:
+                        raise_if_nonfinite(
+                            "GT restoration latent",
+                            gt_restoration_latent,
+                            global_step + 1,
+                        )
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -2871,6 +2908,7 @@ def main(args):
                 loss_weather = torch.tensor(0.0, device=model_pred.device)
                 loss_severity = torch.tensor(0.0, device=model_pred.device)
                 loss_spatial = torch.tensor(0.0, device=model_pred.device)
+                loss_local_correction = torch.tensor(0.0, device=model_pred.device)
                 loss_deg = torch.tensor(0.0, device=model_pred.device)
                 weather_accuracy = torch.tensor(0.0, device=model_pred.device)
                 severity_mae = torch.tensor(0.0, device=model_pred.device)
@@ -2879,6 +2917,9 @@ def main(args):
                 spatial_mae = torch.tensor(0.0, device=model_pred.device)
                 spatial_pred_mean = torch.tensor(0.0, device=model_pred.device)
                 spatial_gt_mean = torch.tensor(0.0, device=model_pred.device)
+                local_correction_mae = torch.tensor(0.0, device=model_pred.device)
+                local_correction_pred_rms = torch.tensor(0.0, device=model_pred.device)
+                local_correction_gt_rms = torch.tensor(0.0, device=model_pred.device)
                 weather_names = batch.get("weather")
                 severity_target = None
                 spatial_target = None
@@ -2962,6 +3003,49 @@ def main(args):
                     spatial_gt_mean = spatial_target.mean()
                     loss_deg = loss_deg + args.ra_spatial_loss_weight * loss_spatial
                     raise_if_nonfinite("RA spatial regression loss", loss_spatial, global_step + 1)
+
+                if args.ra_local_correction_loss_weight > 0.0:
+                    local_correction_prediction = (
+                        ra_diagnostics_model.get_last_ra_local_correction()
+                    )
+                    if local_correction_prediction is None:
+                        raise RuntimeError("RA How branch did not produce a local correction")
+                    if gt_restoration_latent is None:
+                        raise RuntimeError("GT restoration latent was not constructed")
+                    prediction_height, prediction_width = local_correction_prediction.shape[-2:]
+                    local_correction_target = build_local_correction_target(
+                        gt_restoration_latent,
+                        restoration_condition,
+                        spatial_size=(prediction_height, prediction_width),
+                    )
+                    if local_correction_prediction.shape != local_correction_target.shape:
+                        raise ValueError(
+                            "RA local correction target mismatch: "
+                            f"prediction={tuple(local_correction_prediction.shape)}, "
+                            f"target={tuple(local_correction_target.shape)}"
+                        )
+                    loss_local_correction = F.smooth_l1_loss(
+                        local_correction_prediction.float(),
+                        local_correction_target,
+                        beta=args.ra_aux_smooth_l1_beta,
+                    )
+                    local_correction_mae = F.l1_loss(
+                        local_correction_prediction.detach().float(),
+                        local_correction_target,
+                    )
+                    local_correction_pred_rms = (
+                        local_correction_prediction.detach().float().square().mean().sqrt()
+                    )
+                    local_correction_gt_rms = local_correction_target.square().mean().sqrt()
+                    loss_deg = (
+                        loss_deg
+                        + args.ra_local_correction_loss_weight * loss_local_correction
+                    )
+                    raise_if_nonfinite(
+                        "RA local correction loss",
+                        loss_local_correction,
+                        global_step + 1,
+                    )
 
                 loss = loss + loss_deg
 
@@ -3065,8 +3149,6 @@ def main(args):
                         logger.exception("[图像域损失] 非 OOM 异常，终止训练以避免静默失效")
                         raise
 
-                # Deprecated frequency loss remains disabled.
-                loss_freq = torch.tensor(0.0, device=model_pred.device)
                 loss_rest = loss - loss_deg
 
                 accelerator.backward(loss)
@@ -3215,6 +3297,17 @@ def main(args):
                 logs["ra/spatial_mae"] = spatial_mae.detach().item()
                 logs["ra/spatial_pred_mean"] = spatial_pred_mean.detach().item()
                 logs["ra/spatial_gt_mean"] = spatial_gt_mean.detach().item()
+            if args.ra_local_correction_loss_weight > 0.0:
+                logs["ra/loss_local_correction"] = loss_local_correction.detach().item()
+                logs["ra/loss_local_correction_weighted"] = (
+                    args.ra_local_correction_loss_weight
+                    * loss_local_correction.detach().item()
+                )
+                logs["ra/local_correction_mae"] = local_correction_mae.detach().item()
+                logs["ra/local_correction_pred_rms"] = (
+                    local_correction_pred_rms.detach().item()
+                )
+                logs["ra/local_correction_gt_rms"] = local_correction_gt_rms.detach().item()
             if args.latent_l1_weight > 0.0:
                 logs["loss_latent_l1"] = loss_l1.detach().item()
             if ra_diagnostics is not None:
@@ -3225,6 +3318,20 @@ def main(args):
                 for feature_name, feature_stats in ra_diagnostics["features"].items():
                     if feature_stats is not None:
                         logs[f"ra/{feature_name}_rms"] = feature_stats["rms"]
+                spatial_token_base_ratio = ra_diagnostics.get("spatial_token_base_ratio")
+                if spatial_token_base_ratio is not None:
+                    logs["ra/spatial_token_base_ratio"] = spatial_token_base_ratio
+                spatial_gate_stats = ra_diagnostics.get("spatial_gate")
+                spatial_gate_summary = ""
+                if spatial_gate_stats is not None:
+                    for key, value in spatial_gate_stats.items():
+                        logs[f"ra/spatial_gate_{key}"] = value
+                    spatial_gate_summary = (
+                        f", spatial_gate_mean={spatial_gate_stats['mean']:.3f}, "
+                        f"spatial_gate_std={spatial_gate_stats['std']:.3e}, "
+                        f"spatial_gate_range=[{spatial_gate_stats['min']:.3f}, "
+                        f"{spatial_gate_stats['max']:.3f}]"
+                    )
                 deformable_stats = ra_diagnostics.get("deformable")
                 deformable_summary = ""
                 if deformable_stats is not None:
@@ -3244,10 +3351,19 @@ def main(args):
                 for block_stats in ra_diagnostics["blocks"]:
                     index = block_stats["block"]
                     delta_rms = block_stats["delta"]["rms"]
+                    delta_before_gate_rms = block_stats["delta_before_spatial_gate"]["rms"]
                     main_rms = block_stats["main"]["rms"]
                     ratio = delta_rms / max(main_rms, 1e-8)
                     logs[f"ra/block_{index}_delta_rms"] = delta_rms
                     logs[f"ra/block_{index}_delta_main_ratio"] = ratio
+                    logs[f"ra/block_{index}_spatial_gate_rms_ratio"] = (
+                        delta_rms / max(delta_before_gate_rms, 1e-8)
+                    )
+                    how_stats = block_stats.get("how")
+                    if how_stats is not None:
+                        logs[f"ra/block_{index}_how_fused_rms_ratio"] = (
+                            how_stats["rms"] / max(block_stats["condition"]["rms"], 1e-8)
+                        )
                     summaries.append(f"b{index}:delta/main={ratio:.3e}")
                 if accelerator.is_main_process:
                     logger.info(
@@ -3256,6 +3372,7 @@ def main(args):
                         + ", ".join(summaries)
                         + f", output_rms={output_stats['rms']:.3e}, "
                         f"output_max={output_stats['abs_max']:.3e}"
+                        + spatial_gate_summary
                         + deformable_summary
                     )
                     auxiliary_losses = [f"deg={loss_deg.detach().item():.3e}"]
@@ -3270,6 +3387,11 @@ def main(args):
                     if args.ra_degradation_enabled and args.ra_spatial_loss_weight > 0.0:
                         auxiliary_losses.append(
                             f"spatial_w={args.ra_spatial_loss_weight * loss_spatial.detach().item():.3e}"
+                        )
+                    if args.ra_local_correction_loss_weight > 0.0:
+                        auxiliary_losses.append(
+                            "how_w="
+                            f"{args.ra_local_correction_loss_weight * loss_local_correction.detach().item():.3e}"
                         )
                     logger.info(
                         f"[RA losses][Step {global_step}] rest={loss_rest.detach().item():.3e}, "

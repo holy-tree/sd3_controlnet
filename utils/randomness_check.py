@@ -89,6 +89,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     parser.add_argument("--ra_fusion_scale", type=float, default=None)
+    parser.add_argument("--ra_spatial_gate_scale", type=float, default=None)
+    parser.add_argument("--ra_how_token_scale", type=float, default=None)
     parser.add_argument(
         "--use_prompt",
         action=argparse.BooleanOptionalAction,
@@ -158,11 +160,23 @@ def load_selection_manifest(manifest_path: str | Path) -> List[Dict]:
     return records
 
 
-def setup_pipeline(args_config: dict, dtype, device, ra_scale, use_ra_fusion: bool):
+def setup_pipeline(
+    args_config: dict,
+    dtype,
+    device,
+    ra_scale,
+    use_ra_fusion: bool,
+    spatial_gate_scale=None,
+    how_token_scale=None,
+):
     pipeline_config = dict(args_config)
     pipeline_config["use_ra_fusion"] = use_ra_fusion
     if ra_scale is not None:
         pipeline_config["ra_fusion_scale"] = ra_scale
+    if spatial_gate_scale is not None:
+        pipeline_config["ra_spatial_gate_scale"] = spatial_gate_scale
+    if how_token_scale is not None:
+        pipeline_config["ra_how_token_scale"] = how_token_scale
     return build_pipeline(pipeline_config, device, dtype)
 
 
@@ -568,6 +582,16 @@ def main() -> None:
         ra_fusion_scale = float(configured_ra_scale)
     else:
         ra_fusion_scale = None
+    ra_spatial_gate_scale = (
+        args.ra_spatial_gate_scale
+        if args.ra_spatial_gate_scale is not None
+        else args_config.get("ra_spatial_gate_scale")
+    )
+    ra_how_token_scale = (
+        args.ra_how_token_scale
+        if args.ra_how_token_scale is not None
+        else args_config.get("ra_how_token_scale")
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
@@ -624,12 +648,20 @@ def main() -> None:
         for index, record in enumerate(all_sample_records)
     ]
     pipeline = setup_pipeline(
-        args_config, dtype, device, ra_fusion_scale, use_ra_fusion
+        args_config,
+        dtype,
+        device,
+        ra_fusion_scale,
+        use_ra_fusion,
+        ra_spatial_gate_scale,
+        ra_how_token_scale,
     )
     if use_ra_fusion and type(pipeline.transformer).__name__ != "RAFusionSD3Transformer2DModel":
         raise RuntimeError("RA Fusion is enabled, but the transformer is not RA-aware")
     if use_ra_fusion:
         ra_fusion_scale = float(pipeline.transformer.ra_fusion_scale)
+        ra_spatial_gate_scale = float(pipeline.transformer.ra_spatial_gate_scale)
+        ra_how_token_scale = float(pipeline.transformer.ra_how_token_scale)
 
     preprocess = build_preprocess(resolution)
     first_lq = preprocess(Image.open(all_sample_records[0]["lq_path"]).convert("RGB"))
@@ -916,6 +948,8 @@ def main() -> None:
         "scheduler": type(pipeline.scheduler).__name__,
         "use_ra_fusion": use_ra_fusion,
         "ra_fusion_scale": ra_fusion_scale,
+        "ra_spatial_gate_scale": ra_spatial_gate_scale,
+        "ra_how_token_scale": ra_how_token_scale,
         "use_rss": use_rss,
         "rss_weight": args_config.get("rss_weight", 0.01),
         "rss_threshold": args_config.get("rss_threshold", 0.8),
@@ -974,6 +1008,8 @@ def main() -> None:
             "controlnet_conditioning_scale", 1.0
         )),
         "ra_fusion_scale": ra_fusion_scale,
+        "ra_spatial_gate_scale": ra_spatial_gate_scale,
+        "ra_how_token_scale": ra_how_token_scale,
         "load_transformer_lora": bool(args_config.get("load_transformer_lora", False)),
         "controlnet_vae_conditioning": "posterior_mode",
         "candidate_guidance_scales": candidate_guidance_scales,

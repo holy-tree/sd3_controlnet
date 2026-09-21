@@ -54,6 +54,13 @@ def main() -> None:
         str(generation.get("ra_fusion_scale", model.get("ra_fusion_scale", 1.0))),
         "--no-load_transformer_lora",
     ]
+    for key, flag in (
+        ("ra_spatial_gate_scale", "--ra_spatial_gate_scale"),
+        ("ra_how_token_scale", "--ra_how_token_scale"),
+    ):
+        value = generation.get(key, model.get(key))
+        if value is not None:
+            command.extend([flag, str(value)])
     optional = {
         "max_samples_per_weather": "--max_samples_per_weather",
         "strength": "--strength",

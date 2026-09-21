@@ -53,18 +53,72 @@ from dataloaders.paired_dataset import DEFAULT_WEATHER_PROMPTS
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.metrics import (
     fid as calc_fid,
-    lpips as calc_lpips_scalar,
-    psnr as calc_psnr_scalar,
-    ssim as calc_ssim_scalar,
     psnr_batch,
     ssim_batch,
     lpips_batch,
     _get_lpips_model,
+    niqe_batch,
+    musiq_batch,
+    maniqa_batch,
+    clipiqa_batch,
+    afine_nr_batch,
+    topiq_nr_batch,
+    topiq_iaa_batch,
+    nima_batch,
+    qalign_batch,
+    vq_r1_batch,
+    dists_batch,
+    available_iqa_metrics,
 )
 from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
 
 
 ORACLE_MODES = ("baseline", "low_frequency", "high_frequency", "affine")
+
+# IQA panel configuration (DP2O-SR §5.1 style). Each entry maps an internal
+# key to (callable, kwargs, lower_is_better). Order matches DP2O-SR Table 1
+# so reporting stays stable across runs.
+IQA_PANEL_SPEC = {
+    # Trained FR perceptual
+    "dists": (dists_batch, {}, True),
+    # Trained NR perceptual
+    "musiq": (musiq_batch, {"checkpoint": "spaq"}, False),
+    "maniqa": (maniqa_batch, {"checkpoint": "pipal"}, False),
+    "clipiqa": (clipiqa_batch, {"variant": "+"}, False),
+    "topiq_nr": (topiq_nr_batch, {"checkpoint": "spaq"}, False),
+    "afine_nr": (afine_nr_batch, {}, True),
+    "qalign": (qalign_batch, {}, False),
+    # Untrained NR perceptual
+    "vq_r1": (vq_r1_batch, {}, False),
+    "nima": (nima_batch, {"checkpoint": "ava"}, False),
+    "topiq_iaa": (topiq_iaa_batch, {}, False),
+    # Classical NR (kept for parity with WeatherDiffusion §IV-D)
+    "niqe": (niqe_batch, {}, True),
+}
+
+IQA_DIRECTION = {
+    "dists": "↓", "musiq": "↑", "maniqa": "↑", "clipiqa": "↑",
+    "topiq_nr": "↑", "afine_nr": "↓", "qalign": "↑",
+    "vq_r1": "↑", "nima": "↑", "topiq_iaa": "↑", "niqe": "↓",
+}
+
+
+def _resolve_iqa_keys(args_config: dict) -> List[str]:
+    """Compute the active IQA key list based on config flags."""
+    if not bool(args_config.get("enable_iqa_panel", True)):
+        return []
+    enabled = args_config.get("iqa_metrics")
+    if enabled is None or enabled == "all":
+        return list(IQA_PANEL_SPEC.keys())
+    if isinstance(enabled, str):
+        enabled = [token.strip() for token in enabled.split(",") if token.strip()]
+    unknown = [key for key in enabled if key not in IQA_PANEL_SPEC]
+    if unknown:
+        raise ValueError(
+            f"Unknown iqa_metrics entry: {unknown}. "
+            f"Available: {sorted(IQA_PANEL_SPEC.keys())}"
+        )
+    return list(enabled)
 ORACLE_LABELS = {
     "baseline": "Baseline",
     "low_frequency": "Low-frequency Oracle",
@@ -91,6 +145,18 @@ def parse_args():
         type=float,
         default=None,
         help="临时覆盖 RA 输出尺度，用于 0/0.01/0.1/1 消融，不修改 YAML.",
+    )
+    parser.add_argument(
+        "--ra_spatial_gate_scale",
+        type=float,
+        default=None,
+        help="临时覆盖 M 对 RA delta 的 centered spatial gate 强度，不修改 YAML.",
+    )
+    parser.add_argument(
+        "--ra_how_token_scale",
+        type=float,
+        default=None,
+        help="临时覆盖 M local-correction tokens 的 RA 注入强度，不修改 YAML.",
     )
     parser.add_argument(
         "--use_ra_fusion",
@@ -282,6 +348,18 @@ def build_pipeline(args_config: dict, device, dtype):
             if configured_scale is not None
             else float(ra_config.get("ra_fusion_scale", 1.0))
         )
+        configured_spatial_gate_scale = args_config.get("ra_spatial_gate_scale")
+        effective_spatial_gate_scale = (
+            float(configured_spatial_gate_scale)
+            if configured_spatial_gate_scale is not None
+            else float(ra_config.get("ra_spatial_gate_scale", 0.0))
+        )
+        configured_how_token_scale = args_config.get("ra_how_token_scale")
+        effective_how_token_scale = (
+            float(configured_how_token_scale)
+            if configured_how_token_scale is not None
+            else float(ra_config.get("ra_how_token_scale", 0.0))
+        )
         transformer = RAFusionSD3Transformer2DModel.from_pretrained(
             args_config["pretrained_model_name_or_path"],
             subfolder="transformer",
@@ -301,6 +379,11 @@ def build_pipeline(args_config: dict, device, dtype):
             ra_degradation_global_dim=int(ra_config.get("ra_degradation_global_dim", 128)),
             ra_degradation_num_classes=int(ra_config.get("ra_degradation_num_classes", 3)),
             ra_spatial_enabled=bool(ra_config.get("ra_spatial_enabled", False)),
+            ra_spatial_gate_scale=effective_spatial_gate_scale,
+            ra_local_correction_enabled=bool(
+                ra_config.get("ra_local_correction_enabled", False)
+            ),
+            ra_how_token_scale=effective_how_token_scale,
             ra_deformable_enabled=bool(ra_config.get("ra_deformable_enabled", False)),
             ra_deformable_kernel_size=int(ra_config.get("ra_deformable_kernel_size", 3)),
             ra_deformable_max_offset=float(ra_config.get("ra_deformable_max_offset", 1.0)),
@@ -309,6 +392,10 @@ def build_pipeline(args_config: dict, device, dtype):
         transformer.load_ra_fusion(ra_path)
         if configured_scale is not None:
             transformer.set_ra_fusion_scale(configured_scale)
+        if configured_spatial_gate_scale is not None:
+            transformer.set_ra_spatial_gate_scale(configured_spatial_gate_scale)
+        if configured_how_token_scale is not None:
+            transformer.set_ra_how_token_scale(configured_how_token_scale)
         if transformer.ra_degradation_enabled:
             spatial_enabled = not bool(args_config.get("ra_disable_spatial", False))
             transformer.set_ra_degradation_runtime(
@@ -322,6 +409,8 @@ def build_pipeline(args_config: dict, device, dtype):
             )
         print(f"[eval] 加载 RA Fusion: {ra_path}")
         print(f"[eval] RA Fusion scale: {transformer.ra_fusion_scale}")
+        print(f"[eval] RA spatial gate scale: {transformer.ra_spatial_gate_scale}")
+        print(f"[eval] RA how token scale: {transformer.ra_how_token_scale}")
         if transformer.ra_degradation_enabled:
             print(f"[eval] RA degradation runtime: {transformer.get_ra_degradation_runtime()}")
 
@@ -553,6 +642,15 @@ def evaluate(args_config: dict):
     elif args_config.get("mixed_precision") == "bf16":
         weight_dtype = torch.bfloat16
     print(f"[eval] device={device}, dtype={weight_dtype}")
+
+    # ===== IQA panel keys (DP2O-SR §5.1 style 14-metric set) =====
+    iqa_keys = _resolve_iqa_keys(args_config)
+    if iqa_keys:
+        print(
+            "[eval] IQA panel enabled ("
+            + ", ".join(f"{key}{IQA_DIRECTION[key]}" for key in iqa_keys)
+            + ")"
+        )
 
     # ===== 加载样本 =====
     samples = build_dataset_for_eval(args_config)
@@ -806,6 +904,18 @@ def evaluate(args_config: dict):
                     print(f"[warn] LPIPS batch 失败: {e}")
                     lpipses = [float("nan")] * B
 
+                iqa_batch_scores: Dict[str, List[float]] = {}
+                for key in iqa_keys:
+                    fn, kwargs, _ = IQA_PANEL_SPEC[key]
+                    try:
+                        if key == "dists":
+                            iqa_batch_scores[key] = fn(pred_batch, gt_batch, device=device, **kwargs)
+                        else:
+                            iqa_batch_scores[key] = fn(pred_batch, device=device, **kwargs)
+                    except Exception as exc:
+                        print(f"[warn] {key} batch 失败: {exc}")
+                        iqa_batch_scores[key] = [float("nan")] * B
+
                 if enable_oracle_analysis:
                     oracle_predictions = build_oracle_predictions(
                         pred_batch,
@@ -852,12 +962,13 @@ def evaluate(args_config: dict):
                             )
                     del oracle_predictions, oracle_batch_metrics
 
-                # ===== 5. 写指标 / 收集 FID / 保存 PNG =====
+# ===== 5. 写指标 / 收集 FID / 保存 PNG =====
                 for i in range(B):
                     sample_idx_global = batch_start + i
                     p, s, l = psnrs[i], ssims[i], lpipses[i]
+                    extras = {key: iqa_batch_scores[key][i] for key in iqa_batch_scores}
                     per_image_results[sub_name].append(
-                        (stems[i], p, s, l, infer_time_avg)
+                        (stems[i], p, s, l, infer_time_avg, extras)
                     )
 
                     if enable_fid:
@@ -889,12 +1000,22 @@ def evaluate(args_config: dict):
     pbar.close()
 
     # ===== 汇总每个 subdataset 的指标 =====
+    def _nan_mean(values: Sequence[float]) -> float:
+        finite = [v for v in values if isinstance(v, float) and v == v]
+        if not finite:
+            return float("nan")
+        return sum(finite) / len(finite)
+
     sub_metrics: Dict[str, Dict] = {}
     for sub_name, items in per_image_results.items():
         psnrs = [x[1] for x in items]
         ssims = [x[2] for x in items]
         lpipss = [x[3] for x in items if not (isinstance(x[3], float) and x[3] != x[3])]
         times = [x[4] for x in items]
+        extras_per_image = [x[5] for x in items]
+        aggregated: Dict[str, float] = {}
+        for key in iqa_keys:
+            aggregated[key] = _nan_mean([extras.get(key, float("nan")) for extras in extras_per_image])
         sub_metrics[sub_name] = {
             "weather": sub_to_weather[sub_name],
             "n": len(items),
@@ -902,6 +1023,7 @@ def evaluate(args_config: dict):
             "ssim": sum(ssims) / len(ssims) if ssims else 0.0,
             "lpips": sum(lpipss) / len(lpipss) if lpipss else float("nan"),
             "avg_time": sum(times) / len(times) if times else 0.0,
+            **aggregated,
         }
 
     # ===== 计算每个 subdataset / weather 的 FID =====
@@ -926,19 +1048,27 @@ def evaluate(args_config: dict):
         if not sub_list:
             continue
         all_p, all_s, all_l, all_t = [], [], [], []
+        all_extras: List[Dict[str, float]] = []
         for sub_name in sub_list:
-            for _, p, s, l, t in per_image_results[sub_name]:
+            for item in per_image_results[sub_name]:
+                _, p, s, l, t, extras = item
                 all_p.append(p)
                 all_s.append(s)
                 if not (isinstance(l, float) and l != l):
                     all_l.append(l)
                 all_t.append(t)
+                all_extras.append(extras)
+        aggregated_weather = {
+            key: _nan_mean([extras.get(key, float("nan")) for extras in all_extras])
+            for key in iqa_keys
+        }
         weather_metrics[weather] = {
             "n": len(all_p),
             "psnr": sum(all_p) / len(all_p) if all_p else 0.0,
             "ssim": sum(all_s) / len(all_s) if all_s else 0.0,
             "lpips": sum(all_l) / len(all_l) if all_l else float("nan"),
             "avg_time": sum(all_t) / len(all_t) if all_t else 0.0,
+            **aggregated_weather,
         }
 
     if enable_fid:
@@ -976,21 +1106,36 @@ def evaluate(args_config: dict):
     for sub_name, items in per_image_results.items():
         per_img_path = eval_root / sub_name / "per_image_metrics.txt"
         with open(per_img_path, "w", encoding="utf-8") as f:
+            header_cols = ["name", "PSNR", "SSIM", "LPIPS", "infer_time(s)"] + [
+                key for key in iqa_keys
+            ]
             f.write(f"# Per-image metrics for subdataset={sub_name}\n")
-            f.write("# name, PSNR, SSIM, LPIPS, infer_time(s)\n")
-            for stem, p, s, l, t in items:
-                f.write(f"{stem}, {p:.4f}, {s:.4f}, {l:.4f}, {t:.2f}\n")
+            f.write("# " + ", ".join(header_cols) + "\n")
+            for item in items:
+                stem, p, s, l, t, extras = item
+                line = (
+                    f"{stem}, {p:.4f}, {s:.4f}, {l:.4f}, {t:.2f}, "
+                    + ", ".join(
+                        f"{extras.get(key, float('nan')):.4f}" for key in iqa_keys
+                    )
+                )
+                f.write(line + "\n")
 
-    # ===== 写总 metrics.txt =====
+# ===== 写总 metrics.txt =====
     summary_path = eval_root / "metrics.txt"
     total_n = sum(m["n"] for m in weather_metrics.values())
     all_psnrs, all_ssims, all_lpipss = [], [], []
+    all_extras_by_key: Dict[str, List[float]] = {key: [] for key in iqa_keys}
     for items in per_image_results.values():
-        for _, p, s, l, _ in items:
+        for stem, p, s, l, _, extras in items:
             all_psnrs.append(p)
             all_ssims.append(s)
             if not (isinstance(l, float) and l != l):
                 all_lpipss.append(l)
+            for key in iqa_keys:
+                value = extras.get(key, float("nan"))
+                if isinstance(value, float) and value == value:
+                    all_extras_by_key[key].append(value)
 
     oracle_summaries = (
         aggregate_oracle_records(oracle_records, args_config["weather_types"])
@@ -1011,6 +1156,22 @@ def evaluate(args_config: dict):
                 f"{oracle_table}\n\n"
                 f"{ORACLE_INTERPRETATION}\n"
             )
+
+    ra_runtime = None
+    configured_spatial_gate_scale = 0.0
+    configured_how_token_scale = 0.0
+    effective_spatial_gate_scale = 0.0
+    effective_how_token_scale = 0.0
+    if isinstance(pipeline.transformer, RAFusionSD3Transformer2DModel):
+        configured_spatial_gate_scale = pipeline.transformer.ra_spatial_gate_scale
+        configured_how_token_scale = pipeline.transformer.ra_how_token_scale
+        spatial_runtime_enabled = pipeline.transformer.ra_spatial_enabled
+        if pipeline.transformer.ra_degradation_enabled:
+            ra_runtime = pipeline.transformer.get_ra_degradation_runtime()
+            spatial_runtime_enabled = ra_runtime["spatial"]
+        if spatial_runtime_enabled and pipeline.transformer.ra_fusion_scale > 0.0:
+            effective_spatial_gate_scale = configured_spatial_gate_scale
+            effective_how_token_scale = configured_how_token_scale
 
     def _fmt(v):
         return f"{v:.4f}" if v == v else "  N/A  "
@@ -1036,6 +1197,13 @@ def evaluate(args_config: dict):
         f.write(f"Guidance scale:   {args_config['guidance_scale']}\n")
         f.write(f"Strength:         {args_config.get('strength', 1.0)}\n")
         f.write(f"RA Fusion:        {args_config.get('use_ra_fusion', False)}\n")
+        if isinstance(pipeline.transformer, RAFusionSD3Transformer2DModel):
+            f.write(f"RA spatial gate:  {effective_spatial_gate_scale}\n")
+            f.write(f"RA how tokens:    {effective_how_token_scale}\n")
+            f.write(f"RA configured spatial gate: {configured_spatial_gate_scale}\n")
+            f.write(f"RA configured how tokens:   {configured_how_token_scale}\n")
+            if ra_runtime is not None:
+                f.write(f"RA runtime:       {ra_runtime}\n")
         f.write(f"RSS enabled:      {use_rss}\n")
         if use_rss:
             f.write(f"RSS weight:       {rss_weight}\n")
@@ -1050,50 +1218,95 @@ def evaluate(args_config: dict):
         f.write("\n" + "-" * 90 + "\n")
         f.write("Per-Subdataset Metrics:\n")
         f.write("-" * 90 + "\n")
-        f.write(f"{'Subdataset':<28} {'Weather':<8} {'N':>5} {'PSNR (dB)':>10} "
-                f"{'SSIM':>10} {'LPIPS':>10} {'FID':>10} {'AvgTime(s)':>12}\n")
+        header = (
+            f"{'Subdataset':<28} {'Weather':<8} {'N':>5} {'PSNR (dB)':>10} "
+            f"{'SSIM':>10} {'LPIPS':>10} {'FID':>10} {'AvgTime(s)':>12}"
+        )
+        for key in iqa_keys:
+            header += f" {key:>10}"
+        f.write(header + "\n")
         f.write("-" * 90 + "\n")
         for weather in args_config["weather_types"]:
             for sub_name in by_weather.get(weather, []):
                 m = sub_metrics[sub_name]
-                f.write(f"{sub_name:<28} {weather:<8} {m['n']:>5} {m['psnr']:>10.4f} "
-                        f"{m['ssim']:>10.4f} {_fmt(m['lpips']):>10} "
-                        f"{_fmt(m.get('fid', float('nan'))):>10} {m['avg_time']:>12.2f}\n")
+                line = (
+                    f"{sub_name:<28} {weather:<8} {m['n']:>5} {m['psnr']:>10.4f} "
+                    f"{m['ssim']:>10.4f} {_fmt(m['lpips']):>10} "
+                    f"{_fmt(m.get('fid', float('nan'))):>10} {m['avg_time']:>12.2f}"
+                )
+                for key in iqa_keys:
+                    line += f" {_fmt(m.get(key, float('nan'))):>10}"
+                f.write(line + "\n")
 
         f.write("\n" + "-" * 90 + "\n")
         f.write("Per-Weather Aggregated Metrics:\n")
         f.write("-" * 90 + "\n")
-        f.write(f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} "
-                f"{'LPIPS':>10} {'FID':>10} {'AvgTime(s)':>12}\n")
+        header = (
+            f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} "
+            f"{'LPIPS':>10} {'FID':>10} {'AvgTime(s)':>12}"
+        )
+        for key in iqa_keys:
+            header += f" {key:>10}"
+        f.write(header + "\n")
         f.write("-" * 90 + "\n")
         for weather in args_config["weather_types"]:
             if weather not in weather_metrics:
                 continue
             m = weather_metrics[weather]
-            f.write(f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
-                    f"{_fmt(m['lpips']):>10} {_fmt(m.get('fid', float('nan'))):>10} "
-                    f"{m['avg_time']:>12.2f}\n")
+            line = (
+                f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
+                f"{_fmt(m['lpips']):>10} {_fmt(m.get('fid', float('nan'))):>10} "
+                f"{m['avg_time']:>12.2f}"
+            )
+            for key in iqa_keys:
+                line += f" {_fmt(m.get(key, float('nan'))):>10}"
+            f.write(line + "\n")
 
         f.write("-" * 90 + "\n")
         avg_psnr = sum(all_psnrs) / len(all_psnrs) if all_psnrs else 0.0
         avg_ssim = sum(all_ssims) / len(all_ssims) if all_ssims else 0.0
         avg_lpips = sum(all_lpipss) / len(all_lpipss) if all_lpipss else float("nan")
-        f.write(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
-                f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10} {'-':>12}\n")
+        overall_iqa = {
+            key: (
+                sum(values) / len(values)
+                if values
+                else float("nan")
+            )
+            for key, values in all_extras_by_key.items()
+        }
+        line = (
+            f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
+            f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10} {'-':>12}"
+        )
+        for key in iqa_keys:
+            line += f" {_fmt(overall_iqa[key]):>10}"
+        f.write(line + "\n")
+        if iqa_keys:
+            f.write(
+                "\n"
+                "# IQA direction: " + ", ".join(
+                    f"{key}{IQA_DIRECTION[key]}" for key in iqa_keys
+                ) + "\n"
+            )
+            f.write(
+                "# IQA sources: pyiqa (MUSIQ, MANIQA, CLIP-IQA+, TOPIQ, AFINE, NIMA, "
+                "Q-Align, VQ-R1, DISTS, NIQE). Missing weights yield NaN.\n"
+            )
         f.write("=" * 90 + "\n")
         if enable_oracle_analysis:
             f.write(f"\n{oracle_table}\n\n{ORACLE_INTERPRETATION}\n")
 
     per_image_csv = eval_root / "per_image_metrics.csv"
+    fieldnames = [
+        "weather", "subdataset", "name",
+        "psnr", "ssim", "lpips", "infer_time",
+    ] + iqa_keys
     with open(per_image_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["weather", "subdataset", "name", "psnr", "ssim", "lpips", "infer_time"],
-        )
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for sub_name, items in per_image_results.items():
-            for stem, p, s, l, infer_time in items:
-                writer.writerow({
+            for stem, p, s, l, infer_time, extras in items:
+                row = {
                     "weather": sub_to_weather[sub_name],
                     "subdataset": sub_name,
                     "name": stem,
@@ -1101,7 +1314,10 @@ def evaluate(args_config: dict):
                     "ssim": s,
                     "lpips": l,
                     "infer_time": infer_time,
-                })
+                }
+                for key in iqa_keys:
+                    row[key] = extras.get(key, float("nan"))
+                writer.writerow(row)
 
     if enable_oracle_analysis:
         with open(eval_root / "oracle_per_image_metrics.csv", "w", newline="", encoding="utf-8") as f:
@@ -1130,6 +1346,11 @@ def evaluate(args_config: dict):
             "controlnet_model_path": args_config["controlnet_model_path"],
             "ra_fusion_path": args_config.get("ra_fusion_path"),
             "use_ra_fusion": bool(args_config.get("use_ra_fusion", False)),
+            "ra_spatial_gate_scale": effective_spatial_gate_scale,
+            "ra_how_token_scale": effective_how_token_scale,
+            "ra_configured_spatial_gate_scale": configured_spatial_gate_scale,
+            "ra_configured_how_token_scale": configured_how_token_scale,
+            "ra_degradation_runtime": ra_runtime,
         },
         "inference": {
             "resolution": args_config["resolution"],
@@ -1138,7 +1359,7 @@ def evaluate(args_config: dict):
             "strength": args_config.get("strength", 1.0),
             "seed": args_config.get("seed"),
         },
-        "per_subdataset": {
+"per_subdataset": {
             name: {key: _json_metric(value) if key not in ("weather", "n") else value
                    for key, value in metrics.items()}
             for name, metrics in sub_metrics.items()
@@ -1154,6 +1375,18 @@ def evaluate(args_config: dict):
             "ssim": _json_metric(avg_ssim),
             "lpips": _json_metric(avg_lpips),
             "fid": _json_metric(overall_fid),
+            **{key: _json_metric(overall_iqa[key]) for key in iqa_keys},
+        },
+        "iqa_panel": {
+            "enabled": bool(iqa_keys),
+            "metrics": list(iqa_keys),
+            "direction": {key: IQA_DIRECTION[key] for key in iqa_keys},
+            "backend": "pyiqa",
+            "notes": (
+                "Each metric relies on its pretrained checkpoint from pyiqa. "
+                "Missing weights produce NaN entries; metrics are independent "
+                "of the diffusion pipeline and run in a single batch forward."
+            ),
         },
         "oracle_analysis": {
             "enabled": enable_oracle_analysis,
@@ -1177,30 +1410,61 @@ def evaluate(args_config: dict):
     print("\n" + "=" * 90)
     print("Per-Subdataset Metrics:")
     print("-" * 90)
-    print(f"{'Subdataset':<28} {'Weather':<8} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} "
-          f"{'LPIPS':>10} {'FID':>10}")
+    header = (
+        f"{'Subdataset':<28} {'Weather':<8} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} "
+        f"{'LPIPS':>10} {'FID':>10}"
+    )
+    for key in iqa_keys:
+        header += f" {key:>10}"
+    print(header)
     print("-" * 90)
     for weather in args_config["weather_types"]:
         for sub_name in by_weather.get(weather, []):
             m = sub_metrics[sub_name]
-            print(f"{sub_name:<28} {weather:<8} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
-                  f"{_fmt(m['lpips']):>10} {_fmt(m.get('fid', float('nan'))):>10}")
+            line = (
+                f"{sub_name:<28} {weather:<8} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
+                f"{_fmt(m['lpips']):>10} {_fmt(m.get('fid', float('nan'))):>10}"
+            )
+            for key in iqa_keys:
+                line += f" {_fmt(m.get(key, float('nan'))):>10}"
+            print(line)
 
     print("\n" + "=" * 90)
     print("Per-Weather Aggregated Metrics:")
     print("-" * 90)
-    print(f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} {'LPIPS':>10} {'FID':>10}")
+    header = (
+        f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} "
+        f"{'LPIPS':>10} {'FID':>10}"
+    )
+    for key in iqa_keys:
+        header += f" {key:>10}"
+    print(header)
     print("-" * 90)
     for weather in args_config["weather_types"]:
         if weather not in weather_metrics:
             continue
         m = weather_metrics[weather]
-        print(f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
-              f"{_fmt(m['lpips']):>10} {_fmt(m.get('fid', float('nan'))):>10}")
+        line = (
+            f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
+            f"{_fmt(m['lpips']):>10} {_fmt(m.get('fid', float('nan'))):>10}"
+        )
+        for key in iqa_keys:
+            line += f" {_fmt(m.get(key, float('nan'))):>10}"
+        print(line)
     print("-" * 90)
-    print(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
-          f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10}")
+    line = (
+        f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
+        f"{_fmt(avg_lpips):>10} {_fmt(overall_fid):>10}"
+    )
+    for key in iqa_keys:
+        line += f" {_fmt(overall_iqa.get(key, float('nan'))):>10}"
+    print(line)
     print("=" * 90)
+    if iqa_keys:
+        print(
+            "# IQA direction: "
+            + ", ".join(f"{key}{IQA_DIRECTION[key]}" for key in iqa_keys)
+        )
     if enable_oracle_analysis:
         print(f"\n{oracle_table}\n\n{ORACLE_INTERPRETATION}")
     print(f"\n[eval] 评估完成, 结果保存到: {eval_root}")
@@ -1214,6 +1478,10 @@ if __name__ == "__main__":
         cfg["use_ra_fusion"] = True
     if args.ra_fusion_scale is not None:
         cfg["ra_fusion_scale"] = args.ra_fusion_scale
+    if args.ra_spatial_gate_scale is not None:
+        cfg["ra_spatial_gate_scale"] = args.ra_spatial_gate_scale
+    if args.ra_how_token_scale is not None:
+        cfg["ra_how_token_scale"] = args.ra_how_token_scale
     if args.controlnet_model_path is not None:
         cfg["controlnet_model_path"] = args.controlnet_model_path
     if args.ra_fusion_path is not None:

@@ -19,6 +19,10 @@ use_ra_fusion: true
 ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/ra_fusion"
 # 可覆盖 checkpoint 保存的 RA 输出尺度。排查色块时依次测试 0.0 / 0.01 / 0.1 / 1.0。
 ra_fusion_scale: 0.1
+# null 时使用 RA checkpoint 保存的 gate scale；旧 checkpoint 自动回退为 0.0。
+ra_spatial_gate_scale: null
+# null 时使用 checkpoint 保存的 How token scale；旧 checkpoint 自动回退为 0.0。
+ra_how_token_scale: null
 # 运行时消融开关，不改变 checkpoint；依次仅开启一个即可定位 g / M / deform 的贡献。
 ra_disable_global: false
 ra_disable_spatial: false
@@ -130,3 +134,14 @@ enable_fid: true
 # FID 内部 batch size (一次喂 InceptionV3 的图片数, 控制峰值显存)
 # 推荐: 32 (512x512 图约 1.5GB 峰值); OOM 时降到 8 或 4
 fid_batch_size: 32
+
+# ==================== DP2O-SR 风格 IQA panel ====================
+# 是否启用 NR/美学 IQA 扩展 (MUSIQ/MANIQA/CLIP-IQA+/TOPIQ/AFINE/NIMA/Q-Align/VQ-R1/DISTS/NIQE)
+# 依赖: pip install pyiqa
+# 权重会自动下载到 ~/.cache/torch/hub/ 或由 AFINE/CLIP-IQA+ 单独脚本提供
+enable_iqa_panel: true
+# 显式指定子集；留 "all" 走全套 (DP2O-SR §5.1)
+# 可选键: dists, musiq, maniqa, clipiqa, topiq_nr, afine_nr, qalign, vq_r1, nima, topiq_iaa, niqe
+iqa_metrics: "all"
+# IQA 推理 batch size (与 SD3 pipeline batch 解耦，独立 GPU 上限 4-8)
+iqa_batch_size: 4

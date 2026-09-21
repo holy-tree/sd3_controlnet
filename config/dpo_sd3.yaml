@@ -47,9 +47,6 @@ candidate_generation:
   use_ra_fusion: true
   ra_fusion_scale: 0.1
   use_prompt: true
-  # null uses paths in eval_config; set them here for one-off overrides.
-  controlnet_model_path: null
-  ra_fusion_path: null
 
 # ==================== 2. Preference filtering ====================
 preference_filter:

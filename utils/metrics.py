@@ -1,6 +1,6 @@
 """
-图像质量评估指标 (PSNR / SSIM / LPIPS / FID)
-=============================================
+图像质量评估指标 (PSNR / SSIM / LPIPS / FID / NR-IQA)
+======================================================
 
 迁移自 D:\\Projects\\pycharm\\controlnet_file\\ramseesr\\utils\\metrics.py.
 无任何模型依赖 (与 SD3 / SD2 / 任何框架解耦), 仅依赖 torch / torchvision / lpips / scipy.
@@ -10,12 +10,33 @@
     ssim(pred, target)  -> float (0~1, 越高越好)
     lpips(pred, target, net='alex')  -> float (越低越好)
     fid(pred_list, gt_list, batch_size=32)  -> float (越低越好)
+    niqe_batch(pred, device)               -> list[float] (越低越好)
+    musiq_batch(pred, device, ...)          -> list[float] (越高越好)
+    maniqa_batch(pred, device, ...)         -> list[float] (越高越好)
+    clipiqa_batch(pred, device, ...)        -> list[float] (越高越好, [0,1])
+    afine_nr_batch(pred, device, ...)       -> list[float] (越低越好)
+    topiq_nr_batch(pred, device, ...)       -> list[float] (越高越好)
+    qalign_batch(pred, device, ...)         -> list[float] (越高越好, 1~5)
+    topiq_iaa_batch(pred, device, ...)      -> list[float] (越高越好)
+    nima_batch(pred, device, ...)          -> list[float] (越高越好, 1~10)
+    vq_r1_batch(pred, device, ...)          -> list[float] (越高越好)
 
 输入约定:
     所有指标函数接受 [3, H, W] 或 [B, 3, H, W] 形状的 torch.Tensor, 范围 [0, 1].
+
+设计参考:
+    DP2O-SR (Wu et al., NeurIPS 2025, arXiv:2510.18851) 将 IQA 指标分为四类:
+    (1) Trained FR: LPIPS, TOPIQ-FR, AFINE-FR
+    (2) Trained NR: MANIQA, MUSIQ, CLIPIQA+, TOPIQ-NR, AFINE-NR, Q-Align
+    (3) Untrained NR perceptual: VQ-R1, NIMA, TOPIQ-IAA
+    (4) Untrained FR fidelity: PSNR, SSIM
+    本模块实现的 NR 集合与 DP2O-SR §5.1 一致.
 """
 
+import importlib
+import importlib.util
 import warnings
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -89,17 +110,6 @@ def ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> flo
     return ssim_map.mean().item()
 
 
-def evaluate_batch(pred_list, gt_list):
-    """对一组 (pred, gt) 对计算平均 PSNR / SSIM."""
-    psnrs, ssims = [], []
-    for p, g in zip(pred_list, gt_list):
-        psnrs.append(psnr(p, g))
-        ssims.append(ssim(p, g))
-    if not psnrs:
-        return 0.0, 0.0
-    return sum(psnrs) / len(psnrs), sum(ssims) / len(ssims)
-
-
 # ============================================================
 # LPIPS (Learned Perceptual Image Patch Similarity)
 # ============================================================
@@ -123,28 +133,6 @@ def _get_lpips_model(net: str = "alex", device=None):
         _LPIPS_MODEL = _LPIPS_MODEL.to(device)
         _LPIPS_DEVICE = device
     return _LPIPS_MODEL
-
-
-def lpips(pred: torch.Tensor, target: torch.Tensor, net: str = "alex") -> float:
-    """
-    计算 LPIPS (越小越好, 0 表示完全相同).
-    pred / target: [B, 3, H, W] 或 [3, H, W], 范围 [0, 1]
-
-    依赖: pip install lpips
-    第一次调用会下载预训练权重到 ~/.cache/torch/hub/checkpoints/
-    """
-    pred = _to_4d(pred).detach().float()
-    target = _to_4d(target).detach().float()
-
-    model = _get_lpips_model(net, device=pred.device)
-
-    # LPIPS 内部把 [0,1] 映射到 [-1,1]
-    pred = pred * 2.0 - 1.0
-    target = target * 2.0 - 1.0
-
-    with torch.no_grad():
-        d = model(pred, target)
-    return d.mean().item()
 
 
 # ============================================================
@@ -291,3 +279,216 @@ def lpips_batch(lpips_model, pred_batch: torch.Tensor, target_batch: torch.Tenso
         d = lpips_model(cand_norm, target_norm)
     d_list = d.flatten().cpu().tolist() if d.ndim > 1 else [float(d.item())] * len(pred_batch)
     return [float(s) for s in d_list]
+
+
+# ============================================================
+# No-Reference / Aesthetic IQA helpers (DP2O-SR §5.1)
+# ============================================================
+# We use pyiqa for most NR metrics (MUSIQ, MANIQA, CLIP-IQA+, TOPIQ,
+# AFINE, NIMA, Q-Align, DISTS). Each helper lazily initialises the
+# metric on first call and reuses the cached instance, similar to the
+# LPIPS / Inception cache above. If pyiqa is unavailable or the metric
+# fails, the helper returns a list of NaNs so callers can safely report
+# the metric as missing without aborting the evaluation loop.
+#
+# Direction convention:
+#   lower_is_better=True  → NIQE, AFINE-NR, AFINE-FR
+#   lower_is_better=False → MUSIQ, MANIQA, CLIP-IQA+, TOPIQ-NR,
+#                           Q-Align, VQ-R1, NIMA, TOPIQ-IAA
+# All returned lists have length N == len(pred_batch).
+_IQA_CACHE: dict[str, "object"] = {}
+
+
+def _ensure_4d(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim == 3:
+        return x.unsqueeze(0)
+    if x.ndim != 4:
+        raise ValueError(f"Expected 3D or 4D tensor, got shape {tuple(x.shape)}")
+    return x
+
+
+def _resolve_device(device) -> str:
+    if device is None:
+        return "cpu"
+    if isinstance(device, str):
+        return device
+    if isinstance(device, torch.device):
+        return str(device)
+    return str(device)
+
+
+def _pyiqa_available() -> bool:
+    return importlib.util.find_spec("pyiqa") is not None
+
+
+def _load_pyiqa_metric(name: str):
+    """Load and cache a pyiqa metric. Returns None when pyiqa is unavailable."""
+    if not _pyiqa_available():
+        return None
+    if name in _IQA_CACHE:
+        metric = _IQA_CACHE[name]
+        if metric is not None:
+            return metric
+    try:
+        pyiqa = importlib.import_module("pyiqa")
+        metric = pyiqa.create_metric(name, require_corresponding_input=False)
+    except Exception as e:  # pragma: no cover - import depends on user env
+        warnings.warn(f"[metrics] Failed to load pyiqa metric {name}: {e}")
+        _IQA_CACHE[name] = None
+        return None
+    _IQA_CACHE[name] = metric
+    return metric
+
+
+def _move_pyiqa_to(metric, device) -> None:
+    if metric is None:
+        return
+    target = _resolve_device(device)
+    try:
+        current = next(metric.parameters()).device
+    except StopIteration:
+        return
+    if str(current) != target:
+        try:
+            metric.to(target)
+        except Exception as e:  # pragma: no cover
+            warnings.warn(f"[metrics] Failed to move pyiqa metric to {target}: {e}")
+
+
+def _run_pyiqa_metric(name: str, pred_batch: torch.Tensor, device) -> list:
+    """Run a pyiqa NR metric on pred_batch [N,3,H,W] in [0,1]."""
+    metric = _load_pyiqa_metric(name)
+    if metric is None:
+        return [float("nan")] * len(pred_batch)
+    _move_pyiqa_to(metric, device)
+    target_device = _resolve_device(device)
+    pred_4d = _ensure_4d(pred_batch).clamp(min=0.0, max=1.0).to(target_device)
+    with torch.no_grad():
+        try:
+            scores = metric(pred_4d)
+        except Exception as e:  # pragma: no cover
+            warnings.warn(f"[metrics] pyiqa {name} forward failed: {e}")
+            return [float("nan")] * len(pred_batch)
+    if isinstance(scores, (tuple, list)):
+        scores = scores[0]
+    scores = scores.detach().cpu().flatten()
+    if scores.numel() == 1:
+        return [float(scores.item())] * len(pred_batch)
+    return [float(x) for x in scores.tolist()]
+
+
+def niqe_batch(pred_batch: torch.Tensor, device=None) -> List[float]:
+    """NIQE: lower is better. Hand-crafted NSS, CPU friendly."""
+    if not _pyiqa_available():
+        warnings.warn("[metrics] pyiqa not installed; niqe_batch returns NaNs.")
+        return [float("nan")] * len(pred_batch)
+    return _run_pyiqa_metric("niqe", pred_batch, device)
+
+
+def musiq_batch(
+    pred_batch: torch.Tensor,
+    device=None,
+    checkpoint: str = "spaq",
+) -> List[float]:
+    """MUSIQ: higher is better. checkpoint ∈ {spaq, koniq, paq2piq, ava}."""
+    metric_name = f"musiq-{checkpoint}" if checkpoint else "musiq"
+    return _run_pyiqa_metric(metric_name, pred_batch, device)
+
+
+def maniqa_batch(
+    pred_batch: torch.Tensor,
+    device=None,
+    checkpoint: str = "pipal",
+) -> List[float]:
+    """MANIQA: higher is better. checkpoint ∈ {pipal, kadid, koniq}."""
+    metric_name = f"maniqa-{checkpoint}" if checkpoint else "maniqa"
+    return _run_pyiqa_metric(metric_name, pred_batch, device)
+
+
+def clipiqa_batch(
+    pred_batch: torch.Tensor,
+    device=None,
+    variant: str = "+",
+) -> List[float]:
+    """CLIP-IQA: higher is better. variant ∈ {"", "+"}."""
+    metric_name = "clipiqa" if variant in ("", "base") else "clipiqa+"
+    return _run_pyiqa_metric(metric_name, pred_batch, device)
+
+
+def afine_nr_batch(pred_batch: torch.Tensor, device=None) -> List[float]:
+    """AFINE (NR head): lower is better."""
+    return _run_pyiqa_metric("afine", pred_batch, device)
+
+
+def topiq_nr_batch(
+    pred_batch: torch.Tensor,
+    device=None,
+    checkpoint: str = "spaq",
+) -> List[float]:
+    """TOPIQ-NR: higher is better. checkpoint ∈ {koniq, spaq, flive}."""
+    metric_name = f"topiq_nr-{checkpoint}" if checkpoint else "topiq_nr"
+    return _run_pyiqa_metric(metric_name, pred_batch, device)
+
+
+def topiq_iaa_batch(pred_batch: torch.Tensor, device=None) -> List[float]:
+    """TOPIQ-IAA (image aesthetics assessment): higher is better."""
+    return _run_pyiqa_metric("topiq_iaa", pred_batch, device)
+
+
+def nima_batch(
+    pred_batch: torch.Tensor,
+    device=None,
+    checkpoint: str = "ava",
+) -> List[float]:
+    """NIMA aesthetic score: higher is better, roughly 1–10."""
+    metric_name = f"nima-{checkpoint}" if checkpoint else "nima"
+    return _run_pyiqa_metric(metric_name, pred_batch, device)
+
+
+def qalign_batch(pred_batch: torch.Tensor, device=None) -> List[float]:
+    """Q-Align quality head: higher is better, range 1–5."""
+    return _run_pyiqa_metric("qalign", pred_batch, device)
+
+
+def vq_r1_batch(pred_batch: torch.Tensor, device=None) -> List[float]:
+    """VQ-R1 (image quality reward, CLIP-based, arXiv 2502.13556): higher is better."""
+    return _run_pyiqa_metric("vq_r1", pred_batch, device)
+
+
+def dists_batch(pred_batch: torch.Tensor, target_batch: torch.Tensor,
+                device=None) -> List[float]:
+    """DISTS (FR perceptual): lower is better."""
+    if not _pyiqa_available():
+        return [float("nan")] * len(pred_batch)
+    metric = _load_pyiqa_metric("dists")
+    if metric is None:
+        return [float("nan")] * len(pred_batch)
+    _move_pyiqa_to(metric, device)
+    target_device = _resolve_device(device)
+    pred = _ensure_4d(pred_batch).clamp(min=0.0, max=1.0).to(target_device)
+    target = _ensure_4d(target_batch).clamp(min=0.0, max=1.0).to(target_device)
+    with torch.no_grad():
+        scores = metric(pred, target)
+    if isinstance(scores, (tuple, list)):
+        scores = scores[0]
+    scores = scores.detach().cpu().flatten()
+    if scores.numel() == 1:
+        return [float(scores.item())] * len(pred_batch)
+    return [float(x) for x in scores.tolist()]
+
+
+def available_iqa_metrics() -> List[str]:
+    """Return the list of NR/FR IQA helpers that can be called safely."""
+    return [
+        "niqe",
+        "musiq",
+        "maniqa",
+        "clipiqa",
+        "afine_nr",
+        "topiq_nr",
+        "topiq_iaa",
+        "nima",
+        "qalign",
+        "vq_r1",
+        "dists",
+    ]

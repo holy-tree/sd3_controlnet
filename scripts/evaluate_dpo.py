@@ -87,6 +87,9 @@ def main() -> None:
     eval_config["ra_fusion_scale"] = dpo_config["model"].get(
         "ra_fusion_scale", eval_config.get("ra_fusion_scale")
     )
+    for scale_name in ("ra_spatial_gate_scale", "ra_how_token_scale"):
+        if scale_name in dpo_config["model"]:
+            eval_config[scale_name] = dpo_config["model"][scale_name]
     eval_config["use_ra_fusion"] = True
     eval_config["load_transformer_lora"] = False
     eval_config["deterministic_controlnet_vae"] = True
