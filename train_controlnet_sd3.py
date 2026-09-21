@@ -1267,11 +1267,17 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-    if not torch.isfinite(pixel_values).all() or pixel_values.abs().max() > 1.5:
-        import sys
+    import sys
+    finite_pv = bool(torch.isfinite(pixel_values).all().item())
+    max_pv = pixel_values.max().item() if finite_pv else float('nan')
+    min_pv = pixel_values.min().item() if finite_pv else float('nan')
+    print(f"[collate/UNCOND] pixel_values shape={tuple(pixel_values.shape)} "
+          f"dtype={pixel_values.dtype} device={pixel_values.device} "
+          f"min={min_pv:.4e} max={max_pv:.4e} finite={finite_pv}", file=sys.stderr)
+    if not finite_pv or max_pv > 1.5:
         print(f"[collate] BAD pixel_values: shape={tuple(pixel_values.shape)} "
-              f"min={pixel_values.min().item():.4e} max={pixel_values.max().item():.4e} "
-              f"finite={bool(torch.isfinite(pixel_values).all().item())}", file=sys.stderr)
+              f"min={min_pv:.4e} max={max_pv:.4e} "
+              f"finite={finite_pv}", file=sys.stderr)
         for i, ex in enumerate(examples):
             t = ex["pixel_values"]
             print(f"  ex[{i}] path={ex.get('gt_path','?')} "
