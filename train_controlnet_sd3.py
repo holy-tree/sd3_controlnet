@@ -18,7 +18,6 @@ import argparse
 import contextlib
 import copy
 import functools
-import gc
 import logging
 import math
 import os
@@ -61,9 +60,9 @@ from diffusers import (
 )
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3, free_memory
-from diffusers.utils import check_min_version, is_wandb_available, make_image_grid
+from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
-from diffusers.utils.torch_utils import backend_empty_cache, is_compiled_module
+from diffusers.utils.torch_utils import is_compiled_module
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.training_losses import (
     build_local_correction_target,
@@ -73,7 +72,7 @@ from utils.training_losses import (
     select_image_loss_inputs,
     weighted_spatial_smooth_l1,
 )
-from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
+from utils.restoration_condition import encode_restoration_condition
 
 try:
     from peft import LoraConfig
@@ -81,9 +80,6 @@ try:
 except ImportError:
     _PEFT_AVAILABLE = False
 
-
-if is_wandb_available():
-    import wandb
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 # 注: 源脚本要求 0.40.0.dev0 (HF 官方示例版本). 由于 diffusers 0.40+ 尚未发布 stable,
@@ -166,166 +162,6 @@ def prepare_image_conditioned_latents(pipeline, images, strength, num_inference_
     return latents, raw_sigmas.tolist()
 
 
-def log_validation(controlnet, transformer, args, accelerator, weight_dtype, step, is_final_validation=False):
-    logger.info("Running validation... ")
-
-    if not is_final_validation:
-        controlnet = accelerator.unwrap_model(controlnet)
-        transformer = accelerator.unwrap_model(transformer)
-    else:
-        controlnet = SD3ControlNetModel.from_pretrained(args.output_dir, torch_dtype=weight_dtype)
-        transformer = accelerator.unwrap_model(transformer)
-
-    pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        controlnet=None,
-        safety_checker=None,
-        transformer=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(torch.device(accelerator.device))
-    pipeline.set_progress_bar_config(disable=True)
-
-    if args.seed is None:
-        generator = None
-    else:
-        generator = torch.manual_seed(args.seed)
-
-    if len(args.validation_image) == len(args.validation_prompt):
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
-        validation_images = args.validation_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
-    else:
-        raise ValueError(
-            "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
-        )
-
-    with torch.no_grad():
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-            pooled_prompt_embeds,
-            negative_pooled_prompt_embeds,
-        ) = pipeline.encode_prompt(
-            validation_prompts,
-            prompt_2=None,
-            prompt_3=None,
-        )
-
-    del pipeline
-    gc.collect()
-    backend_empty_cache(accelerator.device.type)
-
-    pipeline = StableDiffusion3ControlNetPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
-        controlnet=controlnet,
-        transformer=transformer,
-        safety_checker=None,
-        text_encoder=None,
-        text_encoder_2=None,
-        text_encoder_3=None,
-        revision=args.revision,
-        variant=args.variant,
-        torch_dtype=weight_dtype,
-    )
-    pipeline = pipeline.to(accelerator.device)
-    pipeline.set_progress_bar_config(disable=True)
-
-    image_logs = []
-    inference_ctx = contextlib.nullcontext() if is_final_validation else torch.autocast(accelerator.device.type)
-
-    for i, validation_image in enumerate(validation_images):
-        validation_image = Image.open(validation_image).convert("RGB")
-        validation_prompt = validation_prompts[i]
-        restoration_condition = None
-        if getattr(args, "use_ra_fusion", 0):
-            restoration_condition = encode_rss_condition(
-                pipeline,
-                [validation_image],
-                height=args.resolution,
-                width=args.resolution,
-                device=accelerator.device,
-                dtype=weight_dtype,
-            )
-
-        images = []
-
-        for _ in range(args.num_validation_images):
-            ra_context = (
-                pipeline.transformer.restoration_condition_context(restoration_condition)
-                if getattr(args, "use_ra_fusion", 0)
-                else contextlib.nullcontext()
-            )
-            with ra_context, inference_ctx:
-                image = pipeline(
-                    prompt_embeds=prompt_embeds[i].unsqueeze(0),
-                    negative_prompt_embeds=negative_prompt_embeds[i].unsqueeze(0),
-                    pooled_prompt_embeds=pooled_prompt_embeds[i].unsqueeze(0),
-                    negative_pooled_prompt_embeds=negative_pooled_prompt_embeds[i].unsqueeze(0),
-                    control_image=validation_image,
-                    num_inference_steps=20,
-                    generator=generator,
-                ).images[0]
-
-            images.append(image)
-
-        image_logs.append(
-            {"validation_image": validation_image, "images": images, "validation_prompt": validation_prompt}
-        )
-
-    tracker_key = "test" if is_final_validation else "validation"
-    for tracker in accelerator.trackers:
-        if tracker.name == "tensorboard":
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                tracker.writer.add_image(
-                    "Controlnet conditioning", np.asarray([validation_image]), step, dataformats="NHWC"
-                )
-
-                formatted_images = []
-                for image in images:
-                    formatted_images.append(np.asarray(image))
-
-                formatted_images = np.stack(formatted_images)
-
-                tracker.writer.add_images(validation_prompt, formatted_images, step, dataformats="NHWC")
-        elif tracker.name == "wandb":
-            formatted_images = []
-
-            for log in image_logs:
-                images = log["images"]
-                validation_prompt = log["validation_prompt"]
-                validation_image = log["validation_image"]
-
-                formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
-
-                for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
-
-            tracker.log({tracker_key: formatted_images})
-        else:
-            logger.warning(f"image logging not implemented for {tracker.name}")
-
-    del pipeline
-    free_memory()
-
-    if not is_final_validation:
-        controlnet.to(accelerator.device)
-
-    return image_logs
-
-
 # Copied from dreambooth sd3 example
 def load_text_encoders(class_one, class_two, class_three):
     # T5-XXL (text_encoder_3) in fp32 = ~10GB RAM, 在 RAM 吃紧的环境会被 OOM kill
@@ -368,15 +204,6 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
 
     logger.info(f"[Step {step}] 开始 PSNR/SSIM 验证 ...")
 
-    use_rss = bool(getattr(args, "validation_use_rss", 0))
-    rss_weight = float(getattr(args, "validation_rss_weight", 0.01))
-    rss_threshold = float(getattr(args, "validation_rss_threshold", 0.8))
-    if use_rss:
-        validate_rss_config(rss_weight, rss_threshold)
-        logger.info(
-            f"[Step {step}] RSS 已启用: weight={rss_weight}, "
-            f"threshold={rss_threshold}, sigma=post-step effective sigma"
-        )
     if getattr(args, "use_ra_fusion", 0):
         ra_model = accelerator.unwrap_model(transformer)
         logger.info(
@@ -481,8 +308,8 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 generator=generator,
             )
             restoration_condition = None
-            if use_rss or getattr(args, "use_ra_fusion", 0):
-                restoration_condition = encode_rss_condition(
+            if getattr(args, "use_ra_fusion", 0):
+                restoration_condition = encode_restoration_condition(
                     pipeline,
                     [lq_pil],
                     height=args.resolution,
@@ -490,14 +317,7 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                     device=accelerator.device,
                     dtype=weight_dtype,
                 )
-            if use_rss:
-                pipeline_kwargs["callback_on_step_end"] = make_rss_callback(
-                    restoration_condition,
-                    weight=rss_weight,
-                    threshold=rss_threshold,
-                )
-                pipeline_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
-            if getattr(args, "validation_use_image", 1) and getattr(args, "validation_strength", 1.0) < 1.0:
+            if getattr(args, "validation_strength", 1.0) < 1.0:
                 latents, custom_sigmas = prepare_image_conditioned_latents(
                     pipeline, [lq_pil], args.validation_strength,
                     args.validation_inference_steps, accelerator.device, weight_dtype,
@@ -553,10 +373,6 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
             ra_model = accelerator.unwrap_model(transformer)
             f.write(f"RA Fusion scale: {ra_model.ra_fusion_scale}\n")
             f.write(f"RA Fusion stabilize: {ra_model.config.ra_fusion_stabilize}\n")
-        f.write(f"RSS enabled: {use_rss}\n")
-        if use_rss:
-            f.write(f"RSS weight: {rss_weight}\n")
-            f.write(f"RSS threshold: {rss_threshold}\n")
         f.write("\n")
         f.write("Per-weather metrics:\n")
         for weather, m in weather_metrics.items():
@@ -602,27 +418,12 @@ def import_model_class_from_model_name_or_path(
         raise ValueError(f"{model_class} is not supported.")
 
 
-def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
-    img_str = ""
-    if image_logs is not None:
-        img_str = "You can find some example images below.\n\n"
-        for i, log in enumerate(image_logs):
-            images = log["images"]
-            validation_prompt = log["validation_prompt"]
-            validation_image = log["validation_image"]
-            validation_image.save(os.path.join(repo_folder, "image_control.png"))
-            img_str += f"prompt: {validation_prompt}\n"
-            images = [validation_image] + images
-            make_image_grid(images, 1, len(images)).save(os.path.join(repo_folder, f"images_{i}.png"))
-            img_str += f"![images_{i})](./images_{i}.png)\n"
-
+def save_model_card(repo_id: str, base_model=str, repo_folder=None):
     model_description = f"""
 # SD3 controlnet-{repo_id}
 
 These are controlnet weights trained on {base_model} with new type of conditioning.
 The weights were trained using [ControlNet](https://github.com/lllyasviel/ControlNet) with the [SD3 diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/controlnet/README_sd3.md).
-{img_str}
-
 Please adhere to the licensing terms as described `[here](https://huggingface.co/stabilityai/stable-diffusion-3-medium/blob/main/LICENSE)`.
 """
     model_card = load_or_create_model_card(
@@ -1070,14 +871,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--run_validation",
         action="store_true",
-        help="(默认 False) 是否在训练过程中定期计算 PSNR/SSIM. "
-             "与现有 --validation_prompt 图片验证并行存在, 各跑各的.",
+        help="(默认 False) 是否在训练过程中定期计算 PSNR/SSIM.",
     )
     parser.add_argument(
         "--run_validation_steps",
         type=int,
         default=2000,
-        help="每 N step 跑一次 PSNR/SSIM 验证 (0 = 禁用 step-based 验证, 仅保留图片验证). "
+        help="每 N step 跑一次 PSNR/SSIM 验证 (0 = 禁用). "
              "推荐: 2000 (大训练) / 500 (小训练).",
     )
     parser.add_argument(
@@ -1113,45 +913,6 @@ def parse_args(input_args=None):
     )
     parser.add_argument(
         "--dataset_preprocess_batch_size", type=int, default=1000, help="Batch size for preprocessing dataset."
-    )
-    parser.add_argument(
-        "--validation_prompt",
-        type=str,
-        default=None,
-        nargs="+",
-        help=(
-            "A set of prompts evaluated every `--validation_steps` and logged to `--report_to`."
-            " Provide either a matching number of `--validation_image`s, a single `--validation_image`"
-            " to be used with all prompts, or a single prompt that will be used with all `--validation_image`s."
-        ),
-    )
-    parser.add_argument(
-        "--validation_image",
-        type=str,
-        default=None,
-        nargs="+",
-        help=(
-            "A set of paths to the controlnet conditioning image be evaluated every `--validation_steps`"
-            " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
-            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
-            " `--validation_image` that will be used with all `--validation_prompt`s."
-        ),
-    )
-    parser.add_argument(
-        "--num_validation_images",
-        type=int,
-        default=4,
-        help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
-    )
-    parser.add_argument(
-        "--validation_steps",
-        type=int,
-        default=100,
-        help=(
-            "Run validation every X steps. Validation consists of running the prompt"
-            " `args.validation_prompt` multiple times: `args.num_validation_images`"
-            " and logging the images."
-        ),
     )
     parser.add_argument(
         "--tracker_project_name",
@@ -1243,31 +1004,6 @@ def parse_args(input_args=None):
         help="按 step 验证的 img2img 起始强度 (1.0=纯噪声, 0.0=无噪声). "
              "若 ControlNet 已训练稳定, 0.3~0.5 可显著提高 PSNR/纹理一致性",
     )
-    parser.add_argument(
-        "--validation_use_image",
-        type=int,
-        default=1,
-        help="按 step 验证是否使用 image-conditioned init (1=启用, 0=关闭)",
-    )
-    parser.add_argument(
-        "--validation_use_rss",
-        type=int,
-        default=0,
-        help="按 step 验证是否启用 Restoration Sampling Strategy (1=启用, 0=关闭)",
-    )
-    parser.add_argument(
-        "--validation_rss_weight",
-        type=float,
-        default=0.01,
-        help="按 step 验证的 RSS 引导权重.",
-    )
-    parser.add_argument(
-        "--validation_rss_threshold",
-        type=float,
-        default=0.8,
-        help="按 step 验证的 RSS sigma 阈值, 范围 [0, 1).",
-    )
-
     raw_args = list(input_args) if input_args is not None else sys.argv[1:]
     args = parser.parse_args(input_args)
     args._explicit_cli_args = {
@@ -1284,24 +1020,6 @@ def parse_args(input_args=None):
 
     if args.proportion_empty_prompts < 0 or args.proportion_empty_prompts > 1:
         raise ValueError("`--proportion_empty_prompts` must be in the range [0, 1].")
-
-    if args.validation_prompt is not None and args.validation_image is None:
-        raise ValueError("`--validation_image` must be set if `--validation_prompt` is set")
-
-    if args.validation_prompt is None and args.validation_image is not None:
-        raise ValueError("`--validation_prompt` must be set if `--validation_image` is set")
-
-    if (
-        args.validation_image is not None
-        and args.validation_prompt is not None
-        and len(args.validation_image) != 1
-        and len(args.validation_prompt) != 1
-        and len(args.validation_image) != len(args.validation_prompt)
-    ):
-        raise ValueError(
-            "Must provide either 1 `--validation_image`, 1 `--validation_prompt`,"
-            " or the same number of `--validation_prompt`s and `--validation_image`s"
-        )
 
     if args.resolution % 8 != 0:
         raise ValueError(
@@ -2310,27 +2028,16 @@ def main(args):
             args, accelerator,
         )
 
-    # ========== 验证开关状态打印 (便于排查 "为什么我以为启用了验证但实际没跑") ==========
-    if args.validation_prompt is not None:
-        logger.info(
-            f"[验证] 上半段 log_validation 已启用: 每 {args.validation_steps} step 用 "
-            f"{len(args.validation_prompt)} 个 prompt + {len(args.validation_image)} 张 LQ 出 "
-            f"{args.num_validation_images} 张图 (无 GT 无指标)"
-        )
-    else:
-        logger.info(
-            "[验证] 上半段 log_validation 未启用 (validation_prompt=null). "
-            "训练期间不会跑 pipeline 出图, 只跑下半段 run_validation (若开启)."
-        )
+    # ========== 验证开关状态打印 ==========
     if args.run_validation:
         logger.info(
-            f"[验证] 下半段 run_step_validation 已启用: 每 {args.run_validation_steps} step, "
+            f"[验证] run_step_validation 已启用: 每 {args.run_validation_steps} step, "
             f"每 weather 采 {args.validation_num_samples} 张, 算 PSNR/SSIM 写 metrics.txt; "
             f"strength={args.validation_strength}, guidance={args.validation_guidance_scale}, "
             f"negative_prompt={args.validation_negative_prompt!r}"
         )
     else:
-        logger.info("[验证] 下半段 run_step_validation 未启用 (run_validation=false)")
+        logger.info("[验证] run_step_validation 未启用 (run_validation=false)")
 
     tokenizers = [tokenizer_one, tokenizer_two, tokenizer_three]
     text_encoders = [text_encoder_one, text_encoder_two, text_encoder_three]
@@ -2464,8 +2171,6 @@ def main(args):
         tracker_config = dict(vars(args))
 
         # tensorboard cannot handle list/dict types for config
-        tracker_config.pop("validation_prompt", None)
-        tracker_config.pop("validation_image", None)
         _scalar_types = (int, float, str, bool, type(None))
         tracker_config = {k: v for k, v in tracker_config.items()
                           if isinstance(v, _scalar_types)}
@@ -2752,7 +2457,6 @@ def main(args):
                 f"{bad_detail or '发生在其他 rank'}"
             )
 
-    image_logs = None
     for epoch in range(first_epoch, args.num_train_epochs):
         epoch_train_dataloader = (
             train_dataloader
@@ -3206,37 +2910,17 @@ def main(args):
                     if accelerator.is_main_process:
                         logger.info(f"Saved state to {save_path}")
 
-                should_validate_images = (
-                    args.validation_prompt is not None
-                    and global_step % args.validation_steps == 0
-                )
                 should_validate_metrics = (
                     args.run_validation
                     and args.run_validation_steps > 0
                     and global_step > 0
                     and global_step % args.run_validation_steps == 0
                 )
-                if should_validate_images or should_validate_metrics:
+                if should_validate_metrics:
                     accelerator.wait_for_everyone()
 
                 if accelerator.is_main_process:
-                    if should_validate_images:
-                        controlnet.eval()
-                        transformer.eval()
-                        try:
-                            image_logs = log_validation(
-                                controlnet,
-                                transformer,
-                                args,
-                                accelerator,
-                                weight_dtype,
-                                global_step,
-                            )
-                        finally:
-                            controlnet.train(bool(args.train_controlnet))
-                            transformer.train(transformer_is_trainable)
-
-                    # ===== 按 step 评估 PSNR/SSIM (与现有 log_validation 并行, 不互斥) =====
+                    # ===== 按 step 评估 PSNR/SSIM =====
                     # 训练时 n=4 验证只是"相对参考", 不可作为 best 依据.
                     # 真实 best 必须靠手动跑 utils/evaluate_sd3.py 全量评估决定.
                     if should_validate_metrics:
@@ -3257,7 +2941,7 @@ def main(args):
                             controlnet.train(bool(args.train_controlnet))
                             transformer.train(transformer_is_trainable)
 
-                if should_validate_images or should_validate_metrics:
+                if should_validate_metrics:
                     accelerator.wait_for_everyone()
 
             current_lrs = lr_scheduler.get_last_lr()
@@ -3442,23 +3126,9 @@ def main(args):
         if args.use_transformer_lora:
             transformer.save_lora_adapter(os.path.join(args.output_dir, "transformer_lora"))
 
-        # Run a final round of validation.
-        image_logs = None
-        if args.validation_prompt is not None:
-            image_logs = log_validation(
-                controlnet=None,
-                transformer=transformer,
-                args=args,
-                accelerator=accelerator,
-                weight_dtype=weight_dtype,
-                step=global_step,
-                is_final_validation=True,
-            )
-
         if args.push_to_hub:
             save_model_card(
                 repo_id,
-                image_logs=image_logs,
                 base_model=args.pretrained_model_name_or_path,
                 repo_folder=args.output_dir,
             )

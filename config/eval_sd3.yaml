@@ -64,20 +64,13 @@ seed: 42
 #          大幅提升 PSNR 与纹理位置一致性. 建议范围 0.2~0.6.
 strength: 1.0
 
-# ==================== Restoration Sampling Strategy (RSS) ====================
-# 每次 scheduler.step 后，在高 sigma 阶段将生成 latent 轻微拉向 LQ latent。
-# rain/snow/haze 会把退化也带回输出，因此从较小 weight 开始做消融。
-use_rss: false
-rss_weight: 0.01
-rss_threshold: 0.8
-
 # 推理时使用的 prompt (留空则全部使用空 prompt)
 use_prompt: true
-prompt_ratio: 1.0
+prompt_ratio: 0.5
 weather_prompts:
-  rain: "a clean, sharp, rain-free natural photograph with fine details"
-  snow: "a clean, sharp, snow-free natural photograph with fine details"
-  haze: "a clear, sharp, haze-free natural photograph with natural colors and fine details"
+  rain: "a clean and clear image, with rain streaks removed and natural details restored"
+  snow: "a clean and clear image, with snow artifacts removed and natural details restored"
+  haze: "a clean and clear image, with haze removed, natural colors and visibility restored"
 
 # ==================== 评估参数 ====================
 # === 评估采样数 (用于计算指标, 默认 0 = 使用全部 test 集) ===

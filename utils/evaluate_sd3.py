@@ -70,7 +70,7 @@ from utils.metrics import (
     dists_batch,
     available_iqa_metrics,
 )
-from utils.rss import encode_rss_condition, make_rss_callback, validate_rss_config
+from utils.restoration_condition import encode_restoration_condition
 
 
 ORACLE_MODES = ("baseline", "low_frequency", "high_frequency", "affine")
@@ -472,15 +472,27 @@ def build_pipeline(args_config: dict, device, dtype):
 # ============================================================
 # Prompt 决策
 # ============================================================
-def maybe_make_prompt(weather: str, args_config: dict) -> str:
-    """根据 use_prompt / prompt_ratio 决定 prompt (与源 evaluate.py 一致)."""
+def maybe_make_prompt(
+    weather: str,
+    args_config: dict,
+    sample_key: str | None = None,
+) -> str:
+    """按图片独立决定是否使用天气 prompt。"""
     if not args_config.get("use_prompt", False):
         return ""
     prompts = args_config.get("weather_prompts") or DEFAULT_WEATHER_PROMPTS
     prompt_ratio = float(args_config.get("prompt_ratio", 0.2))
     if prompt_ratio >= 1.0:
         return prompts.get(weather, "")
-    if random.random() < prompt_ratio:
+    if sample_key is not None:
+        import hashlib
+
+        seed = args_config.get("seed")
+        digest = hashlib.md5(f"{seed}:{sample_key}".encode("utf-8")).digest()
+        draw = int.from_bytes(digest[:8], "big") / float(1 << 64)
+    else:
+        draw = random.random()
+    if draw < prompt_ratio:
         return prompts.get(weather, "")
     return ""
 
@@ -718,18 +730,6 @@ def evaluate(args_config: dict):
     # ===== 构建 pipeline =====
     pipeline = build_pipeline(args_config, device, weight_dtype)
 
-    use_rss = bool(args_config.get("use_rss", False))
-    rss_weight = float(args_config.get("rss_weight", 0.01))
-    rss_threshold = float(args_config.get("rss_threshold", 0.8))
-    if use_rss:
-        validate_rss_config(rss_weight, rss_threshold)
-        print(
-            f"[eval] RSS 已启用: weight={rss_weight}, threshold={rss_threshold}, "
-            "sigma=post-step effective sigma"
-        )
-    else:
-        print("[eval] RSS 已关闭")
-
     # ===== 图像预处理 (LQ 给 pipeline, GT 仅用于算指标) =====
     preprocess = transforms.Compose([
         transforms.Resize(args_config["resolution"], interpolation=transforms.InterpolationMode.BILINEAR),
@@ -791,7 +791,6 @@ def evaluate(args_config: dict):
 
             samples_sub = by_sub[sub_name]
             n_sub = len(samples_sub)
-            prompt = maybe_make_prompt(weather, args_config)
 
             for batch_start in range(0, n_sub, eval_batch_size):
                 batch_items = samples_sub[batch_start:batch_start + eval_batch_size]
@@ -819,7 +818,10 @@ def evaluate(args_config: dict):
                 # ===== 3. SD3 pipeline 一次推 B 张 LQ =====
                 # SD3 pipeline.__call__ 用 control_image (PIL list 或 tensor 都可), VAE 在内部编码.
                 # prompts / negative_prompts 与 batch 等长
-                prompts = [prompt] * B
+                prompts = [
+                    maybe_make_prompt(weather, args_config, sample_key=str(gt_path))
+                    for gt_path, _ in batch_items
+                ]
                 t0 = time.time()
                 # image-conditioned init: 把 LQ 同时作为 image 传给 pipeline,
                 #   内部 encode → 加 noise (强度由 strength 决定) → 从对应 timestep 起步去噪.
@@ -837,8 +839,8 @@ def evaluate(args_config: dict):
                 if controlnet_scale is not None:
                     pipeline_kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
                 restoration_condition = None
-                if use_rss or args_config.get("use_ra_fusion", False):
-                    restoration_condition = encode_rss_condition(
+                if args_config.get("use_ra_fusion", False):
+                    restoration_condition = encode_restoration_condition(
                         pipeline,
                         lq_pils,
                         height=args_config["resolution"],
@@ -846,13 +848,6 @@ def evaluate(args_config: dict):
                         device=device,
                         dtype=weight_dtype,
                     )
-                if use_rss:
-                    pipeline_kwargs["callback_on_step_end"] = make_rss_callback(
-                        restoration_condition,
-                        weight=rss_weight,
-                        threshold=rss_threshold,
-                    )
-                    pipeline_kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
                 strength = float(args_config.get("strength", 1.0))
                 if strength < 1.0:
                     latents, custom_sigmas = prepare_image_conditioned_latents(
@@ -1204,10 +1199,6 @@ def evaluate(args_config: dict):
             f.write(f"RA configured how tokens:   {configured_how_token_scale}\n")
             if ra_runtime is not None:
                 f.write(f"RA runtime:       {ra_runtime}\n")
-        f.write(f"RSS enabled:      {use_rss}\n")
-        if use_rss:
-            f.write(f"RSS weight:       {rss_weight}\n")
-            f.write(f"RSS threshold:    {rss_threshold}\n")
         f.write(f"Use prompt:       {args_config.get('use_prompt', False)}\n")
         f.write(f"LPIPS backbone:   {lpips_net}\n")
         f.write(f"FID enabled:      {enable_fid}\n")

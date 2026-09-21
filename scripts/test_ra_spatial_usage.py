@@ -34,7 +34,7 @@ from utils.evaluate_sd3 import (
     prepare_image_conditioned_latents,
 )
 from utils.metrics import psnr_batch
-from utils.rss import encode_rss_condition
+from utils.restoration_condition import encode_restoration_condition
 
 
 SPATIAL_MODES = ("normal", "zero", "shuffle")
@@ -168,7 +168,6 @@ def main() -> None:
     config = load_config(args.config)
     config["use_ra_fusion"] = True
     config["ra_disable_spatial"] = False
-    config["use_rss"] = False
     config["save_predictions"] = False
     config["enable_fid"] = False
     if args.controlnet_model_path is not None:
@@ -237,7 +236,7 @@ def main() -> None:
                     names.append(Path(gt_path).stem)
 
                 gt_batch = torch.stack(gt_tensors).to(device)
-                restoration_condition = encode_rss_condition(
+                restoration_condition = encode_restoration_condition(
                     pipeline,
                     lq_images,
                     height=config["resolution"],

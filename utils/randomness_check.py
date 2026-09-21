@@ -39,11 +39,7 @@ from utils.evaluate_sd3 import (  # noqa: E402
     ssim_batch,
 )
 from dpo.provenance import checkpoint_checksum  # noqa: E402
-from utils.rss import (  # noqa: E402
-    encode_rss_condition,
-    make_rss_callback,
-    validate_rss_config,
-)
+from utils.restoration_condition import encode_restoration_condition  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -443,10 +439,9 @@ def run_with_initial_noise(
     if controlnet_scale is not None:
         kwargs["controlnet_conditioning_scale"] = float(controlnet_scale)
 
-    use_rss = bool(args_config.get("use_rss", False))
     restoration_condition = None
-    if use_rss or use_ra_fusion:
-        restoration_condition = encode_rss_condition(
+    if use_ra_fusion:
+        restoration_condition = encode_restoration_condition(
             pipeline,
             lq_pils,
             height=resolution,
@@ -454,13 +449,6 @@ def run_with_initial_noise(
             device=device,
             dtype=dtype,
         )
-    if use_rss:
-        kwargs["callback_on_step_end"] = make_rss_callback(
-            restoration_condition,
-            weight=float(args_config.get("rss_weight", 0.01)),
-            threshold=float(args_config.get("rss_threshold", 0.8)),
-        )
-        kwargs["callback_on_step_end_tensor_inputs"] = ["latents"]
     ra_context = (
         pipeline.transformer.restoration_condition_context(restoration_condition)
         if use_ra_fusion else contextlib.nullcontext()
@@ -569,12 +557,6 @@ def main() -> None:
         bool(args_config.get("use_ra_fusion", False))
         if args.use_ra_fusion is None else args.use_ra_fusion
     )
-    use_rss = bool(args_config.get("use_rss", False))
-    if use_rss:
-        validate_rss_config(
-            float(args_config.get("rss_weight", 0.01)),
-            float(args_config.get("rss_threshold", 0.8)),
-        )
     configured_ra_scale = args_config.get("ra_fusion_scale")
     if args.ra_fusion_scale is not None:
         ra_fusion_scale = args.ra_fusion_scale
@@ -950,9 +932,6 @@ def main() -> None:
         "ra_fusion_scale": ra_fusion_scale,
         "ra_spatial_gate_scale": ra_spatial_gate_scale,
         "ra_how_token_scale": ra_how_token_scale,
-        "use_rss": use_rss,
-        "rss_weight": args_config.get("rss_weight", 0.01),
-        "rss_threshold": args_config.get("rss_threshold", 0.8),
         "use_prompt": bool(args_config.get("use_prompt", False)),
         "prompts": prompts,
         "base_model": args_config.get("pretrained_model_name_or_path"),

@@ -131,7 +131,6 @@ training:
   validation_guidance_scale: 1.0
   validation_strength: 1.0
   validation_seed: 42
-  validation_use_rss: false
   validation_lpips_net: "alex"
   beta: 0.1
   # ControlNet is larger and easier to destabilize; use a lower LR than RA.
@@ -152,7 +151,7 @@ training:
   sft_weight: 0.0
   # Direct GT anchors. These supervise the policy only; the reference remains frozen.
   gt_flow_weight: 0.1
-  gt_x0_l1_weight: 0.05
+  gt_x0_l1_weight: 0.0
   weight_by_psnr_gap: false
   # Refuse legacy/mismatched preference data unless explicitly disabled.
   require_candidate_provenance: true

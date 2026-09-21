@@ -46,7 +46,7 @@ RGB-domain losses require differentiable VAE decoding and can consume substantia
 python -m utils.evaluate_sd3 --config config/eval_sd3.yaml
 ```
 
-Evaluation supports PSNR, SSIM, LPIPS, FID, RSS, RA ablations, and optional low-frequency, high-frequency, and affine oracle analysis.
+Evaluation supports PSNR, SSIM, LPIPS, FID, RA ablations, and optional low-frequency, high-frequency, and affine oracle analysis.
 
 ## DPO Workflow
 

@@ -304,7 +304,6 @@ training:
   validation_guidance_scale: 1.0
   validation_strength: 1.0
   validation_seed: 42
-  validation_use_rss: false
   validation_lpips_net: "alex"
 ```
 
@@ -426,4 +425,4 @@ python -m scripts.evaluate_dpo --config config/dpo_sd3.yaml \
 `-- haze_test/per_image_metrics.txt
 ```
 
-对比 Baseline + RA 和 DPO 模型时，应保持推理步数、strength、CFG、RA scale、RSS、测试样本、seed 和指标配置一致。
+对比 Baseline + RA 和 DPO 模型时，应保持推理步数、strength、CFG、RA scale、测试样本、seed 和指标配置一致。

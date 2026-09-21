@@ -969,7 +969,6 @@ def main() -> None:
                 model_config.get("controlnet_conditioning_scale", 1.0)
             ),
             "use_ra_fusion": True,
-            "use_rss": bool(train_config.get("validation_use_rss", False)),
             "validation_num_samples_per_weather": int(
                 train_config.get("validation_num_samples_per_weather", 10)
             ),

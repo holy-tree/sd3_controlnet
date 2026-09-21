@@ -17,24 +17,13 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Fusion/test_checkpoint-30000/controlnet"
+controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-19000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
 
-# HF revision / variant (fp16 等量化版本)
-revision: null
-variant: null
-
 # ==================== 输出与缓存 ====================
 output_dir: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint"
-cache_dir: null
-
-# 接续训练 (从 checkpoint 恢复 optimizer / scheduler / global_step):
-#   null      = 不接续, 从头训
-#   "latest"  = 自动选 output_dir 里最新的 checkpoint
-#   "/path/to/checkpoint-N" = 指定具体 checkpoint
-resume_from_checkpoint:  null
 
 # ==================== 数据集 (源项目布局, 与 --dataset_root 配合) ====================
 # 数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/
@@ -44,27 +33,16 @@ dataset_root: "/root/autodl-tmp/datasets"
 weather_types: ["rain", "snow", "haze"]
 splits: ["train"]
 
-# 每个天气类型使用的样本数 (None 表示不限制; 也可填 0/-1)
-rain_num: null
-snow_num: null
-haze_num: null
-
 # ==================== 文本 prompt (天气感知) ====================
 # 是否启用天气 prompt (与源 train.yaml 一致)
-use_prompt: false
-prompt_ratio: 0.2
+use_prompt: true
+prompt_ratio: 0.5
 
 # 自定义天气 prompt (YAML 直接写 dict, 比 CLI 字符串更清晰)
 weather_prompts:
-  rain: "rainy scene, rain streaks on the image, wet surfaces, overcast sky"
-  snow: "snowy scene, snowflakes covering the image, cold atmosphere, white noise"
-  haze: "hazy scene, foggy atmosphere, low visibility, grayish tone"
-
-# proportion_empty_prompts 在 --dataset_root 模式下会被强制设为 0 (天气 prompt 已在 dataset 解析)
-proportion_empty_prompts: 0
-
-# 训练样本截断 (用于 debug; null = 不截断)
-max_train_samples: null
+  rain: "a clean and clear image, with rain streaks removed and natural details restored"
+  snow: "a clean and clear image, with snow artifacts removed and natural details restored"
+  haze: "a clean and clear image, with haze removed, natural colors and visibility restored"
 
 # ==================== 分辨率与 batch ====================
 resolution: 512
@@ -73,8 +51,7 @@ gradient_accumulation_steps: 1
 dataloader_num_workers: 0
 
 # ==================== 训练步数 ====================
-num_train_epochs: 1
-max_train_steps: 20000
+max_train_steps: 5000
 checkpointing_steps: 1000
 # 最多保存几个 checkpoint (旧的会被自动删除以节省磁盘)
 checkpoints_total_limit: 3
@@ -96,8 +73,6 @@ use_8bit_adam: false
 # ==================== LR Scheduler ====================
 lr_scheduler: "constant_with_warmup"   # linear / cosine / cosine_with_restarts / polynomial / constant / constant_with_warmup
 lr_warmup_steps: 500
-lr_num_cycles: 1                       # 仅 cosine_with_restarts 生效
-lr_power: 1.0                          # 仅 polynomial 生效
 
 # ==================== Flow Matching (SD3 专用) ====================
 # 加权采样策略, 影响 timestep 分布
@@ -149,7 +124,7 @@ max_sequence_length: 77
 #
 # 各重建损失均按 (1 - sigma) 在样本维加权, 自动侧重低噪声 timestep.
 # VAE.decode 由 --lpips_interval 控制频率.
-latent_l1_weight: 0.2                   # 第二阶段建议从 0.05 开始
+latent_l1_weight: 0.05                  # 轻量 x0 锚定，避免与 Flow-MSE 重复监督过强
 pixel_charbonnier_weight: 0.0            # RA 稳定后再逐项启用图像域损失
 edge_loss_weight: 0.0
 lpips_weight: 0.0                       # PSNR 敏感任务建议 ≤0.02
@@ -189,35 +164,10 @@ tracker_project_name: "train_controlnet_SD3"
 # seed (null = 随机)
 seed: null
 
-# ==================== 验证 (按 step 跑 pipeline 出图, SD3 官方 log_validation) ====================
-validation_prompt: null
-validation_image: null
-num_validation_images: 1
-validation_steps: 100
-
 # ==================== 按 step 评估 PSNR/SSIM (移植自源项目 run_epoch_validation) ====================
 run_validation: true                  # 默认关闭 (与源 train.yaml:165 一致)
 run_validation_steps: 1000              # 每 N step 跑一次 (0 = 禁用)
 validation_num_samples: 4               # 每种天气采样数
 validation_inference_steps: 30          # pipeline 推理步数
-validation_guidance_scale: 1.5          # 恢复任务使用低 CFG, 减少生成先验干扰
-validation_negative_prompt: null
-validation_use_image: 1                 # 使用 LQ latent 作为去噪起点
+validation_guidance_scale: 1.0          # 恢复任务使用低 CFG, 减少生成先验干扰
 validation_strength: 1.0                # 有效起始噪声强度, 建议 0.2~0.6
-validation_use_rss: 0                   # 保持现有验证曲线口径；RSS 消融时改为 1
-validation_rss_weight: 0.01
-validation_rss_threshold: 0.8
-
-# ==================== Hub 推送 (HF) ====================
-push_to_hub: false
-hub_token: null
-hub_model_id: null
-
-# ==================== 保留旧字段 (HF imagefolder 兼容, 不与 --dataset_root 同用) ====================
-# 想用 HF datasets (fill50k / metadata.jsonl) 时启用下面, 并把 --dataset_root 留空
-dataset_name: null
-dataset_config_name: null
-train_data_dir: null
-image_column: "image"
-conditioning_image_column: "conditioning_image"
-caption_column: "text"
