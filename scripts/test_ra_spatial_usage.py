@@ -35,6 +35,7 @@ from utils.evaluate_sd3 import (
 )
 from utils.metrics import psnr_batch
 from utils.restoration_condition import encode_restoration_condition
+from utils.pipeline_inference import run_pipeline_with_fp32_decode
 
 
 SPATIAL_MODES = ("normal", "zero", "shuffle")
@@ -129,7 +130,6 @@ def run_mode(
         pipeline_kwargs["latents"] = latents
         pipeline_kwargs["sigmas"] = sigmas
 
-    autocast_enabled = device.type == "cuda" and dtype in {torch.float16, torch.bfloat16}
     ra_context = transformer.restoration_condition_context(restoration_condition)
     posterior_context = patch.object(
         DiagonalGaussianDistribution,
@@ -137,12 +137,13 @@ def run_mode(
         lambda distribution, generator=None: distribution.mode(),
     )
     try:
-        with posterior_context, ra_context, torch.autocast(
-            device_type=device.type,
-            enabled=autocast_enabled,
-            dtype=dtype,
-        ), torch.no_grad():
-            images = pipeline(**pipeline_kwargs).images
+        with posterior_context, ra_context:
+            images = run_pipeline_with_fp32_decode(
+                pipeline,
+                pipeline_kwargs,
+                device=device,
+                denoise_dtype=dtype,
+            )
         diagnostics = transformer.get_last_ra_diagnostics() if mode == "normal" else None
     finally:
         transformer.enable_ra_diagnostics(False)

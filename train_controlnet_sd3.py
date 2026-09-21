@@ -74,6 +74,7 @@ from utils.training_losses import (
     weighted_spatial_smooth_l1,
 )
 from utils.restoration_condition import encode_restoration_condition
+from utils.pipeline_inference import run_pipeline_with_fp32_decode
 
 try:
     from peft import LoraConfig
@@ -252,8 +253,6 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
     if isinstance(getattr(args, "weather_prompts", None), dict):
         weather_prompts_lookup = dict(args.weather_prompts)
 
-    autocast_enabled = (accelerator.device.type == "cuda")
-
     for weather in args.weather_types:
         candidates = [s for s in base_samples if s[2] == weather]
         if not candidates:
@@ -332,8 +331,13 @@ def run_step_validation(vae, text_encoder_one, text_encoder_two, text_encoder_th
                 if getattr(args, "use_ra_fusion", 0)
                 else contextlib.nullcontext()
             )
-            with ra_context, torch.autocast("cuda", enabled=autocast_enabled, dtype=weight_dtype):
-                pred_pil = pipeline(**pipeline_kwargs).images[0]
+            with ra_context:
+                pred_pil = run_pipeline_with_fp32_decode(
+                    pipeline,
+                    pipeline_kwargs,
+                    device=accelerator.device,
+                    denoise_dtype=weight_dtype,
+                )[0]
 
             # pred -> tensor [3, H, W] in [0, 1]
             pred_tensor = tvt.ToTensor()(pred_pil).to(accelerator.device).clamp(0, 1)
@@ -2375,19 +2379,23 @@ def main(args):
         source: str,
         step_number: int,
         sample_paths: list[str] | None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Keep SD3 VAE encoding in true FP32. Mixed-precision autocast can make
         # the encoder attention overflow for otherwise valid restoration images.
         device_type = accelerator.device.type
         images = images.to(device=accelerator.device, dtype=torch.float32)
 
-        def encode(batch: torch.Tensor) -> torch.Tensor:
+        def encode(batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             with torch.autocast(device_type=device_type, enabled=False):
-                return vae.encode(batch).latent_dist.mode().float()
+                posterior = vae.encode(batch).latent_dist
+                return posterior.sample().float(), posterior.mode().float()
 
-        latents = encode(images)
+        sampled_latents, mode_latents = encode(images)
         bad_indices = (
-            (~torch.isfinite(latents)).flatten(1).any(1).nonzero(as_tuple=False).flatten().tolist()
+            (
+                (~torch.isfinite(sampled_latents)).flatten(1).any(1)
+                | (~torch.isfinite(mode_latents)).flatten(1).any(1)
+            ).nonzero(as_tuple=False).flatten().tolist()
         )
         for index in bad_indices:
             path = sample_paths[index] if sample_paths is not None else f"batch_index={index}"
@@ -2395,8 +2403,11 @@ def main(args):
                 f"[Step {step_number}] {source} VAE batch encode 非有限，"
                 f"单张 FP32 重试: {path}"
             )
-            retry = encode(images[index:index + 1])
-            if not bool(torch.isfinite(retry).all()) and device_type == "cuda":
+            retry_sample, retry_mode = encode(images[index:index + 1])
+            retry_is_finite = bool(
+                torch.isfinite(retry_sample).all() and torch.isfinite(retry_mode).all()
+            )
+            if not retry_is_finite and device_type == "cuda":
                 logger.warning(
                     f"[Step {step_number}] {source} 单张重试仍非有限，"
                     f"改用 math SDPA: {path}"
@@ -2407,9 +2418,10 @@ def main(args):
                     enable_mem_efficient=False,
                     enable_cudnn=False,
                 ):
-                    retry = encode(images[index:index + 1])
-            latents[index:index + 1] = retry
-        return latents
+                    retry_sample, retry_mode = encode(images[index:index + 1])
+            sampled_latents[index:index + 1] = retry_sample
+            mode_latents[index:index + 1] = retry_mode
+        return sampled_latents, mode_latents
 
     def raise_if_nonfinite(
         name: str,
@@ -2535,7 +2547,7 @@ def main(args):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
-                gt_latent = encode_vae_mode(
+                gt_latent, gt_mode_latent = encode_vae_mode(
                     pixel_values,
                     source="GT",
                     step_number=global_step + 1,
@@ -2546,7 +2558,7 @@ def main(args):
                 model_input = model_input.to(dtype=weight_dtype)
                 gt_restoration_latent = None
                 if args.ra_local_correction_loss_weight > 0.0:
-                    gt_restoration_latent = gt_latent
+                    gt_restoration_latent = gt_mode_latent
                     gt_restoration_latent = (
                         gt_restoration_latent - vae.config.shift_factor
                     ) * vae.config.scaling_factor
@@ -2593,7 +2605,7 @@ def main(args):
                 # controlnet(s) inference
                 lq_pixels_for_targets = batch["conditioning_pixel_values"]
                 conditioning_pixels = lq_pixels_for_targets.to(dtype=torch.float32)
-                lq_latent = encode_vae_mode(
+                lq_latent, lq_mode_latent = encode_vae_mode(
                     conditioning_pixels,
                     source="LQ",
                     step_number=global_step + 1,
@@ -2603,7 +2615,7 @@ def main(args):
                 controlnet_image = (lq_latent - controlnet_shift) * vae.config.scaling_factor
                 controlnet_image = controlnet_image.to(dtype=weight_dtype)
                 restoration_condition = (
-                    lq_latent - vae.config.shift_factor
+                    lq_mode_latent - vae.config.shift_factor
                 ) * vae.config.scaling_factor
                 if check_source_tensors:
                     raise_if_nonfinite(

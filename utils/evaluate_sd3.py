@@ -46,7 +46,7 @@ from torchvision import transforms
 from torchvision.transforms import functional as transform_functional
 from tqdm import tqdm
 
-from diffusers import StableDiffusion3ControlNetPipeline, SD3ControlNetModel
+from diffusers import AutoencoderKL, StableDiffusion3ControlNetPipeline, SD3ControlNetModel
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
 from dataloaders.paired_dataset import DEFAULT_WEATHER_PROMPTS
@@ -71,6 +71,7 @@ from utils.metrics import (
     available_iqa_metrics,
 )
 from utils.restoration_condition import encode_restoration_condition
+from utils.pipeline_inference import run_pipeline_with_fp32_decode
 
 
 ORACLE_MODES = ("baseline", "low_frequency", "high_frequency", "affine")
@@ -417,6 +418,13 @@ def build_pipeline(args_config: dict, device, dtype):
     pipeline_components = {
         "controlnet": controlnet,
         "torch_dtype": dtype,
+        "vae": AutoencoderKL.from_pretrained(
+            args_config["pretrained_model_name_or_path"],
+            subfolder="vae",
+            revision=args_config.get("revision"),
+            variant=args_config.get("variant"),
+            torch_dtype=torch.float32,
+        ),
     }
     if transformer is not None:
         pipeline_components["transformer"] = transformer
@@ -877,10 +885,13 @@ def evaluate(args_config: dict):
                     if args_config.get("deterministic_controlnet_vae", False)
                     else contextlib.nullcontext()
                 )
-                with posterior_context, ra_context, torch.autocast(
-                    "cuda", enabled=(device.type == "cuda"), dtype=weight_dtype
-                ), torch.no_grad():
-                    outs = pipeline(**pipeline_kwargs).images
+                with posterior_context, ra_context:
+                    outs = run_pipeline_with_fp32_decode(
+                        pipeline,
+                        pipeline_kwargs,
+                        device=device,
+                        denoise_dtype=weight_dtype,
+                    )
                 infer_time_total = time.time() - t0
                 infer_time_avg = infer_time_total / B
 

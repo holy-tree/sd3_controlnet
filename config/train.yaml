@@ -17,7 +17,7 @@ pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
 # ControlNet 初始化权重来源 (二选一):
 #   1) controlnet_model_name_or_path: 加载已有 SD3 ControlNet 权重
 #   2) 不填: 从 SD3 transformer 初始化 (SD3ControlNetModel.from_transformer)
-controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-19000/controlnet"
+controlnet_model_name_or_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/Joint-5000/controlnet"
 
 # SD3 ControlNet 的 conditioning 额外通道数 (默认 0, 与 SD3 标准接口一致)
 num_extra_conditioning_channels: 0
@@ -170,4 +170,4 @@ run_validation_steps: 1000              # 每 N step 跑一次 (0 = 禁用)
 validation_num_samples: 4               # 每种天气采样数
 validation_inference_steps: 30          # pipeline 推理步数
 validation_guidance_scale: 1.0          # 恢复任务使用低 CFG, 减少生成先验干扰
-validation_strength: 1.0                # 有效起始噪声强度, 建议 0.2~0.6
+validation_strength: 1.0                # 与历史验证口径一致：从纯噪声开始

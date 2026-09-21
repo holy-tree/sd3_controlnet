@@ -40,6 +40,7 @@ from utils.evaluate_sd3 import (  # noqa: E402
 )
 from dpo.provenance import checkpoint_checksum  # noqa: E402
 from utils.restoration_condition import encode_restoration_condition  # noqa: E402
+from utils.pipeline_inference import run_pipeline_with_fp32_decode  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -459,10 +460,13 @@ def run_with_initial_noise(
     deterministic_sample = lambda distribution, generator=None: distribution.mode()
     with patch.object(
         DiagonalGaussianDistribution, "sample", deterministic_sample
-    ), ra_context, torch.autocast(
-        "cuda", enabled=(device.type == "cuda"), dtype=dtype
-    ), torch.no_grad():
-        images = pipeline(**kwargs).images
+    ), ra_context:
+        images = run_pipeline_with_fp32_decode(
+            pipeline,
+            kwargs,
+            device=device,
+            denoise_dtype=dtype,
+        )
     return torch.stack([
         transforms.ToTensor()(image).to(device).clamp(0, 1) for image in images
     ])
