@@ -731,9 +731,19 @@ def main() -> None:
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_path, subfolder="scheduler", revision=revision
     )
+    upcast_vae = bool(train_config.get("upcast_vae", True))
+    vae_load_kwargs = {"torch_dtype": torch.float32} if upcast_vae else {}
     vae = AutoencoderKL.from_pretrained(
-        model_path, subfolder="vae", revision=revision, variant=model_config.get("variant")
-    ).to(device=device, dtype=torch.float32 if train_config.get("upcast_vae", True) else weight_dtype)
+        model_path,
+        subfolder="vae",
+        revision=revision,
+        variant=model_config.get("variant"),
+        **vae_load_kwargs,
+    )
+    if upcast_vae:
+        vae.to(device=device)
+    else:
+        vae.to(device=device, dtype=weight_dtype)
     vae.requires_grad_(False).eval()
     controlnet_path = resolve_controlnet_path(model_config["controlnet_model_path"])
     controlnet = _load_controlnet_smart(controlnet_path).to(device=device)

@@ -1660,11 +1660,18 @@ def main(args):
     text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(
         text_encoder_cls_one, text_encoder_cls_two, text_encoder_cls_three
     )
+    vae_load_kwargs = {}
+    if args.upcast_vae:
+        # Loading directly in FP32 is materially different from casting an
+        # already-loaded VAE with .to(dtype=...). Diffusers explicitly warns
+        # that the latter can leave numerically sensitive modules inconsistent.
+        vae_load_kwargs["torch_dtype"] = torch.float32
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
         variant=args.variant,
+        **vae_load_kwargs,
     )
     transformer_cls = RAFusionSD3Transformer2DModel if args.use_ra_fusion else SD3Transformer2DModel
     transformer_kwargs = {}
@@ -1994,8 +2001,8 @@ def main(args):
             )
         )
 
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
+    # The frozen denoising/text backbones use mixed precision. Keep the VAE in
+    # FP32 when requested because SD3 VAE encoding is unstable in lower precision.
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -2004,9 +2011,23 @@ def main(args):
 
     # Move vae, transformer and text_encoder to device and cast to weight_dtype
     if args.upcast_vae:
-        vae.to(accelerator.device, dtype=torch.float32)
+        vae.to(accelerator.device)
+        non_fp32_vae_parameters = [
+            name
+            for name, parameter in vae.named_parameters()
+            if parameter.is_floating_point() and parameter.dtype != torch.float32
+        ]
+        if non_fp32_vae_parameters:
+            raise TypeError(
+                "upcast_vae=True requires every VAE parameter to be FP32; "
+                f"found non-FP32 parameters: {non_fp32_vae_parameters[:5]}"
+            )
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
+    logger.info(
+        f"[VAE] dtype={vae.dtype}, slicing={args.vae_slicing}, "
+        f"tiling={args.vae_tiling}, force_upcast={getattr(vae.config, 'force_upcast', None)}"
+    )
     transformer.to(accelerator.device)
     # Cast only the frozen backbone. Trainable RA/LoRA parameters never pass
     # through BF16, preserving initialized or loaded FP32 values exactly.

@@ -189,6 +189,14 @@ def fid(pred_list, gt_list, batch_size: int = 32) -> float:
     """
     if not pred_list or not gt_list:
         return float("nan")
+    if len(pred_list) < 2 or len(gt_list) < 2:
+        warnings.warn(
+            "FID requires at least 2 predicted and 2 reference images to "
+            f"estimate covariance; got {len(pred_list)} and {len(gt_list)}. "
+            "Returning NaN.",
+            stacklevel=2,
+        )
+        return float("nan")
 
     def _stream_features(img_list, bs):
         all_feats = []
