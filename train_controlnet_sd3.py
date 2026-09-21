@@ -2609,7 +2609,7 @@ def main(args):
                 models_to_accumulate.append(controlnet)
             if transformer_is_trainable:
                 models_to_accumulate.append(transformer)
-with accelerator.accumulate(*models_to_accumulate):
+            with accelerator.accumulate(*models_to_accumulate):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
