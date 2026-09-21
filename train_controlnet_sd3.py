@@ -1267,6 +1267,16 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    if not torch.isfinite(pixel_values).all() or pixel_values.abs().max() > 1.5:
+        import sys
+        print(f"[collate] BAD pixel_values: shape={tuple(pixel_values.shape)} "
+              f"min={pixel_values.min().item():.4e} max={pixel_values.max().item():.4e} "
+              f"finite={bool(torch.isfinite(pixel_values).all().item())}", file=sys.stderr)
+        for i, ex in enumerate(examples):
+            t = ex["pixel_values"]
+            print(f"  ex[{i}] path={ex.get('gt_path','?')} "
+                  f"shape={tuple(t.shape)} dtype={t.dtype} "
+                  f"min={t.min().item():.4e} max={t.max().item():.4e}", file=sys.stderr)
 
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -2599,10 +2609,27 @@ def main(args):
                 models_to_accumulate.append(controlnet)
             if transformer_is_trainable:
                 models_to_accumulate.append(transformer)
-            with accelerator.accumulate(*models_to_accumulate):
+with accelerator.accumulate(*models_to_accumulate):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
+                if global_step == 0:
+                    import sys
+                    print(f"\n[STEP 1 / before_encode] "
+                          f"batch[pixel_values].dtype={gt_pixels_for_targets.dtype} "
+                          f"device={gt_pixels_for_targets.device} "
+                          f"min={gt_pixels_for_targets.min().item():.4e} "
+                          f"max={gt_pixels_for_targets.max().item():.4e} "
+                          f"finite={bool(torch.isfinite(gt_pixels_for_targets).all().item())}", file=sys.stderr)
+                    print(f"[STEP 1 / after_to_fp32] "
+                          f"pixel_values.dtype={pixel_values.dtype} "
+                          f"device={pixel_values.device} "
+                          f"min={pixel_values.min().item():.4e} "
+                          f"max={pixel_values.max().item():.4e}", file=sys.stderr)
+                    gtp = batch.get("gt_path")
+                    if gtp:
+                        print(f"[STEP 1 / paths] {gtp}", file=sys.stderr)
+                    sys.stderr.flush()
                 gt_latent, gt_mode_latent = encode_vae_mode(
                     pixel_values,
                     source="GT",
