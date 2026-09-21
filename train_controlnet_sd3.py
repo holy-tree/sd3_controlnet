@@ -1267,22 +1267,6 @@ def make_train_dataset(args, tokenizer_one, tokenizer_two, tokenizer_three, acce
 def collate_fn(examples):
     pixel_values = torch.stack([example["pixel_values"] for example in examples])
     pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-    import sys
-    finite_pv = bool(torch.isfinite(pixel_values).all().item())
-    max_pv = pixel_values.max().item() if finite_pv else float('nan')
-    min_pv = pixel_values.min().item() if finite_pv else float('nan')
-    print(f"[collate/UNCOND] pixel_values shape={tuple(pixel_values.shape)} "
-          f"dtype={pixel_values.dtype} device={pixel_values.device} "
-          f"min={min_pv:.4e} max={max_pv:.4e} finite={finite_pv}", file=sys.stderr)
-    if not finite_pv or max_pv > 1.5:
-        print(f"[collate] BAD pixel_values: shape={tuple(pixel_values.shape)} "
-              f"min={min_pv:.4e} max={max_pv:.4e} "
-              f"finite={finite_pv}", file=sys.stderr)
-        for i, ex in enumerate(examples):
-            t = ex["pixel_values"]
-            print(f"  ex[{i}] path={ex.get('gt_path','?')} "
-                  f"shape={tuple(t.shape)} dtype={t.dtype} "
-                  f"min={t.min().item():.4e} max={t.max().item():.4e}", file=sys.stderr)
 
     conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
@@ -2035,7 +2019,7 @@ def main(args):
         ]
         if non_fp32_vae_parameters:
             raise TypeError(
-"upcast_vae=True requires every VAE parameter to be FP32; "
+                "upcast_vae=True requires every VAE parameter to be FP32; "
                 f"found non-FP32 parameters: {non_fp32_vae_parameters[:5]}"
             )
     else:
@@ -2044,24 +2028,6 @@ def main(args):
         f"[VAE] dtype={vae.dtype}, slicing={args.vae_slicing}, "
         f"tiling={args.vae_tiling}, force_upcast={getattr(vae.config, 'force_upcast', None)}"
     )
-    bad_vae_params = [
-        (n, tuple(p.shape), p.dtype)
-        for n, p in vae.named_parameters()
-        if p.is_floating_point() and not bool(torch.isfinite(p).all())
-    ]
-    logger.info(f"[VAE] 非有限参数数量 = {len(bad_vae_params)}")
-    if bad_vae_params:
-        for n, s, d in bad_vae_params[:5]:
-            logger.warning(f"[VAE] 非有限参数: {n} shape={s} dtype={d}")
-    bad_vae_buffers = [
-        (n, tuple(b.shape), b.dtype)
-        for n, b in vae.named_buffers()
-        if b.is_floating_point() and not bool(torch.isfinite(b).all())
-    ]
-    logger.info(f"[VAE] 非有限 buffer 数量 = {len(bad_vae_buffers)}")
-    if bad_vae_buffers:
-        for n, s, d in bad_vae_buffers[:5]:
-            logger.warning(f"[VAE] 非有限 buffer: {n} shape={s} dtype={d}")
     transformer.to(accelerator.device)
     # Cast only the frozen backbone. Trainable RA/LoRA parameters never pass
     # through BF16, preserving initialized or loaded FP32 values exactly.
@@ -2439,55 +2405,12 @@ def main(args):
         # the encoder attention overflow for otherwise valid restoration images.
         device_type = accelerator.device.type
         images = images.to(device=accelerator.device, dtype=torch.float32)
-        if step_number <= 1:
-            logger.info(
-                f"[encode_vae_mode/{source}] input: shape={tuple(images.shape)} "
-                f"dtype={images.dtype} finite={bool(torch.isfinite(images).all().item())} "
-                f"min={images.min().item():.4f} max={images.max().item():.4f}"
-            )
 
         def encode(batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             with torch.autocast(device_type=device_type, enabled=False):
                 posterior = vae.encode(batch).latent_dist
                 sampled = posterior.sample().float()
                 mode = posterior.mode().float()
-                params = posterior.parameters
-                sampled_abs_max = (
-                    sampled[torch.isfinite(sampled)].abs().max().item()
-                    if torch.isfinite(sampled).any()
-                    else float("nan")
-                )
-                mode_abs_max = (
-                    mode[torch.isfinite(mode)].abs().max().item()
-                    if torch.isfinite(mode).any()
-                    else float("nan")
-                )
-                if step_number <= 1:
-                    logger.info(
-                        f"[encode_vae_mode/{source}] posterior.parameters: "
-                        f"shape={tuple(params.shape)} dtype={params.dtype} "
-                        f"finite={bool(torch.isfinite(params).all().item())} "
-                        f"nan={int(torch.isnan(params).sum().item())} "
-                        f"inf={int(torch.isinf(params).sum().item())} "
-                        f"finite_min={params[torch.isfinite(params)].min().item() if torch.isfinite(params).any() else float('nan'):.4e} "
-                        f"finite_max={params[torch.isfinite(params)].max().item() if torch.isfinite(params).any() else float('nan'):.4e}"
-                    )
-                if not bool(
-                    torch.isfinite(params).all()
-                    and torch.isfinite(sampled).all()
-                    and torch.isfinite(mode).all()
-                    and sampled_abs_max < 1.0e4
-                    and mode_abs_max < 1.0e4
-                ):
-                    logger.warning(
-                        f"[Step {step_number}] {source} VAE posterior 诊断: "
-                        f"batch={batch.shape[0]}, params_finite={bool(torch.isfinite(params).all())}, "
-                        f"sample_finite={bool(torch.isfinite(sampled).all())}, "
-                        f"mode_finite={bool(torch.isfinite(mode).all())}, "
-                        f"params_abs_max={params[torch.isfinite(params)].abs().max().item() if torch.isfinite(params).any() else float('nan'):.4e}, "
-                        f"sample_abs_max={sampled_abs_max:.4e}, "
-                        f"mode_abs_max={mode_abs_max:.4e}"
-                    )
                 return sampled, mode
 
         sampled_latents, mode_latents = encode(images)
@@ -2664,23 +2587,6 @@ def main(args):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
-                if global_step < 5:
-                    import sys
-                    print(f"\n[STEP {global_step+1} / before_encode] "
-                          f"batch[pixel_values].dtype={gt_pixels_for_targets.dtype} "
-                          f"device={gt_pixels_for_targets.device} "
-                          f"min={gt_pixels_for_targets.min().item():.4e} "
-                          f"max={gt_pixels_for_targets.max().item():.4e} "
-                          f"finite={bool(torch.isfinite(gt_pixels_for_targets).all().item())}", file=sys.stderr)
-                    print(f"[STEP {global_step+1} / after_to_fp32] "
-                          f"pixel_values.dtype={pixel_values.dtype} "
-                          f"device={pixel_values.device} "
-                          f"min={pixel_values.min().item():.4e} "
-                          f"max={pixel_values.max().item():.4e}", file=sys.stderr)
-                    gtp = batch.get("gt_path")
-                    if gtp:
-                        print(f"[STEP {global_step+1} / paths] {gtp}", file=sys.stderr)
-                    sys.stderr.flush()
                 gt_latent, gt_mode_latent = encode_vae_mode(
                     pixel_values,
                     source="GT",
@@ -2839,18 +2745,6 @@ def main(args):
                     raise_if_nonfinite("flow target", target, global_step + 1, batch.get("gt_path"))
                     raise_if_nonfinite("loss weighting", weighting, global_step + 1)
                     raise_if_nonfinite("flow residual", residual, global_step + 1, batch.get("gt_path"))
-                    residual_per_sample = residual.abs().flatten(1).amax(1)
-                    logger.info(
-                        f"[Flow diagnostics][Step {global_step + 1}] "
-                        f"model_pred_abs_max={model_pred.detach().float().abs().max().item():.4e}, "
-                        f"target_abs_max={target.detach().float().abs().max().item():.4e}, "
-                        f"residual_abs_max={residual.detach().abs().max().item():.4e}, "
-                        f"weighting=[{weighting.detach().float().min().item():.4e}, "
-                        f"{weighting.detach().float().max().item():.4e}], "
-                        f"sigma=[{sigmas.detach().float().min().item():.4e}, "
-                        f"{sigmas.detach().float().max().item():.4e}], "
-                        f"residual_per_sample={residual_per_sample.detach().cpu().tolist()}"
-                    )
 
                 # Compute regular loss.
                 loss_mse = torch.mean(
