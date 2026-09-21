@@ -2024,10 +2024,28 @@ def main(args):
             )
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
-    logger.info(
+logger.info(
         f"[VAE] dtype={vae.dtype}, slicing={args.vae_slicing}, "
         f"tiling={args.vae_tiling}, force_upcast={getattr(vae.config, 'force_upcast', None)}"
     )
+    bad_vae_params = [
+        (n, tuple(p.shape), p.dtype)
+        for n, p in vae.named_parameters()
+        if p.is_floating_point() and not bool(torch.isfinite(p).all())
+    ]
+    logger.info(f"[VAE] 非有限参数数量 = {len(bad_vae_params)}")
+    if bad_vae_params:
+        for n, s, d in bad_vae_params[:5]:
+            logger.warning(f"[VAE] 非有限参数: {n} shape={s} dtype={d}")
+    bad_vae_buffers = [
+        (n, tuple(b.shape), b.dtype)
+        for n, b in vae.named_buffers()
+        if b.is_floating_point() and not bool(torch.isfinite(b).all())
+    ]
+    logger.info(f"[VAE] 非有限 buffer 数量 = {len(bad_vae_buffers)}")
+    if bad_vae_buffers:
+        for n, s, d in bad_vae_buffers[:5]:
+            logger.warning(f"[VAE] 非有限 buffer: {n} shape={s} dtype={d}")
     transformer.to(accelerator.device)
     # Cast only the frozen backbone. Trainable RA/LoRA parameters never pass
     # through BF16, preserving initialized or loaded FP32 values exactly.
@@ -2393,7 +2411,7 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    @torch.no_grad()
+@torch.no_grad()
     def encode_vae_mode(
         images: torch.Tensor,
         *,
@@ -2405,10 +2423,27 @@ def main(args):
         # the encoder attention overflow for otherwise valid restoration images.
         device_type = accelerator.device.type
         images = images.to(device=accelerator.device, dtype=torch.float32)
+        if step_number <= 1:
+            logger.info(
+                f"[encode_vae_mode/{source}] input: shape={tuple(images.shape)} "
+                f"dtype={images.dtype} finite={bool(torch.isfinite(images).all().item())} "
+                f"min={images.min().item():.4f} max={images.max().item():.4f}"
+            )
 
         def encode(batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             with torch.autocast(device_type=device_type, enabled=False):
                 posterior = vae.encode(batch).latent_dist
+                if step_number <= 1:
+                    params = posterior.parameters
+                    logger.info(
+                        f"[encode_vae_mode/{source}] posterior.parameters: "
+                        f"shape={tuple(params.shape)} dtype={params.dtype} "
+                        f"finite={bool(torch.isfinite(params).all().item())} "
+                        f"nan={int(torch.isnan(params).sum().item())} "
+                        f"inf={int(torch.isinf(params).sum().item())} "
+                        f"finite_min={params[torch.isfinite(params)].min().item() if torch.isfinite(params).any() else float('nan'):.4e} "
+                        f"finite_max={params[torch.isfinite(params)].max().item() if torch.isfinite(params).any() else float('nan'):.4e}"
+                    )
                 return posterior.sample().float(), posterior.mode().float()
 
         sampled_latents, mode_latents = encode(images)
