@@ -67,6 +67,7 @@ from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from utils.training_losses import (
     build_local_correction_target,
     build_online_degradation_targets,
+    clip_grad_norm_stable,
     extend_optimizer_state_for_appended_params,
     load_degradation_statistics,
     select_image_loss_inputs,
@@ -2947,18 +2948,16 @@ def main(args):
                     accelerator.unscale_gradients(optimizer)
                     if collect_ra_diagnostics:
                         ra_gradient_diagnostics = collect_ra_gradient_diagnostics()
-                    try:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            params_to_clip,
-                            args.max_grad_norm,
-                            error_if_nonfinite=True,
-                        )
-                    except RuntimeError as error:
-                        bad_gradients = find_nonfinite_gradient_names()
+                    bad_gradients = find_nonfinite_gradient_names()
+                    if bad_gradients:
                         raise FloatingPointError(
                             f"[Step {global_step + 1}] backward 产生非有限梯度; "
                             f"首批参数={bad_gradients[:20]}"
-                        ) from error
+                        )
+                    grad_norm = clip_grad_norm_stable(
+                        params_to_clip,
+                        args.max_grad_norm,
+                    )
                     if not bool(torch.isfinite(grad_norm)):
                         raise FloatingPointError(
                             f"[Step {global_step + 1}] gradient norm 非有限: {grad_norm}"

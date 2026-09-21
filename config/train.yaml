@@ -144,7 +144,7 @@ mixed_precision: "bf16"
 upcast_vae: true
 # 三项均可能改变执行路径，默认关闭；逐项验证 PSNR 与峰值显存后再启用。
 vae_gradient_checkpointing: false
-vae_slicing: false
+vae_slicing: true                       # 按样本切分 VAE batch，规避批量 encode 的 CUDA NaN
 vae_tiling: false
 
 # 梯度检查点 (用时间换显存)

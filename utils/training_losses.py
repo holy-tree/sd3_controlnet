@@ -7,6 +7,46 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.no_grad()
+def clip_grad_norm_stable(
+    parameters,
+    max_norm: float,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Clip finite gradients without overflowing the aggregate FP32 norm."""
+    if not math.isfinite(max_norm) or max_norm <= 0.0:
+        raise ValueError("max_norm must be finite and positive")
+    gradients = [
+        parameter.grad.detach()
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not gradients:
+        return torch.tensor(0.0)
+    if any(not bool(torch.isfinite(gradient).all()) for gradient in gradients):
+        raise FloatingPointError("Cannot clip gradients containing NaN or Inf")
+
+    device = gradients[0].device
+    max_abs = torch.stack([
+        gradient.abs().max().to(device=device, dtype=torch.float64)
+        for gradient in gradients
+    ]).max()
+    if max_abs.item() == 0.0:
+        return max_abs
+
+    scaled_square_sum = torch.zeros((), device=device, dtype=torch.float64)
+    scale = max_abs.to(dtype=torch.float32)
+    for gradient in gradients:
+        normalized = gradient.float() / scale
+        scaled_square_sum += normalized.square().sum(dtype=torch.float64)
+    total_norm = max_abs * scaled_square_sum.sqrt()
+    clip_coefficient = min(1.0, float(max_norm / (total_norm.item() + eps)))
+    if clip_coefficient < 1.0:
+        for gradient in gradients:
+            gradient.mul_(clip_coefficient)
+    return total_norm
+
+
 def load_degradation_statistics(
     path: str | Path,
     weather_types: list[str],

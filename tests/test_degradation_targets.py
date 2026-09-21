@@ -14,6 +14,7 @@ from scripts.precompute_degradation_targets import (
 from utils.training_losses import (
     build_local_correction_target,
     build_online_degradation_targets,
+    clip_grad_norm_stable,
     extend_optimizer_state_for_appended_params,
     load_degradation_statistics,
     residual_severity,
@@ -24,6 +25,16 @@ from utils.training_losses import (
 
 
 class DegradationTargetTest(unittest.TestCase):
+    def test_stable_gradient_clipping_handles_fp32_norm_overflow(self):
+        parameter = torch.nn.Parameter(torch.zeros(4, dtype=torch.float32))
+        parameter.grad = torch.full_like(parameter, 1e30)
+
+        original_norm = clip_grad_norm_stable([parameter], max_norm=1.0)
+
+        self.assertTrue(torch.isfinite(original_norm))
+        self.assertGreater(float(original_norm), 1e30)
+        self.assertAlmostEqual(float(parameter.grad.double().norm()), 1.0, places=5)
+
     def test_local_correction_target_preserves_signed_latent_residual(self):
         gt_latent = torch.linspace(-1.0, 1.0, 2 * 3 * 4 * 4).view(2, 3, 4, 4)
         lq_latent = torch.flip(gt_latent, dims=(-1,))
