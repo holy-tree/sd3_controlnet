@@ -2449,6 +2449,8 @@ def main(args):
         def encode(batch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             with torch.autocast(device_type=device_type, enabled=False):
                 posterior = vae.encode(batch).latent_dist
+                sampled = posterior.sample().float()
+                mode = posterior.mode().float()
                 if step_number <= 1:
                     params = posterior.parameters
                     logger.info(
@@ -2460,7 +2462,16 @@ def main(args):
                         f"finite_min={params[torch.isfinite(params)].min().item() if torch.isfinite(params).any() else float('nan'):.4e} "
                         f"finite_max={params[torch.isfinite(params)].max().item() if torch.isfinite(params).any() else float('nan'):.4e}"
                     )
-                return posterior.sample().float(), posterior.mode().float()
+                if not bool(torch.isfinite(sampled).all() and torch.isfinite(mode).all()):
+                    params = posterior.parameters
+                    logger.warning(
+                        f"[Step {step_number}] {source} VAE posterior 诊断: "
+                        f"batch={batch.shape[0]}, params_finite={bool(torch.isfinite(params).all())}, "
+                        f"sample_finite={bool(torch.isfinite(sampled).all())}, "
+                        f"mode_finite={bool(torch.isfinite(mode).all())}, "
+                        f"params_abs_max={params[torch.isfinite(params)].abs().max().item() if torch.isfinite(params).any() else float('nan'):.4e}"
+                    )
+                return sampled, mode
 
         sampled_latents, mode_latents = encode(images)
         bad_indices = (
@@ -2686,6 +2697,12 @@ def main(args):
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                if check_source_tensors:
+                    raise_if_nonfinite("sampled noise", noise, global_step + 1, batch.get("gt_path"))
+                    raise_if_nonfinite("sigmas", sigmas, global_step + 1)
+                    raise_if_nonfinite(
+                        "noisy model input", noisy_model_input, global_step + 1, batch.get("gt_path")
+                    )
 
                 # Get the text embedding for conditioning
                 prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
@@ -2783,10 +2800,27 @@ def main(args):
                 # Raw velocity flow-matching loss. This avoids the implicit sigma^2
                 # attenuation introduced by supervising preconditioned x0 directly.
                 target = noise - model_input
+                residual = model_pred.float() - target.float()
+                if check_source_tensors:
+                    raise_if_nonfinite("flow target", target, global_step + 1, batch.get("gt_path"))
+                    raise_if_nonfinite("loss weighting", weighting, global_step + 1)
+                    raise_if_nonfinite("flow residual", residual, global_step + 1, batch.get("gt_path"))
+                    residual_per_sample = residual.abs().flatten(1).amax(1)
+                    logger.info(
+                        f"[Flow diagnostics][Step {global_step + 1}] "
+                        f"model_pred_abs_max={model_pred.detach().float().abs().max().item():.4e}, "
+                        f"target_abs_max={target.detach().float().abs().max().item():.4e}, "
+                        f"residual_abs_max={residual.detach().abs().max().item():.4e}, "
+                        f"weighting=[{weighting.detach().float().min().item():.4e}, "
+                        f"{weighting.detach().float().max().item():.4e}], "
+                        f"sigma=[{sigmas.detach().float().min().item():.4e}, "
+                        f"{sigmas.detach().float().max().item():.4e}], "
+                        f"residual_per_sample={residual_per_sample.detach().cpu().tolist()}"
+                    )
 
                 # Compute regular loss.
                 loss_mse = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    (weighting.float() * residual.square()).reshape(target.shape[0], -1),
                     1,
                 )
                 loss_mse = loss_mse.mean()

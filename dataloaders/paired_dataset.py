@@ -263,8 +263,8 @@ class PairedCaptionDataset(data.Dataset):
         lq_img = self.to_tensor(lq_img)
 
         result = {
-            "conditioning_pixel_values": (lq_img * 2.0 - 1.0).clamp(-1.0, 1.0),  # LQ, [-1, 1] 跟 VAE 输入范围对齐
-            "pixel_values":              (gt_img * 2.0 - 1.0).clamp(-1.0, 1.0),  # GT, [-1, 1]
+            "conditioning_pixel_values": lq_img * 2.0 - 1.0,  # LQ, [-1, 1] 跟 VAE 输入范围对齐
+            "pixel_values":              gt_img * 2.0 - 1.0,  # GT, [-1, 1]
             "weather":                   weather,
             "gt_path":                   str(gt_path),
             "lq_path":                   str(lq_path),
