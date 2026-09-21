@@ -2619,22 +2619,22 @@ def main(args):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
-                if global_step == 0:
+                if global_step < 5:
                     import sys
-                    print(f"\n[STEP 1 / before_encode] "
+                    print(f"\n[STEP {global_step+1} / before_encode] "
                           f"batch[pixel_values].dtype={gt_pixels_for_targets.dtype} "
                           f"device={gt_pixels_for_targets.device} "
                           f"min={gt_pixels_for_targets.min().item():.4e} "
                           f"max={gt_pixels_for_targets.max().item():.4e} "
                           f"finite={bool(torch.isfinite(gt_pixels_for_targets).all().item())}", file=sys.stderr)
-                    print(f"[STEP 1 / after_to_fp32] "
+                    print(f"[STEP {global_step+1} / after_to_fp32] "
                           f"pixel_values.dtype={pixel_values.dtype} "
                           f"device={pixel_values.device} "
                           f"min={pixel_values.min().item():.4e} "
                           f"max={pixel_values.max().item():.4e}", file=sys.stderr)
                     gtp = batch.get("gt_path")
                     if gtp:
-                        print(f"[STEP 1 / paths] {gtp}", file=sys.stderr)
+                        print(f"[STEP {global_step+1} / paths] {gtp}", file=sys.stderr)
                     sys.stderr.flush()
                 gt_latent, gt_mode_latent = encode_vae_mode(
                     pixel_values,
