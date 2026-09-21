@@ -2368,15 +2368,47 @@ def main(args):
         return sigma
 
     @torch.no_grad()
-    def encode_vae_mode(images: torch.Tensor) -> torch.Tensor:
+    def encode_vae_mode(
+        images: torch.Tensor,
+        *,
+        source: str,
+        step_number: int,
+        sample_paths: list[str] | None,
+    ) -> torch.Tensor:
         # Keep SD3 VAE encoding in true FP32. Mixed-precision autocast can make
         # the encoder attention overflow for otherwise valid restoration images.
         device_type = accelerator.device.type
-        with torch.autocast(device_type=device_type, enabled=False):
-            posterior = vae.encode(
-                images.to(device=accelerator.device, dtype=torch.float32)
-            ).latent_dist
-            return posterior.mode().float()
+        images = images.to(device=accelerator.device, dtype=torch.float32)
+
+        def encode(batch: torch.Tensor) -> torch.Tensor:
+            with torch.autocast(device_type=device_type, enabled=False):
+                return vae.encode(batch).latent_dist.mode().float()
+
+        latents = encode(images)
+        bad_indices = (
+            (~torch.isfinite(latents)).flatten(1).any(1).nonzero(as_tuple=False).flatten().tolist()
+        )
+        for index in bad_indices:
+            path = sample_paths[index] if sample_paths is not None else f"batch_index={index}"
+            logger.warning(
+                f"[Step {step_number}] {source} VAE batch encode 非有限，"
+                f"单张 FP32 重试: {path}"
+            )
+            retry = encode(images[index:index + 1])
+            if not bool(torch.isfinite(retry).all()) and device_type == "cuda":
+                logger.warning(
+                    f"[Step {step_number}] {source} 单张重试仍非有限，"
+                    f"改用 math SDPA: {path}"
+                )
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_math=True,
+                    enable_mem_efficient=False,
+                    enable_cudnn=False,
+                ):
+                    retry = encode(images[index:index + 1])
+            latents[index:index + 1] = retry
+        return latents
 
     def raise_if_nonfinite(
         name: str,
@@ -2502,7 +2534,12 @@ def main(args):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
                 pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
-                gt_latent = encode_vae_mode(pixel_values)
+                gt_latent = encode_vae_mode(
+                    pixel_values,
+                    source="GT",
+                    step_number=global_step + 1,
+                    sample_paths=batch.get("gt_path"),
+                )
                 model_input = gt_latent
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
@@ -2555,7 +2592,12 @@ def main(args):
                 # controlnet(s) inference
                 lq_pixels_for_targets = batch["conditioning_pixel_values"]
                 conditioning_pixels = lq_pixels_for_targets.to(dtype=torch.float32)
-                lq_latent = encode_vae_mode(conditioning_pixels)
+                lq_latent = encode_vae_mode(
+                    conditioning_pixels,
+                    source="LQ",
+                    step_number=global_step + 1,
+                    sample_paths=batch.get("lq_path"),
+                )
                 controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
                 controlnet_image = (lq_latent - controlnet_shift) * vae.config.scaling_factor
                 controlnet_image = controlnet_image.to(dtype=weight_dtype)
