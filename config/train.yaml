@@ -144,7 +144,7 @@ mixed_precision: "bf16"
 upcast_vae: true
 # 三项均可能改变执行路径，默认关闭；逐项验证 PSNR 与峰值显存后再启用。
 vae_gradient_checkpointing: false
-vae_slicing: false                      # 保留 batch 编码；失败样本由训练循环显式逐张重试
+vae_slicing: true                       # batch VAE attention 偶发非有限，固定逐张编码
 vae_tiling: false
 
 # 梯度检查点 (用时间换显存)

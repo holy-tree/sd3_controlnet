@@ -2451,8 +2451,18 @@ def main(args):
                 posterior = vae.encode(batch).latent_dist
                 sampled = posterior.sample().float()
                 mode = posterior.mode().float()
+                params = posterior.parameters
+                sampled_abs_max = (
+                    sampled[torch.isfinite(sampled)].abs().max().item()
+                    if torch.isfinite(sampled).any()
+                    else float("nan")
+                )
+                mode_abs_max = (
+                    mode[torch.isfinite(mode)].abs().max().item()
+                    if torch.isfinite(mode).any()
+                    else float("nan")
+                )
                 if step_number <= 1:
-                    params = posterior.parameters
                     logger.info(
                         f"[encode_vae_mode/{source}] posterior.parameters: "
                         f"shape={tuple(params.shape)} dtype={params.dtype} "
@@ -2462,14 +2472,21 @@ def main(args):
                         f"finite_min={params[torch.isfinite(params)].min().item() if torch.isfinite(params).any() else float('nan'):.4e} "
                         f"finite_max={params[torch.isfinite(params)].max().item() if torch.isfinite(params).any() else float('nan'):.4e}"
                     )
-                if not bool(torch.isfinite(sampled).all() and torch.isfinite(mode).all()):
-                    params = posterior.parameters
+                if not bool(
+                    torch.isfinite(params).all()
+                    and torch.isfinite(sampled).all()
+                    and torch.isfinite(mode).all()
+                    and sampled_abs_max < 1.0e4
+                    and mode_abs_max < 1.0e4
+                ):
                     logger.warning(
                         f"[Step {step_number}] {source} VAE posterior 诊断: "
                         f"batch={batch.shape[0]}, params_finite={bool(torch.isfinite(params).all())}, "
                         f"sample_finite={bool(torch.isfinite(sampled).all())}, "
                         f"mode_finite={bool(torch.isfinite(mode).all())}, "
-                        f"params_abs_max={params[torch.isfinite(params)].abs().max().item() if torch.isfinite(params).any() else float('nan'):.4e}"
+                        f"params_abs_max={params[torch.isfinite(params)].abs().max().item() if torch.isfinite(params).any() else float('nan'):.4e}, "
+                        f"sample_abs_max={sampled_abs_max:.4e}, "
+                        f"mode_abs_max={mode_abs_max:.4e}"
                     )
                 return sampled, mode
 
@@ -2478,6 +2495,8 @@ def main(args):
             (
                 (~torch.isfinite(sampled_latents)).flatten(1).any(1)
                 | (~torch.isfinite(mode_latents)).flatten(1).any(1)
+                | (sampled_latents.abs() >= 1.0e4).flatten(1).any(1)
+                | (mode_latents.abs() >= 1.0e4).flatten(1).any(1)
             ).nonzero(as_tuple=False).flatten().tolist()
         )
         for index in bad_indices:
@@ -2487,12 +2506,15 @@ def main(args):
                 f"单张 FP32 重试: {path}"
             )
             retry_sample, retry_mode = encode(images[index:index + 1])
-            retry_is_finite = bool(
-                torch.isfinite(retry_sample).all() and torch.isfinite(retry_mode).all()
+            retry_is_valid = bool(
+                torch.isfinite(retry_sample).all()
+                and torch.isfinite(retry_mode).all()
+                and retry_sample.abs().max() < 1.0e4
+                and retry_mode.abs().max() < 1.0e4
             )
-            if not retry_is_finite and device_type == "cuda":
+            if not retry_is_valid and device_type == "cuda":
                 logger.warning(
-                    f"[Step {step_number}] {source} 单张重试仍非有限，"
+                    f"[Step {step_number}] {source} 单张重试仍非有限或幅值异常，"
                     f"改用 math SDPA: {path}"
                 )
                 with torch.backends.cuda.sdp_kernel(
@@ -2502,6 +2524,18 @@ def main(args):
                     enable_cudnn=False,
                 ):
                     retry_sample, retry_mode = encode(images[index:index + 1])
+            retry_is_valid = bool(
+                torch.isfinite(retry_sample).all()
+                and torch.isfinite(retry_mode).all()
+                and retry_sample.abs().max() < 1.0e4
+                and retry_mode.abs().max() < 1.0e4
+            )
+            if not retry_is_valid:
+                raise FloatingPointError(
+                    f"[Step {step_number}] {source} VAE 单张 math SDPA 重试失败: {path}; "
+                    f"sample_abs_max={retry_sample[torch.isfinite(retry_sample)].abs().max().item() if torch.isfinite(retry_sample).any() else float('nan'):.4e}, "
+                    f"mode_abs_max={retry_mode[torch.isfinite(retry_mode)].abs().max().item() if torch.isfinite(retry_mode).any() else float('nan'):.4e}"
+                )
             sampled_latents[index:index + 1] = retry_sample
             mode_latents[index:index + 1] = retry_mode
         return sampled_latents, mode_latents
