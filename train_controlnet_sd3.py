@@ -1721,6 +1721,7 @@ def main(args):
 
     transformer.requires_grad_(False)
     vae.requires_grad_(False)
+    vae.eval()
     if args.vae_gradient_checkpointing:
         vae.enable_gradient_checkpointing()
     if args.vae_slicing:
@@ -2366,6 +2367,17 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
+    @torch.no_grad()
+    def encode_vae_mode(images: torch.Tensor) -> torch.Tensor:
+        # Keep SD3 VAE encoding in true FP32. Mixed-precision autocast can make
+        # the encoder attention overflow for otherwise valid restoration images.
+        device_type = accelerator.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            posterior = vae.encode(
+                images.to(device=accelerator.device, dtype=torch.float32)
+            ).latent_dist
+            return posterior.mode().float()
+
     def raise_if_nonfinite(
         name: str,
         tensor: torch.Tensor,
@@ -2489,14 +2501,14 @@ def main(args):
             with accelerator.accumulate(*models_to_accumulate):
                 # Convert images to latent space
                 gt_pixels_for_targets = batch["pixel_values"]
-                pixel_values = gt_pixels_for_targets.to(dtype=vae.dtype)
-                gt_posterior = vae.encode(pixel_values).latent_dist
-                model_input = gt_posterior.mode()
+                pixel_values = gt_pixels_for_targets.to(dtype=torch.float32)
+                gt_latent = encode_vae_mode(pixel_values)
+                model_input = gt_latent
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
                 gt_restoration_latent = None
                 if args.ra_local_correction_loss_weight > 0.0:
-                    gt_restoration_latent = gt_posterior.mode()
+                    gt_restoration_latent = gt_latent
                     gt_restoration_latent = (
                         gt_restoration_latent - vae.config.shift_factor
                     ) * vae.config.scaling_factor
@@ -2542,9 +2554,8 @@ def main(args):
 
                 # controlnet(s) inference
                 lq_pixels_for_targets = batch["conditioning_pixel_values"]
-                conditioning_pixels = lq_pixels_for_targets.to(dtype=vae.dtype)
-                lq_posterior = vae.encode(conditioning_pixels).latent_dist
-                lq_latent = lq_posterior.mode()
+                conditioning_pixels = lq_pixels_for_targets.to(dtype=torch.float32)
+                lq_latent = encode_vae_mode(conditioning_pixels)
                 controlnet_shift = 0.0 if controlnet_force_zero_pooled else vae.config.shift_factor
                 controlnet_image = (lq_latent - controlnet_shift) * vae.config.scaling_factor
                 controlnet_image = controlnet_image.to(dtype=weight_dtype)
