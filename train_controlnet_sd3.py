@@ -2019,12 +2019,12 @@ def main(args):
         ]
         if non_fp32_vae_parameters:
             raise TypeError(
-                "upcast_vae=True requires every VAE parameter to be FP32; "
+"upcast_vae=True requires every VAE parameter to be FP32; "
                 f"found non-FP32 parameters: {non_fp32_vae_parameters[:5]}"
             )
     else:
         vae.to(accelerator.device, dtype=weight_dtype)
-logger.info(
+    logger.info(
         f"[VAE] dtype={vae.dtype}, slicing={args.vae_slicing}, "
         f"tiling={args.vae_tiling}, force_upcast={getattr(vae.config, 'force_upcast', None)}"
     )
@@ -2411,7 +2411,7 @@ logger.info(
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-@torch.no_grad()
+    @torch.no_grad()
     def encode_vae_mode(
         images: torch.Tensor,
         *,
