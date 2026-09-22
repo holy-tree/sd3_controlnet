@@ -26,6 +26,8 @@ dependencies = [
     "peft>=0.14.0",
     "sentencepiece==0.2.0",
     "huggingface-hub==0.36.0",
+    # pyiqa's CLIP backend still imports pkg_resources at runtime.
+    "setuptools>=68,<81",
 ]
 
 [tool.setuptools]

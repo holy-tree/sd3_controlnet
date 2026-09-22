@@ -159,6 +159,13 @@ def main() -> None:
         import pyiqa
     except ImportError as error:
         raise RuntimeError("pyiqa is required: python -m pip install pyiqa") from error
+    try:
+        import pkg_resources  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError(
+            "pyiqa's CLIP backend requires pkg_resources; install it with "
+            "`python -m pip install 'setuptools>=68,<81'`"
+        ) from error
 
     device = torch.device(args.device)
     available = set(pyiqa.list_models())

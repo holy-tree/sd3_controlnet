@@ -105,7 +105,9 @@ dpo_candidates/
 
 每个候选组的 `metrics.txt` 保存 6 个 candidate-to-GT 的 PSNR、SSIM、LPIPS，以及实际 PSNR gap 和对应天气阈值。
 
-已有候选图不需要重新生成。安装 `pyiqa` 后，对 PNG 离线补算美学指标：
+已有候选图不需要重新生成。安装 `pyiqa` 后，对 PNG 离线补算美学指标。
+`pyiqa` 的 CLIP 后端仍依赖 `pkg_resources`；若环境使用已移除它的新版
+`setuptools`，先运行 `python -m pip install "setuptools>=68,<81"`：
 
 ```bash
 python -m scripts.rescore_dpo_candidates \
