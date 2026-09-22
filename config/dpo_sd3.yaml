@@ -50,17 +50,27 @@ candidate_generation:
 
 # ==================== 2. Preference filtering ====================
 preference_filter:
-  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics.csv"
+  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics_aesthetic.csv"
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences"
   pair_strategy: "all_pairs"       # best_vs_all | best_vs_worst | all_pairs
-  min_psnr_gap: 0.2
-  # Initial values based on current rain/snow/haze gaps. Tune independently.
+  # Aesthetic preference may trade at most 0.15 dB PSNR for better visual quality.
+  min_psnr_gap: -0.15
   weather_specific_thresholds:
-    rain: 0.2
-    snow: 0.5
-    haze: 1.0
+    rain: -0.15
+    snow: -0.15
+    haze: -0.15
   max_psnr_gap: null
-  # Maximum retained pairs per source image after sorting by PSNR gap.
+  # Ignore visually insignificant aesthetic score differences.
+  min_reward_gap: 0.05
+  fidelity_constraints:
+    # DISTS is lower-is-better; chosen may degrade by at most this amount.
+    max_dists_pair_degradation: 0.01
+    # Existing candidates all come from the SFT model. Their group median is
+    # used as a per-source SFT fidelity baseline.
+    baseline_mode: "group_median"
+    baseline_psnr_tolerance: 0.50
+    baseline_dists_tolerance: 0.02
+  # Maximum retained pairs per source image after sorting by aesthetic reward gap.
   max_samples_per_pair: 3
   # null means unlimited; useful for balancing haze against rain/snow.
   max_pairs_per_weather: null
@@ -69,15 +79,15 @@ preference_filter:
 
 # ==================== 3. Offline reward ====================
 reward:
-  # Higher total reward wins. Add metrics without changing filtering code.
+  # Robust z-scores are produced by scripts/rescore_dpo_candidates.py.
   weights:
-    psnr: 1.0
-    # ssim: 0.0
-    # lpips: 0.0
+    musiq_z: 0.55
+    clipiqa_z: 0.35
+    nima_z: 0.10
   directions:
-    psnr: 1.0
-    ssim: 1.0
-    lpips: -1.0
+    musiq_z: 1.0
+    clipiqa_z: 1.0
+    nima_z: 1.0
 
 # ==================== 4. DPO model ====================
 model:
@@ -151,7 +161,7 @@ training:
   sft_weight: 0.0
   # Direct GT anchors. These supervise the policy only; the reference remains frozen.
   gt_flow_weight: 0.1
-  gt_x0_l1_weight: 0.0
+  gt_x0_l1_weight: 0.01
   weight_by_psnr_gap: false
   # Refuse legacy/mismatched preference data unless explicitly disabled.
   require_candidate_provenance: true

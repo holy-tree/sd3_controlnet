@@ -11,6 +11,13 @@ DEFAULT_DIRECTIONS = {
     "psnr": 1.0,
     "ssim": 1.0,
     "lpips": -1.0,
+    "dists": -1.0,
+    "musiq": 1.0,
+    "clipiqa": 1.0,
+    "nima": 1.0,
+    "musiq_z": 1.0,
+    "clipiqa_z": 1.0,
+    "nima_z": 1.0,
     "perceptual_loss": -1.0,
 }
 

@@ -105,6 +105,18 @@ dpo_candidates/
 
 每个候选组的 `metrics.txt` 保存 6 个 candidate-to-GT 的 PSNR、SSIM、LPIPS，以及实际 PSNR gap 和对应天气阈值。
 
+已有候选图不需要重新生成。安装 `pyiqa` 后，对 PNG 离线补算美学指标：
+
+```bash
+python -m scripts.rescore_dpo_candidates \
+  --input_csv /root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics.csv \
+  --output_csv /root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics_aesthetic.csv
+```
+
+脚本计算 MUSIQ、CLIP-IQA+、NIMA 和 DISTS，并按天气使用候选全集固定的
+`(score - median) / IQR` 生成 `musiq_z`、`clipiqa_z` 和 `nima_z`。
+归一化统计写入同目录的 `*_normalization.json`。
+
 ## 2. 构建偏好对
 
 运行：
@@ -117,14 +129,20 @@ python -m scripts.filter_dpo_pairs --config config/dpo_sd3.yaml
 
 ```yaml
 preference_filter:
-  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics.csv"
+  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics_aesthetic.csv"
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences"
-  pair_strategy: "best_vs_all"
-  min_psnr_gap: 0.2
+  pair_strategy: "all_pairs"
+  min_psnr_gap: -0.15
   weather_specific_thresholds:
-    rain: 0.2
-    snow: 0.5
-    haze: 1.0
+    rain: -0.15
+    snow: -0.15
+    haze: -0.15
+  min_reward_gap: 0.05
+  fidelity_constraints:
+    max_dists_pair_degradation: 0.01
+    baseline_mode: "group_median"
+    baseline_psnr_tolerance: 0.50
+    baseline_dists_tolerance: 0.02
   max_samples_per_pair: 3
   max_pairs_per_weather: null
   shuffle: true
@@ -133,11 +151,12 @@ preference_filter:
 
 支持三种配对策略：
 
-- `best_vs_worst`：每组只使用 PSNR 最高和最低的候选。
-- `best_vs_all`：最佳候选分别与其他候选配对。
-- `all_pairs`：组内所有候选两两组合，质量较高者为 chosen，较低者为 rejected。
+- `best_vs_worst`：每组只使用 aesthetic reward 最高和最低的候选。
+- `best_vs_all`：reward 最高候选分别与其他候选配对。
+- `all_pairs`：组内所有候选两两组合，reward 较高者为 chosen。
 
-所有策略都会继续应用 pair 级 PSNR gap 阈值，并按 gap 从大到小最多保留 `max_samples_per_pair` 对。
+所有策略都应用 PSNR、DISTS 和候选组中位数保真约束，然后按 aesthetic reward gap
+从大到小最多保留 `max_samples_per_pair` 对。
 
 输出：
 
@@ -157,58 +176,28 @@ dpo_preferences/
 ```yaml
 reward:
   weights:
-    psnr: 1.0
-    # ssim: 0.0
-    # lpips: 0.0
+    musiq_z: 0.55
+    clipiqa_z: 0.35
+    nima_z: 0.10
   directions:
-    psnr: 1.0
-    ssim: 1.0
-    lpips: -1.0
+    musiq_z: 1.0
+    clipiqa_z: 1.0
+    nima_z: 1.0
 ```
 
 `weights` 决定每个指标对总奖励的权重，值为 0 或未配置表示不参与奖励。
 
-`directions` 将不同指标统一成“奖励越大越好”：
-
-- PSNR 越大越好，因此方向为 `1.0`。
-- SSIM 越大越好，因此方向为 `1.0`。
-- LPIPS 越小越好，因此方向为 `-1.0`。
+`directions` 将不同指标统一成“奖励越大越好”。三个 z-score 都是越大越好。
 
 奖励计算公式为：
 
 ```text
-reward = sum(weight[metric] * direction[metric] * metric_value)
+reward = 0.55 * musiq_z + 0.35 * clipiqa_z + 0.10 * nima_z
 ```
 
-当前默认只使用 PSNR：
-
-```text
-reward = 1.0 * 1.0 * PSNR = PSNR
-```
-
-因此即使 `directions` 中写了 SSIM 和 LPIPS，只要它们未在 `weights` 中启用，就不会影响当前奖励。
-
-后续启用多指标的示例：
-
-```yaml
-reward:
-  weights:
-    psnr: 1.0
-    ssim: 2.0
-    lpips: 0.5
-  directions:
-    psnr: 1.0
-    ssim: 1.0
-    lpips: -1.0
-```
-
-对应：
-
-```text
-reward = PSNR + 2.0 * SSIM - 0.5 * LPIPS
-```
-
-注意不同指标的数值尺度差异很大。PSNR 通常为几十，SSIM 为 0 到 1，LPIPS 通常也在较小范围；启用多奖励前应先统计分布并重新设计权重或归一化方案。
+PSNR 和 DISTS 不进入 aesthetic reward，而作为保真门槛。chosen 最多允许损失
+0.15 dB PSNR；DISTS pair 退化最多 0.01。每个源图现有候选的 PSNR/DISTS
+中位数作为 SFT baseline，chosen 还必须满足绝对保真下限。
 
 ## 4. DPO 训练
 
@@ -257,14 +246,14 @@ training:
 | 训练步数 | 5000 | 1000–10000 |
 | `sft_weight` | 0 | 0–0.1 |
 | `gt_flow_weight` | 0.1 | 0.03–0.3 |
-| `gt_x0_l1_weight` | 0.05 | 0–0.1 |
+| `gt_x0_l1_weight` | 0.01 | 0–0.1 |
 
 第一轮建议保持：
 
 ```yaml
 sft_weight: 0.0
 gt_flow_weight: 0.1
-gt_x0_l1_weight: 0.05
+gt_x0_l1_weight: 0.01
 weight_by_psnr_gap: false
 ```
 
