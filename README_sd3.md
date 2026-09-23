@@ -48,6 +48,20 @@ python -m utils.evaluate_sd3 --config config/eval_sd3.yaml
 
 Evaluation supports PSNR, SSIM, LPIPS, FID, RA ablations, and optional low-frequency, high-frequency, and affine oracle analysis.
 
+To measure inference-seed robustness with the same evaluation samples, run a 20-seed sweep:
+
+```bash
+python -m scripts.evaluate_seed_sweep \
+  --config config/eval_sd3.yaml \
+  --num_seeds 20 \
+  --output_dir /root/autodl-tmp/sd3/experiment/eval_seed_sweep
+```
+
+The sweep reuses the evaluator configuration and writes per-seed metrics plus mean,
+standard deviation, sample variance, min, and max summaries. Dataset sampling uses one
+fixed `sample_seed`, so only diffusion inference noise changes between runs. Completed
+seed directories are reused automatically when the same output directory is supplied.
+
 ## DPO Workflow
 
 The optional DPO pipeline uses `config/dpo_sd3.yaml`:

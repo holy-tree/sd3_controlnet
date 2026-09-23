@@ -693,7 +693,8 @@ def evaluate(args_config: dict):
     default_max = args_config.get("max_samples_per_weather", 0)
     sample_mode = args_config.get("sample_mode", "head")
     if sample_mode == "random":
-        sample_seed = args_config.get("seed")
+        # Keep dataset sampling fixed during seed sweeps while varying inference noise.
+        sample_seed = args_config.get("sample_seed", args_config.get("seed"))
         if sample_seed is not None:
             random.seed(sample_seed)
     for sub_name in by_sub:
@@ -1471,6 +1472,7 @@ def evaluate(args_config: dict):
         print(f"\n{oracle_table}\n\n{ORACLE_INTERPRETATION}")
     print(f"\n[eval] 评估完成, 结果保存到: {eval_root}")
     print(f"[eval] 汇总指标: {summary_path}")
+    return metrics_json, eval_root
 
 
 if __name__ == "__main__":
