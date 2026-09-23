@@ -4,8 +4,10 @@ import math
 import unittest
 
 from scripts.evaluate_seed_sweep import (
+    aggregate_per_image_statistics,
     extract_metric_rows,
     resolve_seeds,
+    summarize_per_image_rows,
     summarize_rows,
 )
 
@@ -51,6 +53,30 @@ class SeedSweepTest(unittest.TestCase):
         )
         self.assertIsNone(overall_musiq["mean"])
         self.assertEqual(overall_musiq["num_valid_seeds"], 0)
+
+    def test_per_image_variance_is_computed_before_image_average(self):
+        rows = [
+            {"seed": 1, "weather": "rain", "subdataset": "rain_test", "name": "a", "psnr": 1.0},
+            {"seed": 2, "weather": "rain", "subdataset": "rain_test", "name": "a", "psnr": 3.0},
+            {"seed": 1, "weather": "rain", "subdataset": "rain_test", "name": "b", "psnr": 2.0},
+            {"seed": 2, "weather": "rain", "subdataset": "rain_test", "name": "b", "psnr": 6.0},
+        ]
+        image_statistics = summarize_per_image_rows(rows)
+        image_a = next(row for row in image_statistics if row["name"] == "a")
+        image_b = next(row for row in image_statistics if row["name"] == "b")
+        self.assertEqual(image_a["variance"], 2.0)
+        self.assertEqual(image_b["variance"], 8.0)
+
+        aggregated = aggregate_per_image_statistics(image_statistics)
+        overall = next(
+            row
+            for row in aggregated
+            if row["scope"] == "overall" and row["metric"] == "psnr"
+        )
+        self.assertEqual(overall["mean"], 3.0)
+        self.assertEqual(overall["mean_seed_variance"], 5.0)
+        self.assertEqual(overall["rms_seed_std"], math.sqrt(5.0))
+        self.assertEqual(overall["num_valid_images"], 2)
 
 
 if __name__ == "__main__":

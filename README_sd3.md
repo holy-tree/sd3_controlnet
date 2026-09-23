@@ -57,10 +57,14 @@ python -m scripts.evaluate_seed_sweep \
   --output_dir /root/autodl-tmp/sd3/experiment/eval_seed_sweep
 ```
 
-The sweep reuses the evaluator configuration and writes per-seed metrics plus mean,
-standard deviation, sample variance, min, and max summaries. Dataset sampling uses one
-fixed `sample_seed`, so only diffusion inference noise changes between runs. Completed
-seed directories are reused automatically when the same output directory is supplied.
+The sweep reuses the evaluator configuration and keeps the evaluated image set fixed with
+one `sample_seed`. For each image, it computes the mean, standard deviation, and sample
+variance across inference seeds; those per-image statistics are then averaged across all
+images, each weather, and each subdataset. `per_image_seed_statistics.csv` contains the
+individual image results and `seed_statistics.csv` contains the image-averaged summary.
+FID has no per-image definition, so its across-seed statistics remain in
+`dataset_seed_statistics.csv`. Completed seed directories are reused automatically when
+the same output directory is supplied.
 
 ## DPO Workflow
 

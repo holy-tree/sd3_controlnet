@@ -30,7 +30,7 @@ METRIC_DIRECTIONS = {
     "fid": "down",
     **{name: "down" if direction == "↓" else "up" for name, direction in IQA_DIRECTION.items()},
 }
-METADATA_FIELDS = {"seed", "scope", "name", "weather", "n"}
+METADATA_FIELDS = {"seed", "scope", "name", "weather", "subdataset", "n"}
 PREFERRED_METRIC_ORDER = ["psnr", "ssim", "lpips", "fid", *IQA_DIRECTION]
 
 
@@ -146,8 +146,8 @@ def summarize_rows(rows: list[dict]) -> list[dict]:
                 if row.get(metric) is not None and math.isfinite(float(row[metric]))
             ]
             mean = statistics.fmean(values) if values else None
-            std = statistics.stdev(values) if len(values) >= 2 else (0.0 if values else None)
-            variance = statistics.variance(values) if len(values) >= 2 else (0.0 if values else None)
+            std = statistics.stdev(values) if len(values) >= 2 else None
+            variance = statistics.variance(values) if len(values) >= 2 else None
             summaries.append({
                 "scope": scope,
                 "name": name,
@@ -167,6 +167,139 @@ def summarize_rows(rows: list[dict]) -> list[dict]:
     return summaries
 
 
+def load_per_image_metric_rows(metrics_path: Path, seed: int) -> list[dict]:
+    per_image_path = metrics_path.parent / "per_image_metrics.csv"
+    if not per_image_path.is_file():
+        raise FileNotFoundError(f"Missing per-image metrics for seed {seed}: {per_image_path}")
+    rows = []
+    identities = set()
+    with per_image_path.open("r", newline="", encoding="utf-8") as handle:
+        for raw in csv.DictReader(handle):
+            identity = (raw["weather"], raw["subdataset"], raw["name"])
+            if identity in identities:
+                raise ValueError(
+                    "Per-image metric identity is not unique: "
+                    f"weather={identity[0]}, subdataset={identity[1]}, name={identity[2]}"
+                )
+            identities.add(identity)
+            row = {
+                "seed": seed,
+                "weather": identity[0],
+                "subdataset": identity[1],
+                "name": identity[2],
+            }
+            for key, value in raw.items():
+                if key in {"weather", "subdataset", "name", "infer_time"}:
+                    continue
+                try:
+                    row[key] = float(value) if value not in (None, "") else None
+                except ValueError:
+                    row[key] = None
+            rows.append(row)
+    return rows
+
+
+def validate_same_images(per_seed_rows: dict[int, list[dict]]) -> None:
+    expected_seed = next(iter(per_seed_rows))
+    expected = {
+        (row["weather"], row["subdataset"], row["name"])
+        for row in per_seed_rows[expected_seed]
+    }
+    for seed, rows in per_seed_rows.items():
+        actual = {
+            (row["weather"], row["subdataset"], row["name"])
+            for row in rows
+        }
+        if actual != expected:
+            missing = sorted(expected - actual)[:5]
+            extra = sorted(actual - expected)[:5]
+            raise ValueError(
+                f"Seed {seed} evaluated a different image set than seed {expected_seed}; "
+                f"missing={missing}, extra={extra}. Keep sample_seed fixed."
+            )
+
+
+def summarize_per_image_rows(rows: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str, str], list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[(row["weather"], row["subdataset"], row["name"])].append(row)
+
+    summaries = []
+    for (weather, subdataset, name), items in sorted(grouped.items()):
+        for metric in _ordered_metric_names(items):
+            values = [
+                float(row[metric])
+                for row in items
+                if row.get(metric) is not None and math.isfinite(float(row[metric]))
+            ]
+            mean = statistics.fmean(values) if values else None
+            std = statistics.stdev(values) if len(values) >= 2 else None
+            variance = statistics.variance(values) if len(values) >= 2 else None
+            summaries.append({
+                "weather": weather,
+                "subdataset": subdataset,
+                "name": name,
+                "metric": metric,
+                "direction": METRIC_DIRECTIONS.get(metric, "unknown"),
+                "num_seeds": len(items),
+                "num_valid_seeds": len(values),
+                "mean": mean,
+                "std": std,
+                "variance": variance,
+                "mean_minus_std": mean - std if mean is not None and std is not None else None,
+                "mean_plus_std": mean + std if mean is not None and std is not None else None,
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+            })
+    return summaries
+
+
+def aggregate_per_image_statistics(image_statistics: list[dict]) -> list[dict]:
+    grouped: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
+    for row in image_statistics:
+        scopes = (
+            ("overall", "ALL", "all"),
+            ("weather", row["weather"], row["weather"]),
+            ("subdataset", row["subdataset"], row["weather"]),
+        )
+        for scope, name, weather in scopes:
+            grouped[(scope, name, weather, row["metric"])].append(row)
+
+    aggregated = []
+    for (scope, name, weather, metric), items in sorted(grouped.items()):
+        valid = [
+            row for row in items
+            if row["mean"] is not None and row["variance"] is not None
+        ]
+        means = [float(row["mean"]) for row in valid]
+        stds = [float(row["std"]) for row in valid]
+        variances = [float(row["variance"]) for row in valid]
+        mean_metric = statistics.fmean(means) if means else None
+        mean_seed_std = statistics.fmean(stds) if stds else None
+        mean_seed_variance = statistics.fmean(variances) if variances else None
+        aggregated.append({
+            "scope": scope,
+            "name": name,
+            "weather": weather,
+            "metric": metric,
+            "direction": METRIC_DIRECTIONS.get(metric, "unknown"),
+            "num_images": len(items),
+            "num_valid_images": len(valid),
+            "num_seeds": min((row["num_seeds"] for row in items), default=0),
+            "mean": mean_metric,
+            "mean_seed_std": mean_seed_std,
+            "mean_seed_variance": mean_seed_variance,
+            "rms_seed_std": (
+                math.sqrt(mean_seed_variance)
+                if mean_seed_variance is not None
+                else None
+            ),
+            "min_seed_variance": min(variances) if variances else None,
+            "max_seed_variance": max(variances) if variances else None,
+        })
+    return aggregated
+
+
 def _write_csv(path: Path, rows: list[dict], fieldnames: list[str]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -180,22 +313,52 @@ def write_aggregate_outputs(
     seeds: list[int],
     sample_seed: int,
 ) -> None:
-    rows = [
+    dataset_rows = [
         row
         for seed, metrics, _ in run_results
         for row in extract_metric_rows(metrics, seed)
     ]
-    summaries = summarize_rows(rows)
-    metric_names = _ordered_metric_names(rows)
+    dataset_summaries = summarize_rows(dataset_rows)
+    metric_names = _ordered_metric_names(dataset_rows)
     _write_csv(
         output_dir / "per_seed_metrics.csv",
-        rows,
+        dataset_rows,
         ["seed", "scope", "name", "weather", "n", *metric_names],
     )
-    summary_fields = [
+    dataset_summary_fields = [
         "scope", "name", "weather", "metric", "direction", "num_seeds",
         "num_valid_seeds", "mean", "std", "variance", "mean_minus_std",
         "mean_plus_std", "min", "max",
+    ]
+    _write_csv(
+        output_dir / "dataset_seed_statistics.csv",
+        dataset_summaries,
+        dataset_summary_fields,
+    )
+
+    per_seed_image_rows = {
+        seed: load_per_image_metric_rows(metrics_path, seed)
+        for seed, _, metrics_path in run_results
+    }
+    validate_same_images(per_seed_image_rows)
+    image_rows = [row for rows in per_seed_image_rows.values() for row in rows]
+    image_statistics = summarize_per_image_rows(image_rows)
+    image_stat_fields = [
+        "weather", "subdataset", "name", "metric", "direction", "num_seeds",
+        "num_valid_seeds", "mean", "std", "variance", "mean_minus_std",
+        "mean_plus_std", "min", "max",
+    ]
+    _write_csv(
+        output_dir / "per_image_seed_statistics.csv",
+        image_statistics,
+        image_stat_fields,
+    )
+    summaries = aggregate_per_image_statistics(image_statistics)
+    summary_fields = [
+        "scope", "name", "weather", "metric", "direction", "num_images",
+        "num_valid_images", "num_seeds", "mean", "mean_seed_std",
+        "mean_seed_variance", "rms_seed_std", "min_seed_variance",
+        "max_seed_variance",
     ]
     _write_csv(output_dir / "seed_statistics.csv", summaries, summary_fields)
 
@@ -208,7 +371,16 @@ def write_aggregate_outputs(
             {"seed": seed, "metrics_path": str(metrics_path)}
             for seed, _, metrics_path in run_results
         ],
+        "aggregation": (
+            "For each image and metric, compute sample statistics across seeds; "
+            "then average those per-image statistics across images."
+        ),
+        "fid_note": (
+            "FID has no per-image definition and is reported only in "
+            "dataset_seed_statistics.csv."
+        ),
         "statistics": summaries,
+        "dataset_level_statistics": dataset_summaries,
     }
     with (output_dir / "seed_statistics.json").open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False, allow_nan=False)
@@ -216,21 +388,28 @@ def write_aggregate_outputs(
     display = [row for row in summaries if row["scope"] in {"overall", "weather"}]
     with (output_dir / "seed_statistics.txt").open("w", encoding="utf-8") as handle:
         handle.write(
-            "Seed robustness statistics (mean +/- std; variance is sample variance)\n"
+            "Per-image seed robustness statistics\n"
         )
         handle.write(f"Seeds: {payload['completed_seeds']}\nSample seed: {sample_seed}\n\n")
         handle.write(
-            f"{'Scope':<10} {'Name':<16} {'Metric':<12} {'Dir':<7} "
-            f"{'Valid':>5} {'Mean':>12} {'Std':>12} {'Variance':>12}\n"
+            "Each image is evaluated across seeds first. Its sample variance uses N-1; "
+            "MeanVariance below is the arithmetic mean of those per-image variances.\n"
+            "FID is distribution-level and is available only in dataset_seed_statistics.csv.\n\n"
         )
-        handle.write("-" * 92 + "\n")
+        handle.write(
+            f"{'Scope':<10} {'Name':<16} {'Metric':<12} {'Dir':<7} "
+            f"{'Images':>6} {'Mean':>12} {'MeanStd':>12} {'MeanVariance':>14}\n"
+        )
+        handle.write("-" * 98 + "\n")
         for row in display:
-            values = [row[key] for key in ("mean", "std", "variance")]
+            values = [
+                row[key] for key in ("mean", "mean_seed_std", "mean_seed_variance")
+            ]
             formatted = ["N/A" if value is None else f"{value:.6f}" for value in values]
             handle.write(
                 f"{row['scope']:<10} {row['name']:<16} {row['metric']:<12} "
-                f"{row['direction']:<7} {row['num_valid_seeds']:>5} "
-                f"{formatted[0]:>12} {formatted[1]:>12} {formatted[2]:>12}\n"
+                f"{row['direction']:<7} {row['num_valid_images']:>6} "
+                f"{formatted[0]:>12} {formatted[1]:>12} {formatted[2]:>14}\n"
             )
 
 
