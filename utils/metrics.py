@@ -334,12 +334,10 @@ def _load_pyiqa_metric(name: str):
     if not _pyiqa_available():
         return None
     if name in _IQA_CACHE:
-        metric = _IQA_CACHE[name]
-        if metric is not None:
-            return metric
+        return _IQA_CACHE[name]
     try:
         pyiqa = importlib.import_module("pyiqa")
-        metric = pyiqa.create_metric(name, require_corresponding_input=False)
+        metric = pyiqa.create_metric(name)
     except Exception as e:  # pragma: no cover - import depends on user env
         warnings.warn(f"[metrics] Failed to load pyiqa metric {name}: {e}")
         _IQA_CACHE[name] = None
@@ -449,7 +447,8 @@ def nima_batch(
     checkpoint: str = "ava",
 ) -> List[float]:
     """NIMA aesthetic score: higher is better, roughly 1–10."""
-    metric_name = f"nima-{checkpoint}" if checkpoint else "nima"
+    # Current pyiqa releases expose the AVA checkpoint under the base name.
+    metric_name = "nima" if checkpoint in ("", "ava") else f"nima-{checkpoint}"
     return _run_pyiqa_metric(metric_name, pred_batch, device)
 
 

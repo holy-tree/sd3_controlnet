@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import importlib.util
 import unittest
+import warnings
+from unittest import mock
 
 import torch
 
+import utils.metrics as metrics_module
 from utils.metrics import (
     available_iqa_metrics,
     clipiqa_batch,
@@ -24,6 +27,35 @@ from utils.perceptual_reward import (
 
 
 PYIQA_AVAILABLE = importlib.util.find_spec("pyiqa") is not None
+
+
+class IqaLoaderTest(unittest.TestCase):
+    def setUp(self):
+        metrics_module._IQA_CACHE.clear()
+
+    @mock.patch.object(metrics_module, "_pyiqa_available", return_value=True)
+    @mock.patch.object(metrics_module.importlib, "import_module")
+    def test_loader_uses_current_pyiqa_api(self, import_module, _available):
+        pyiqa = mock.Mock()
+        metric = object()
+        pyiqa.create_metric.return_value = metric
+        import_module.return_value = pyiqa
+
+        self.assertIs(metrics_module._load_pyiqa_metric("musiq-spaq"), metric)
+        pyiqa.create_metric.assert_called_once_with("musiq-spaq")
+
+    @mock.patch.object(metrics_module, "_pyiqa_available", return_value=True)
+    @mock.patch.object(metrics_module.importlib, "import_module")
+    def test_loader_caches_failures(self, import_module, _available):
+        pyiqa = mock.Mock()
+        pyiqa.create_metric.side_effect = RuntimeError("unavailable")
+        import_module.return_value = pyiqa
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.assertIsNone(metrics_module._load_pyiqa_metric("missing"))
+            self.assertIsNone(metrics_module._load_pyiqa_metric("missing"))
+        pyiqa.create_metric.assert_called_once_with("missing")
 
 
 @unittest.skipUnless(PYIQA_AVAILABLE, "pyiqa not installed")
