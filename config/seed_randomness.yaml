@@ -1,0 +1,27 @@
+# Reuse all model, dataset, prompt, preprocessing, and inference settings here.
+eval_config: "./config/eval_sd3.yaml"
+
+num_samples_per_weather: 20
+max_candidates: 12
+compare_candidate_counts: [8, 12]
+sample_seed: 2026
+seeds: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53]
+
+# Candidate/metric batch size for one source image. Lower this on OOM.
+batch_size: 4
+num_workers: 4
+device: "cuda"
+dtype: "bf16"                 # fp32 | fp16 | bf16
+omp_num_threads: 1
+output_dir: "/root/autodl-tmp/sd3/experiment/seed_randomness_m8_m12"
+
+lpips_net: "alex"
+metric_models:
+  dists: "dists"
+  musiq: "musiq-spaq"
+  clipiqa: "clipiqa+"
+  nima: "nima"
+
+# M=8 is stable only when the cross-image P95 of each image's exact-subset
+# P95 relative variance error is no larger than this value.
+stability_relative_error_threshold: 0.20
