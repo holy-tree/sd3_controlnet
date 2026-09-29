@@ -66,6 +66,16 @@ FID has no per-image definition, so its across-seed statistics remain in
 `dataset_seed_statistics.csv`. Completed seed directories are reused automatically when
 the same output directory is supplied.
 
+For the fixed 60-image nested M=8/M=12 per-image randomness experiment, use:
+
+```bash
+uv run python -m scripts.evaluate_seed_randomness \
+  --config config/seed_randomness.yaml
+```
+
+See `docs/SEED_RANDOMNESS.md` for cache validation, per-image-first variance,
+pairwise output diversity, and exact 8-of-12 stability analysis.
+
 ## DPO Workflow
 
 The optional DPO pipeline uses `config/dpo_sd3.yaml`:

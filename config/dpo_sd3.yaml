@@ -29,6 +29,18 @@ candidate_generation:
   candidate_guidance_scales: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
+  # Non-destructive expansion is run with scripts/expand_dpo_candidates.py.
+  # Existing candidates 0-5 remain authoritative; only missing/invalid slots
+  # are generated. The repeated CFG schedule changes the independent noise seed.
+  expansion:
+    target_candidates_per_group: 12
+    base_seed: 20240805
+    guidance_scales: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    resume: true
+    verify_existing: true
+    overwrite_invalid: false
+    batch_size: 1
+    metrics_batch_size: 8
   # Input limits are sampled from the curated manifest with a fixed seed.
   sample_mode: "random"
   rain_max_samples: 2000
