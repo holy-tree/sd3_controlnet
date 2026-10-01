@@ -1,0 +1,16 @@
+# Only DPO pair weighting differs from the matched Standard control.
+# Export rewards and generate the new weighted manifest before training either run.
+base_config: "dpo_sd3_tail_risk_standard.yaml"
+
+tail_risk:
+  enabled: true
+  tail_quantile: 0.20
+  lambda_tail: 1.0
+  tail_deficit_max: 2.0
+  eps: 1.0e-8
+
+training:
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Tail_Risk"
+
+evaluation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_tail_risk"

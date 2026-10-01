@@ -37,8 +37,15 @@ from tqdm.auto import tqdm
 
 from dpo.dataset import PreferencePairDataset, collate_preference_pairs
 from dpo.ema import ModelEMA
-from dpo.losses import diffusion_dpo_loss, flow_matching_gt_losses
+from dpo.losses import flow_matching_gt_losses
 from dpo.provenance import checkpoint_checksum
+from dpo.tail_risk import load_config as load_dpo_config, normalize_tail_risk_config
+from dpo.tail_risk_training import (
+    DPOLogWindow,
+    tail_risk_resume_signature,
+    training_dpo_loss,
+    validate_tail_risk_training,
+)
 from dpo.validation import summarize_validation_rows, validation_prompt_for_record
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from train_controlnet_sd3 import encode_prompt, import_model_class_from_model_name_or_path
@@ -350,7 +357,7 @@ def write_resume_metadata(
     dataset_length: int,
 ) -> None:
     metadata = {
-        "version": 2,
+        "version": 3,
         "global_step": global_step,
         "epoch": epoch,
         "next_batch_index": next_batch_index,
@@ -372,6 +379,7 @@ def write_resume_metadata(
         "gt_flow_weight": float(train_config.get("gt_flow_weight", 0.0)),
         "gt_x0_l1_weight": float(train_config.get("gt_x0_l1_weight", 0.0)),
         "weight_by_psnr_gap": bool(train_config.get("weight_by_psnr_gap", False)),
+        "tail_risk": tail_risk_resume_signature(train_config),
         "beta": float(train_config.get("beta", 0.1)),
         "controlnet_learning_rate": float(
             train_config.get("controlnet_learning_rate", 5e-8)
@@ -453,6 +461,8 @@ def validate_resume_metadata(
     }
     if mismatches:
         raise ValueError(f"Resume configuration mismatch: {mismatches}")
+    if metadata.get("tail_risk", {"enabled": False}) != tail_risk_resume_signature(train_config):
+        raise ValueError("Resume tail-risk configuration/provenance mismatch")
     return metadata
 
 
@@ -664,10 +674,11 @@ def run_checkpoint_validation(
 
 def main() -> None:
     cli = parse_args()
-    with open(cli.config, "r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+    config = load_dpo_config(cli.config)
     model_config = dict(config["model"])
     train_config = dict(config["training"])
+    train_config["tail_risk"] = normalize_tail_risk_config(config.get("tail_risk"))
+    tail_risk = validate_tail_risk_training(train_config)
     train_controlnet = bool(train_config.get("train_controlnet", False))
     train_ra_fusion = bool(train_config.get("train_ra_fusion", True))
     use_ema = bool(train_config.get("use_ema", False))
@@ -805,7 +816,8 @@ def main() -> None:
         eps=float(train_config.get("adam_epsilon", 1e-8)),
     )
     dataset = PreferencePairDataset(
-        train_config["preference_manifest"], resolution=int(train_config.get("resolution", 512))
+        train_config["preference_manifest"], resolution=int(train_config.get("resolution", 512)),
+        tail_risk_enabled=tail_risk["enabled"],
     )
     dataloader = DataLoader(
         dataset,
@@ -1099,6 +1111,10 @@ def main() -> None:
     )
     global_step = initial_global_step
     beta = float(train_config.get("beta", 0.1))
+    logging_steps = int(train_config.get("logging_steps", 10))
+    if logging_steps <= 0:
+        raise ValueError("training.logging_steps must be positive")
+    log_window = DPOLogWindow()
     mean_psnr_gap = sum(float(row["psnr_gap"]) for row in dataset.records) / len(dataset)
     accumulation_steps = int(train_config.get("gradient_accumulation_steps", 1))
     updates_per_epoch = math.ceil(len(dataloader) / accumulation_steps)
@@ -1211,13 +1227,15 @@ def main() -> None:
                 sample_weights = None
                 if bool(train_config.get("weight_by_psnr_gap", False)):
                     sample_weights = batch["psnr_gap"].to(device) / max(mean_psnr_gap, 1e-8)
-                loss, stats = diffusion_dpo_loss(
+                pair_weights = batch["pair_weight"]
+                loss, stats = training_dpo_loss(
                     chosen_policy,
                     rejected_policy,
                     chosen_reference,
                     rejected_reference,
                     beta=beta,
-                    sample_weights=sample_weights,
+                    pair_weights=pair_weights,
+                    psnr_weights=sample_weights,
                     sft_weight=float(train_config.get("sft_weight", 0.0)),
                 )
                 accelerator.backward(loss)
@@ -1290,6 +1308,7 @@ def main() -> None:
                     "loss_gt_x0_l1": gt_x0_l1_loss.detach(),
                     "loss_gt_weighted": weighted_gt_loss.detach(),
                 })
+                log_window.update(stats, loss, pair_weights, batch["is_tail_pair"])
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable, float(train_config.get("max_grad_norm", 1.0)))
                 optimizer.step()
@@ -1302,27 +1321,31 @@ def main() -> None:
             if accelerator.sync_gradients:
                 global_step += 1
                 progress.update(1)
-                logs = {key: float(value) for key, value in stats.items()}
-                group_lrs = {
-                    f"lr/{group.get('name', index)}": float(group["lr"])
-                    for index, group in enumerate(optimizer.param_groups)
-                }
-                logs.update(loss=float(loss.detach()), **group_lrs)
-                if ema is not None:
-                    logs["ema/decay"] = float(ema.cur_decay_value)
-                    logs["ema/updates"] = float(ema.num_updates)
-                    logs["ema/updated"] = float(ema_updated)
-                progress.set_postfix(
-                    loss=f"{logs['loss']:.4f}",
-                    gt=f"{logs['loss_gt_weighted']:.4f}",
-                    acc=f"{logs['implicit_accuracy']:.2f}",
-                )
-                if train_config.get("report_to"):
-                    accelerator.log(logs, step=global_step)
                 checkpointing_steps = int(train_config.get("checkpointing_steps", 250))
                 checkpoint_due = (
                     checkpointing_steps > 0 and global_step % checkpointing_steps == 0
                 )
+                if global_step % logging_steps == 0 or checkpoint_due or global_step >= max_steps:
+                    logs = log_window.flush(accelerator)
+                    logs.update({
+                        f"lr/{group.get('name', index)}": float(group["lr"])
+                        for index, group in enumerate(optimizer.param_groups)
+                    })
+                    if ema is not None:
+                        logs["ema/decay"] = float(ema.cur_decay_value)
+                        logs["ema/updates"] = float(ema.num_updates)
+                        logs["ema/updated"] = float(ema_updated)
+                    progress.set_postfix(
+                        loss=f"{logs['loss']:.4f}", gt=f"{logs['loss_gt_weighted']:.4f}",
+                        acc=f"{logs['implicit_accuracy']:.2f}",
+                        w=f"{logs['pair_weight_mean']:.3f}",
+                        tail=f"{logs['tail_pair_fraction']:.2f}",
+                    )
+                    if accelerator.is_main_process:
+                        with (output_dir / "training_metrics.jsonl").open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps({"step": global_step, **logs}) + "\n")
+                    if train_config.get("report_to"):
+                        accelerator.log(logs, step=global_step)
                 if checkpoint_due:
                     accelerator.wait_for_everyone()
                     checkpoint_dir = output_dir / f"checkpoint-{global_step}"
@@ -1411,6 +1434,7 @@ def main() -> None:
                 "global_step": global_step,
                 "num_preference_pairs": len(dataset),
                 "beta": beta,
+                "tail_risk": tail_risk_resume_signature(train_config),
                 "sft_weight": float(train_config.get("sft_weight", 0.0)),
                 "gt_flow_weight": gt_flow_weight,
                 "gt_x0_l1_weight": gt_x0_l1_weight,

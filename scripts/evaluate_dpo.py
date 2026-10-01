@@ -6,13 +6,12 @@ import argparse
 import sys
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from utils.evaluate_sd3 import evaluate, load_config
+from dpo.tail_risk import load_config as load_dpo_config
 
 
 def latest_complete_checkpoint(
@@ -41,8 +40,7 @@ def main() -> None:
     parser.add_argument("--max_samples_per_weather", type=int, default=None)
     parser.add_argument("--disable_fid", action="store_true")
     args = parser.parse_args()
-    with open(args.config, "r", encoding="utf-8") as handle:
-        dpo_config = yaml.safe_load(handle)
+    dpo_config = load_dpo_config(args.config)
     evaluation = dpo_config["evaluation"]
     training = dpo_config["training"]
     eval_config = load_config(evaluation.get("eval_config", "./config/eval_sd3.yaml"))

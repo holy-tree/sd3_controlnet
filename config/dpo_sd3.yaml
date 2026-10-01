@@ -117,6 +117,15 @@ model:
   variant: null
 
 # ==================== 5. Diffusion-DPO training ====================
+# Experimental pair weighting only; disabled leaves all dataset pair weights at 1.
+tail_risk:
+  enabled: false
+  candidate_reward_file: null
+  tail_quantile: 0.20
+  lambda_tail: 1.0
+  tail_deficit_max: 2.0
+  eps: 1.0e-8
+
 training:
   preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences/preference_pairs.jsonl"
   output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO"
@@ -145,6 +154,8 @@ training:
   dataloader_num_workers: 4
   max_train_steps: 5000
   checkpointing_steps: 500
+  # Sample-counted logs across microbatches and processes; no effect on gradients.
+  logging_steps: 10
   # Keep only the newest N checkpoint-* directories. 0 means unlimited.
   checkpoints_total_limit: 3
   # Run a lightweight test-set validation after every checkpoint save.

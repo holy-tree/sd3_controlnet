@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -12,7 +13,12 @@ from torchvision import transforms
 
 
 class PreferencePairDataset(Dataset):
-    def __init__(self, manifest_path: str | Path, resolution: int = 512):
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        resolution: int = 512,
+        tail_risk_enabled: bool = False,
+    ):
         self.manifest_path = Path(manifest_path).expanduser().resolve()
         if not self.manifest_path.is_file():
             raise FileNotFoundError(self.manifest_path)
@@ -20,6 +26,19 @@ class PreferencePairDataset(Dataset):
             self.records = [json.loads(line) for line in handle if line.strip()]
         if not self.records:
             raise ValueError(f"Preference manifest is empty: {self.manifest_path}")
+        self.tail_risk_enabled = tail_risk_enabled
+        if tail_risk_enabled:
+            for index, record in enumerate(self.records):
+                try:
+                    weight = float(record.get("pair_weight", 1.0))
+                except (TypeError, ValueError, OverflowError) as error:
+                    raise ValueError(
+                        f"pair_weight must be positive and finite (record {index})"
+                    ) from error
+                if not math.isfinite(weight) or weight <= 0.0:
+                    raise ValueError(
+                        f"pair_weight must be positive and finite (record {index})"
+                    )
         self.preprocess = transforms.Compose([
             transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(resolution),
@@ -50,6 +69,10 @@ class PreferencePairDataset(Dataset):
             "psnr_gap": float(record["psnr_gap"]),
             "reward_gap": float(record["reward_gap"]),
             "pair_id": str(record["pair_id"]),
+            "pair_weight": (
+                float(record.get("pair_weight", 1.0)) if self.tail_risk_enabled else 1.0
+            ),
+            "is_tail_pair": bool(record.get("is_tail_pair", False)),
         }
 
     def __len__(self) -> int:
@@ -69,4 +92,10 @@ def collate_preference_pairs(examples: list[dict]) -> dict:
         "psnr_gap": torch.tensor([row["psnr_gap"] for row in examples], dtype=torch.float32),
         "reward_gap": torch.tensor([row["reward_gap"] for row in examples], dtype=torch.float32),
         "pair_id": [row["pair_id"] for row in examples],
+        "pair_weight": torch.tensor(
+            [row.get("pair_weight", 1.0) for row in examples], dtype=torch.float32
+        ),
+        "is_tail_pair": torch.tensor(
+            [row.get("is_tail_pair", False) for row in examples], dtype=torch.bool
+        ),
     }

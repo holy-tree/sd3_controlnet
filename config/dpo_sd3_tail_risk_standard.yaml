@@ -1,0 +1,17 @@
+# Fair control: same weighted manifest/order as the tail run, but unit weights.
+# All model/optimizer/auxiliary-loss settings inherit the existing experiment.
+# Ensure the base model paths match the actual candidate_policy before training.
+base_config: "dpo_sd3.yaml"
+
+tail_risk:
+  enabled: false
+  candidate_reward_file: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_rewards.csv"
+
+training:
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_tail_risk/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Standard_Control"
+  resume_from_checkpoint: null
+  weight_by_psnr_gap: false
+
+evaluation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_standard_control"

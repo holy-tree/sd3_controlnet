@@ -217,6 +217,9 @@ PSNR 和 DISTS 不进入 aesthetic reward，而作为保真门槛。chosen 最�
 
 ## 4. DPO 训练
 
+实验性尾部风险加权、匹配的 Standard/Tail-risk 对照配置与命令见
+[`TAIL_RISK_DPO.md`](TAIL_RISK_DPO.md)。默认关闭，不改变当前偏好对或辅助损失。
+
 运行：
 
 ```bash

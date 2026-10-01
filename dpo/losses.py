@@ -45,8 +45,20 @@ def diffusion_dpo_loss(
     beta: float = 0.1,
     sample_weights: torch.Tensor | None = None,
     sft_weight: float = 0.0,
+    reduction: str = "mean",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute DPO with negative denoising MSE as the log-probability surrogate."""
+    """Compute DPO from negative MSE; 'none' returns pure per-pair DPO losses.
+
+    The default mean retains legacy sample weighting and unweighted SFT.
+    With 'none', apply pair weights and auxiliary losses outside this function.
+    """
+    if reduction not in ("mean", "none"):
+        raise ValueError("reduction must be 'mean' or 'none'")
+    if reduction == "none":
+        if sample_weights is not None:
+            raise ValueError("sample_weights must be None when reduction='none'")
+        if sft_weight != 0.0:
+            raise ValueError("sft_weight must be zero when reduction='none'")
     if beta <= 0.0:
         raise ValueError("beta must be positive")
     policy_logratio = policy_rejected_mse - policy_chosen_mse
@@ -58,7 +70,10 @@ def diffusion_dpo_loss(
         dpo = (losses * weights).mean()
     else:
         dpo = losses.mean()
-    loss = dpo + float(sft_weight) * policy_chosen_mse.mean()
+    loss = (
+        losses if reduction == "none"
+        else dpo + float(sft_weight) * policy_chosen_mse.mean()
+    )
     stats = {
         "loss_dpo": dpo.detach(),
         "policy_margin": policy_logratio.mean().detach(),
