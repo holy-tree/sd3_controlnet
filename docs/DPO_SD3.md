@@ -145,7 +145,9 @@ preference_filter:
     baseline_mode: "group_median"
     baseline_psnr_tolerance: 0.50
     baseline_dists_tolerance: 0.02
-  max_samples_per_pair: 3
+  pair_selection: "coverage_first"
+  max_candidate_appearances: 2
+  max_samples_per_pair: 8
   max_pairs_per_weather: null
   shuffle: true
   random_seed: 42
@@ -157,8 +159,16 @@ preference_filter:
 - `best_vs_all`：reward 最高候选分别与其他候选配对。
 - `all_pairs`：组内所有候选两两组合，reward 较高者为 chosen。
 
-所有策略都应用 PSNR、DISTS 和候选组中位数保真约束，然后按 aesthetic reward gap
-从大到小最多保留 `max_samples_per_pair` 对。
+所有策略先应用 reward gap、PSNR、DISTS 和候选组中位数保真约束，再选择最终偏好对。
+`pair_strategy` 决定枚举哪些组合，`pair_selection` 决定从合格组合中保留哪些：
+
+- `coverage_first`：每次优先选择覆盖更多未使用候选的对（两个新候选优于一个，优于零个），同等覆盖下选择 reward gap 较大的对；每次选取后重新计算覆盖。
+- `reward_gap`：优先选择 reward gap 较大的对。不配置 `pair_selection` 时使用此模式，保持原有行为。
+
+`max_candidate_appearances: 2` 限制每张候选在同一源图组内作为 chosen 和 rejected 的合计出现次数。
+设为 `null` 或不配置则不限制次数。每组最多保留 `max_samples_per_pair` 对；合格组合不足或次数上限阻止继续选择时，不会放宽质量门槛凑数。
+推荐 M=12 使用 `all_pairs + coverage_first`、每组最多 8 对、每个候选最多出现 2 次。
+这是覆盖优先的贪心选择，不保证全局最优覆盖，也不保证每组用上全部候选。
 
 输出：
 
@@ -170,6 +180,10 @@ dpo_preferences/
 ```
 
 每行偏好数据包含 LQ、GT、chosen、rejected、天气、候选索引、PSNR、reward 和 gap 等字段。
+`preference_summary.json` 的 `candidate_usage_per_weather` 记录各天气的候选覆盖率、平均组覆盖率、
+实际最大候选出现次数、平均每组偏好对数及有偏好对的组数；统计包含无偏好对的有效源图组，
+并在天气级数量截断后计算，因此反映最终输出数据。
+更改选对策略无需重新生成或评分候选，重新运行 `scripts.filter_dpo_pairs` 即可。
 
 ## 3. 离线奖励
 

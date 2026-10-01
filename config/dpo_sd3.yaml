@@ -82,8 +82,12 @@ preference_filter:
     baseline_mode: "group_median"
     baseline_psnr_tolerance: 0.50
     baseline_dists_tolerance: 0.02
-  # Maximum retained pairs per source image after sorting by aesthetic reward gap.
-  max_samples_per_pair: 3
+  # Select from quality-qualified pairs: cover unused candidates first, then gap.
+  pair_selection: "coverage_first"  # coverage_first | reward_gap
+  # Combined chosen/rejected appearances per candidate within a source group.
+  max_candidate_appearances: 2
+  # Maximum retained pairs per source image; never relax quality gates to fill it.
+  max_samples_per_pair: 8
   # null means unlimited; useful for balancing haze against rain/snow.
   max_pairs_per_weather: null
   shuffle: true

@@ -47,6 +47,43 @@ def _iter_pairs(rows: list[dict], strategy: str) -> Iterable[tuple[dict, dict]]:
         raise ValueError(f"Unsupported pair_strategy: {strategy}")
 
 
+def _select_source_pairs(
+    pairs: list[dict],
+    limit: int,
+    pair_selection: str,
+    max_candidate_appearances: int | None,
+) -> list[dict]:
+    remaining = sorted(pairs, key=lambda row: row["reward_gap"], reverse=True)
+    if pair_selection == "coverage_first":
+        remaining.sort(key=lambda row: (
+            -row["reward_gap"], row["chosen_noise_index"], row["rejected_noise_index"],
+            row["chosen_path"], row["rejected_path"],
+        ))
+    usage = Counter()
+    selected = []
+    while remaining and len(selected) < limit:
+        if max_candidate_appearances is not None:
+            remaining = [
+                row for row in remaining
+                if usage[row["chosen_path"]] < max_candidate_appearances
+                and usage[row["rejected_path"]] < max_candidate_appearances
+            ]
+        if not remaining:
+            break
+        if pair_selection == "coverage_first":
+            # Recompute coverage after every selection; stable gap order breaks ties.
+            index = max(range(len(remaining)), key=lambda i: (
+                int(usage[remaining[i]["chosen_path"]] == 0)
+                + int(usage[remaining[i]["rejected_path"]] == 0)
+            ))
+        else:
+            index = 0
+        pair = remaining.pop(index)
+        selected.append(pair)
+        usage.update((pair["chosen_path"], pair["rejected_path"]))
+    return selected
+
+
 def build_preference_pairs(
     candidate_metrics_path: str | Path,
     output_dir: str | Path,
@@ -115,6 +152,17 @@ def build_preference_pairs(
     max_per_sample = int(selection.get("max_samples_per_pair", 1))
     if max_per_sample <= 0:
         raise ValueError("selection.max_samples_per_pair must be positive")
+    pair_selection = str(selection.get("pair_selection", "reward_gap"))
+    if pair_selection not in {"reward_gap", "coverage_first"}:
+        raise ValueError(f"Unsupported pair_selection: {pair_selection}")
+    max_candidate_appearances = selection.get("max_candidate_appearances")
+    if max_candidate_appearances is not None:
+        if (
+            isinstance(max_candidate_appearances, bool)
+            or not isinstance(max_candidate_appearances, int)
+            or max_candidate_appearances <= 0
+        ):
+            raise ValueError("selection.max_candidate_appearances must be a positive integer or null")
     max_gap = selection.get("max_psnr_gap")
     max_gap = float(max_gap) if max_gap is not None else None
     prompt_map = dict(prompts or {})
@@ -204,8 +252,9 @@ def build_preference_pairs(
                     name: float(rejected[name]) for name in reward.metric_names
                 },
             })
-        source_pairs.sort(key=lambda row: row["reward_gap"], reverse=True)
-        pairs.extend(source_pairs[:max_per_sample])
+        pairs.extend(_select_source_pairs(
+            source_pairs, max_per_sample, pair_selection, max_candidate_appearances,
+        ))
 
     rng = random.Random(int(selection.get("random_seed", 42)))
     max_pairs_per_weather = selection.get("max_pairs_per_weather")
@@ -260,6 +309,42 @@ def build_preference_pairs(
             if pair["weather"] == weather
         )
     }
+    # Measure actual retained coverage after any weather-level truncation.
+    source_usage = defaultdict(Counter)
+    source_pair_counts = Counter()
+    for pair in pairs:
+        identifier = pair["source_index"] or pair["lq_path"]
+        source_key = (str(pair["subdataset"]), str(identifier))
+        source_usage[source_key].update((pair["chosen_path"], pair["rejected_path"]))
+        source_pair_counts[source_key] += 1
+    candidate_usage_per_weather = {}
+    for source_key, candidates in grouped.items():
+        weather = str(candidates[0]["weather"])
+        stats = candidate_usage_per_weather.setdefault(weather, {
+            "num_groups": 0,
+            "groups_with_pairs": 0,
+            "num_candidates": 0,
+            "num_covered_candidates": 0,
+            "candidate_coverage": 0.0,
+            "mean_group_candidate_coverage": 0.0,
+            "mean_pairs_per_group": 0.0,
+            "max_candidate_appearances": 0,
+        })
+        usage = source_usage[source_key]
+        count = len({row["candidate_path"] for row in candidates})
+        stats["num_groups"] += 1
+        stats["groups_with_pairs"] += int(bool(usage))
+        stats["num_candidates"] += count
+        stats["num_covered_candidates"] += len(usage)
+        stats["mean_group_candidate_coverage"] += len(usage) / count
+        stats["mean_pairs_per_group"] += source_pair_counts[source_key]
+        stats["max_candidate_appearances"] = max(
+            stats["max_candidate_appearances"], max(usage.values(), default=0),
+        )
+    for stats in candidate_usage_per_weather.values():
+        stats["candidate_coverage"] = stats["num_covered_candidates"] / stats["num_candidates"]
+        stats["mean_group_candidate_coverage"] /= stats["num_groups"]
+        stats["mean_pairs_per_group"] /= stats["num_groups"]
     candidate_policy = None
     candidate_summary_path = csv_path.parent / "summary.json"
     if candidate_summary_path.is_file():
@@ -275,6 +360,7 @@ def build_preference_pairs(
         "mean_psnr_gap_per_weather": weather_gaps,
         "mean_reward_gap_per_weather": weather_reward_gaps,
         "mean_dists_gap_per_weather": weather_dists_gaps,
+        "candidate_usage_per_weather": candidate_usage_per_weather,
         "rejected_by_reason": dict(rejected_by_reason),
         "skipped_invalid_candidate_rows": skipped_invalid,
         "reward_weights": dict(reward.weights),

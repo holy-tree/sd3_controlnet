@@ -72,6 +72,8 @@ class AestheticRewardTest(unittest.TestCase):
                 reward_config={"weights": {"musiq_z": 1.0}},
                 selection={
                     "pair_strategy": "all_pairs",
+                    "pair_selection": "coverage_first",
+                    "max_candidate_appearances": 2,
                     "min_psnr_gap": -0.15,
                     "min_reward_gap": 0.05,
                     "max_samples_per_pair": 3,
