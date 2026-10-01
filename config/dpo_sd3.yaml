@@ -24,9 +24,9 @@ candidate_generation:
   splits: ["train"]
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
   # Generate exactly six candidates for every source image.
-  num_candidates_per_image: 6
+  num_candidates_per_image: 12
   # Each candidate uses a different CFG and independently seeded initial noise.
-  candidate_guidance_scales: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+  candidate_guidance_scales: [1.0, 1.0, 1.0, 1.0,1.0, 1.0,1.0, 1.0,1.0, 1.0,1.0, 1.0]
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
   # Non-destructive expansion is run with scripts/expand_dpo_candidates.py.
