@@ -108,9 +108,9 @@ reward:
 # ==================== 4. DPO model ====================
 model:
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
-  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Prompt_Joint-5000"
+  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/checkpoint-5000"
   # Reference model is the immutable initial snapshot loaded from this path.
-  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Prompt_Joint-5000/ra_fusion"
+  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/checkpoint-5000/ra_fusion"
   ra_fusion_scale: 0.1
   controlnet_conditioning_scale: 1.0
   revision: null
