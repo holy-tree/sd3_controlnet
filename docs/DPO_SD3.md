@@ -220,6 +220,42 @@ PSNR 和 DISTS 不进入 aesthetic reward，而作为保真门槛。chosen 最�
 实验性尾部风险加权、匹配的 Standard/Tail-risk 对照配置与命令见
 [`TAIL_RISK_DPO.md`](TAIL_RISK_DPO.md)。默认关闭，不改变当前偏好对或辅助损失。
 
+### 尾部加权快速开始
+
+已有候选评分和偏好对时，无需重新选图、生成候选、计算 IQA 或筛选偏好对。
+依次执行：
+
+```bash
+# 用原 reward 公式和已保存的指标导出完整训练候选的最终分数。
+python -m scripts.export_dpo_candidate_rewards --config config/dpo_sd3_tail_risk.yaml
+
+# 以各天气完整候选 reward 的 Q20 为尾部阈值，用 IQR 缩放低于阈值的程度。
+# 给原偏好对添加权重；不改变 chosen/rejected、数量或顺序。
+python -m scripts.weight_dpo_tail_risk --config config/dpo_sd3_tail_risk.yaml
+
+# 开始 Tail-risk DPO；只对 DPO 项加权，不对 GT 等辅助损失加权。
+accelerate launch scripts/train_dpo_sd3.py --config config/dpo_sd3_tail_risk.yaml
+```
+
+Q20 是候选 reward 的第 20 百分位；IQR 是 Q75-Q25，即中间 50% 候选的分数跨度。
+这两个统计按天气分别计算，候选按唯一身份去重；不是只统计 rejected。
+生成权重后，在每种天气的完整偏好对集合上归一化，使平均权重为 1。
+尾部表示天气内相对低 reward 的输出，不表示异常 Seed，也不保证改善 Seed 方差。
+
+`config/dpo_sd3_tail_risk.yaml` 已覆盖为 `enabled: true`，并继承完整奖励文件和
+新偏好文件路径；不要把基础 `config/dpo_sd3.yaml` 的 `false/null` 直接改成 `true`。
+基础配置保持关闭用于原始训练。两个离线命令拒绝覆盖已有输出；成功后不要重复运行。
+统计保存在 `dpo_preferences_tail_risk/tail_risk_statistics.json`。
+
+训练前检查基础 `model` checkpoint 和 scale 与原偏好数据的 `candidate_policy` 一致，
+并使用新的输出目录。若需要匹配的 Standard 对照（相同 pair 文件但所有权重为 1），运行：
+
+```bash
+accelerate launch scripts/train_dpo_sd3.py --config config/dpo_sd3_tail_risk_standard.yaml
+```
+
+### 原始 DPO
+
 运行：
 
 ```bash

@@ -169,7 +169,7 @@ training:
   validation_strength: 1.0
   validation_seed: 42
   validation_lpips_net: "alex"
-  beta: 0.1
+  beta: 1.0
   # ControlNet is larger and easier to destabilize; use a lower LR than RA.
   controlnet_learning_rate: 5.0e-8
   ra_fusion_learning_rate: 1.0e-7
