@@ -735,7 +735,12 @@ class MetricCache:
                     for line in handle:
                         if not line.strip():
                             continue
-                        payload = json.loads(line)
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(payload, Mapping):
+                            continue
                         value = finite(payload.get("value"))
                         if value is not None and payload.get("key"):
                             self.values[str(payload["key"])] = value
@@ -753,6 +758,8 @@ class MetricCache:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
+            # Separate a torn trailing record before publishing the next batch.
+            handle.write("\n")
             for key, value in self.pending.items():
                 handle.write(json.dumps({"key": key, "value": value}) + "\n")
             handle.flush()
@@ -1352,9 +1359,31 @@ def build_experiment_b(
             "dpo_seed_mean": dpo_mean_map.get(identity),
             **selected,
         }
+        base["sft_num_seeds"] = sft_mean_map.get(identity, {}).get("num_seeds")
+        base["dpo_num_seeds"] = dpo_mean_map.get(identity, {}).get("num_seeds")
         for name, record in comparators.items():
             for metric in (*ALL_METRICS, "reward"):
                 base[f"{name}_{metric}"] = finite(record.get(metric)) if record else None
+        paired_definitions = [
+            (candidate, model)
+            for candidate in selected
+            for model in ("sft_reference", "sft_seed_mean", "dpo_reference", "dpo_seed_mean")
+        ] + [("dpo_reference", "sft_reference"), ("dpo_seed_mean", "sft_seed_mean")]
+        for newer, baseline in paired_definitions:
+            for metric in (*ALL_METRICS, "reward"):
+                left, right = base.get(f"{newer}_{metric}"), base.get(f"{baseline}_{metric}")
+                difference = left - right if left is not None and right is not None else None
+                base[f"{newer}_vs_{baseline}_{metric}_difference"] = difference
+                base[f"{newer}_vs_{baseline}_{metric}_gain"] = (
+                    directional_delta(metric, left, right) if difference is not None else None
+                )
+        for definition in ("strict_best", "tolerant_best"):
+            metric = "reward" if all(
+                base.get(f"{view}_reward") is not None for view in (definition, "sft_reference")
+            ) else "musiq"
+            gain = base.get(f"{definition}_vs_sft_reference_{metric}_gain")
+            base[f"{definition}_quality_metric"] = metric
+            base[f"{definition}_quality_better_than_sft"] = gain > 1e-12 if gain is not None else None
         gt_path = str((items[0].get("gt_path") if items else "") or "")
         base["gt_path"] = gt_path
         if selected["pool_best"]:
@@ -1394,6 +1423,7 @@ def summarize_experiment_b(rows: Sequence[Mapping]) -> list[dict]:
         shared_sft = [row for row in items if row.get("sft_qualified_available")]
         for candidate_name in candidate_names:
             available = [row for row in items if row.get(f"{candidate_name}_path")]
+            evaluable = items if candidate_name == "pool_best" else shared_sft
             summaries.append({
                 "scope": scope,
                 "group": group,
@@ -1402,9 +1432,29 @@ def summarize_experiment_b(rows: Sequence[Mapping]) -> list[dict]:
                 "candidate_groups": len(items),
                 "shared_sft_groups": len(shared_sft),
                 "qualified_groups": len(available),
-                "no_qualified_rate": 1.0 - len(available) / len(items) if items else None,
-                "n": len(items),
+                "no_qualified_rate": 1.0 - len(available) / len(evaluable) if evaluable else None,
+                "n": len(evaluable),
             })
+        for newer, baseline in (("dpo_reference", "sft_reference"), ("dpo_seed_mean", "sft_seed_mean")):
+            for metric in (*ALL_METRICS, "reward"):
+                valid = [
+                    row for row in items
+                    if finite(row.get(f"{newer}_{metric}")) is not None
+                    and finite(row.get(f"{baseline}_{metric}")) is not None
+                ]
+                differences = [row[f"{newer}_{metric}"] - row[f"{baseline}_{metric}"] for row in valid]
+                gains = [directional_delta(metric, row[f"{newer}_{metric}"], row[f"{baseline}_{metric}"]) for row in valid]
+                summaries.append({
+                    "scope": scope, "group": group, "comparison": f"{newer}_vs_{baseline}",
+                    "metric": metric, "direction": "lower" if metric in LOWER_IS_BETTER else "higher",
+                    "newer_mean_same_pairs": statistics.fmean(row[f"{newer}_{metric}"] for row in valid) if valid else None,
+                    "baseline_mean_same_pairs": statistics.fmean(row[f"{baseline}_{metric}"] for row in valid) if valid else None,
+                    "raw_difference_mean": statistics.fmean(differences) if differences else None,
+                    "directional_delta_mean": statistics.fmean(gains) if gains else None,
+                    "directional_delta_median": statistics.median(gains) if gains else None,
+                    "win_rate": sum(value > 1e-12 for value in gains) / len(gains) if gains else None,
+                    "n": len(valid),
+                })
         for candidate_name in candidate_names:
             for reference_name in references:
                 for metric in (*ALL_METRICS, "reward"):
@@ -1594,12 +1644,14 @@ def _report(
         return "" if number is None else f"{number:.5g}"
 
     normalized = bool(config.get("normalization_json"))
+    online = config.get("online_validation")
     lines = [
-        "# Pure-offline GT/SFT/DPO/Candidate IQA Analysis",
+        "# Online Paired GT/SFT/DPO/Candidate IQA Analysis" if online else "# Pure-offline GT/SFT/DPO/Candidate IQA Analysis",
         "",
         "## Scope",
         "",
-        "- All scores use existing image files. No diffusion inference or training was run.",
+        "- SFT/DPO outputs were generated or reused with paired inference; historical candidates were not regenerated and no training was run."
+        if online else "- All scores use existing image files. No diffusion inference or training was run.",
         "- Experiment A uses only exact common `(weather, subdataset, source_id)` identities.",
         "- GT is `恢复目标的评分参照`, not an upper bound. The analysis makes no automatic detail or semantic-cause claims.",
         "- Model seed means are formed within each image before any dataset summary.",
@@ -1651,6 +1703,27 @@ def _report(
         )
     else:
         lines.append("|  | No valid common GT/SFT/DPO metric pairs |  |  |  | 0 |")
+
+    direct_model_rows = [
+        row for row in experiment_b_summary
+        if row.get("scope") == "overall"
+        and row.get("comparison") == "dpo_seed_mean_vs_sft_seed_mean"
+        and int(row.get("n") or 0) > 0
+    ]
+    lines.extend([
+        "", "## DPO Improvement Over SFT", "",
+        "| Metric | SFT mean | DPO mean | Raw DPO-SFT | Directional gain | Win rate | N |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ])
+    for row in direct_model_rows:
+        lines.append(
+            f"| {row['metric']} | {formatted(row.get('baseline_mean_same_pairs'))} | "
+            f"{formatted(row.get('newer_mean_same_pairs'))} | {formatted(row.get('raw_difference_mean'))} | "
+            f"{formatted(row.get('directional_delta_mean'))} | {formatted(row.get('win_rate'))} | {row['n']} |"
+        )
+    if not direct_model_rows:
+        lines.append("| No valid paired SFT/DPO candidate-source rows | | | | | | 0 |")
+    lines.append("\nThis table measures model-to-model improvement on the same images. Not exceeding a best-of-K candidate is not evidence of failure to learn.")
 
     availability = [
         row for row in experiment_b_summary
@@ -1721,9 +1794,15 @@ def _report(
     stable_benefit = any(
         finite(row.get("directional_delta_mean")) is not None
         and float(row["directional_delta_mean"]) > 0
-        and finite(row.get("dpo_exceeds_rate")) is not None
-        and float(row["dpo_exceeds_rate"]) > 0.5
-        for row in dpo_quality_rows
+        and finite(row.get("win_rate")) is not None
+        and float(row["win_rate"]) > 0.5
+        for row in direct_model_rows if row.get("metric") in {"reward", *NR_METRICS}
+    )
+    paired_dpo_quality = sum(int(row.get("n") or 0) for row in dpo_quality_rows)
+    qualified_quality_gains = sum(
+        bool(row.get("strict_best_quality_better_than_sft"))
+        or bool(row.get("tolerant_best_quality_better_than_sft"))
+        for row in experiment_b_rows
     )
     diagnostic_conflicts = sum(bool(row.get("nr_quality_up_psnr_down")) for row in experiment_b_rows)
     lines.extend([
@@ -1733,17 +1812,21 @@ def _report(
         "### State 1: Candidate pool lacks usable quality results",
         "",
         (
-            f"Observed: no finite-reward pool winner was available across {counts.get('candidate_groups', 0)} groups."
+            f"Unassessed: no finite-reward pool winner was available across {counts.get('candidate_groups', 0)} groups. Missing reward does not demonstrate absence of visually good candidates."
             if usable_pool == 0
-            else f"Not globally observed: {usable_pool} candidate groups had a finite-reward pool winner. Missing groups remain unassessed."
+            else f"{usable_pool} groups had a finite-reward pool winner; {qualified_quality_gains} groups had a strict or tolerant winner scoring above the SFT reference (shared reward, otherwise MUSIQ). A finite score alone does not establish good visual quality."
         ),
         "",
         "### State 2: Usable quality candidates exist but DPO does not stably obtain benefit",
         "",
         (
-            "Observed under the report rule: usable candidates exist, but no reported DPO-vs-pool quality comparison has both positive mean directional gain and an image win rate above 0.5."
-            if usable_pool > 0 and not stable_benefit
-            else "Not established by available paired rows; this statement is diagnostic rather than a causal conclusion."
+            "Cannot be assessed: no valid paired DPO/candidate quality rows were available."
+            if paired_dpo_quality == 0
+            else (
+                "Diagnostic concern: fidelity-qualified, better-scoring candidates exist, but no paired DPO-vs-SFT quality metric has both positive mean gain and image win rate above 0.5. Inspect per-image fidelity and multi-seed results; no cause is inferred."
+                if qualified_quality_gains > 0 and not stable_benefit
+                else "Not established by available paired rows; this statement is diagnostic rather than a causal conclusion."
+            )
         ),
         "",
         "### State 3: Score increase conflicts with fidelity/detail diagnostics",
@@ -1787,6 +1870,15 @@ def _report(
             json.dumps(generation_config, indent=2, ensure_ascii=False),
             "```",
         ])
+    if online:
+        lines.extend([
+            "", "## Online Validation", "",
+            "```json", json.dumps({
+                "sample": online.get("sample"), "checkpoints": online.get("checkpoints"),
+                "settings": online.get("settings"), "results": online.get("results"),
+            }, indent=2, ensure_ascii=False), "```", "",
+        ])
+        lines.extend(f"- {warning}" for warning in online.get("warnings", []))
     lines.extend(["", "## Visualizations", ""])
     if visualizations:
         lines.extend(
@@ -1845,28 +1937,40 @@ def run_analysis(config: Mapping, runner: object | None = None) -> dict:
     _atomic_json(output_dir / "run_config.json", effective_config)
 
     candidates, skipped_candidates, candidate_counts = load_candidates(candidate_csv, normalization)
-    if config.get("max_images") is not None:
+    if config.get("online_selected_identities") is not None:
+        allowed = {tuple(identity) for identity in config["online_selected_identities"]}
+        sft = [row for row in sft if row["identity"] in allowed]
+        dpo = [row for row in dpo if row["identity"] in allowed]
+        candidates = [row for row in candidates if row["identity"] in allowed]
+        if not sft or not dpo or not candidates:
+            raise ValueError("Online inference produced no shared SFT/DPO/candidate records")
+    elif config.get("max_images") is not None:
         maximum = int(config["max_images"])
         sft_ids = {row["identity"] for row in sft}
         dpo_ids = {row["identity"] for row in dpo}
         candidate_ids = {row["identity"] for row in candidates}
-        prioritized = [
-            sft_ids & dpo_ids & candidate_ids,
-            sft_ids & dpo_ids,
-            candidate_ids & (sft_ids | dpo_ids),
-            sft_ids | dpo_ids | candidate_ids,
+
+        def first_unique(groups: Sequence[set], limit: int) -> set:
+            ordered = []
+            seen = set()
+            for identities in groups:
+                for identity in sorted(identities):
+                    if identity not in seen:
+                        ordered.append(identity)
+                        seen.add(identity)
+            return set(ordered[:limit])
+
+        allowed_models = first_unique(
+            [sft_ids & dpo_ids, sft_ids | dpo_ids], maximum
+        )
+        allowed_candidates = first_unique(
+            [candidate_ids & sft_ids & dpo_ids, candidate_ids], maximum
+        )
+        sft = [row for row in sft if row["identity"] in allowed_models]
+        dpo = [row for row in dpo if row["identity"] in allowed_models]
+        candidates = [
+            row for row in candidates if row["identity"] in allowed_candidates
         ]
-        ordered = []
-        seen = set()
-        for identities in prioritized:
-            for identity in sorted(identities):
-                if identity not in seen:
-                    ordered.append(identity)
-                    seen.add(identity)
-        allowed = set(ordered[:maximum])
-        sft = [row for row in sft if row["identity"] in allowed]
-        dpo = [row for row in dpo if row["identity"] in allowed]
-        candidates = [row for row in candidates if row["identity"] in allowed]
     gt, skipped_gt = gt_records_from_models(
         [*sft, *dpo, *candidates], int(config["resolution"])
     )

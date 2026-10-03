@@ -73,6 +73,16 @@ class FakeMetricRunner:
 
 
 class OfflineIqaLogicTest(unittest.TestCase):
+    def test_metric_cache_recovers_valid_rows_around_torn_append(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metric_cache.jsonl"
+            path.write_text('{"key":"old","value":1.0}\n{"key":"torn"', encoding="utf-8")
+            cache = MetricCache(path)
+            self.assertEqual(cache.values, {"old": 1.0})
+            cache.put("new", 2.0)
+            cache.save(force=True)
+            self.assertEqual(MetricCache(path).values, {"old": 1.0, "new": 2.0})
+
     def test_identity_matching_does_not_cross_subdataset_basename_collision(self):
         def row(weather: str, subdataset: str, source: str, model: str, value: float) -> dict:
             identity = identity_key(weather, subdataset, source)
