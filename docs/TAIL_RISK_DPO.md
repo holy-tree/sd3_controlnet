@@ -1,5 +1,11 @@
 # Tail-Risk Weighted DPO
 
+Reward-mode compatibility: static uses a single scalar and is supported. Dynamic
+preferences switch between Q/F per pair and cannot use this scalar tail algorithm;
+export, weighting, and enabled tail training reject it explicitly. Use ordinary
+DPO with `tail_risk.enabled: false`, or define a separate tail algorithm first.
+See [REWARD_MODES.md](REWARD_MODES.md) for shared scores and pair construction.
+
 This is an experimental pair-weighting scheme, not a guarantee of reduced seed
 variance. The tail is low reward within each weather's complete TRAIN candidate
 population, not an abnormal seed for a particular input or a generation failure.

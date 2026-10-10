@@ -15,6 +15,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from .rewards import build_reward
+from .preference_provenance import require_scalar_reward, validate_preference_reward
 
 
 TAIL_RISK_DEFAULTS = {
@@ -249,17 +250,22 @@ def _inputs(config: Mapping, input_pairs: str | Path | None = None) -> dict:
     reward_config = config.get("reward") or {}
     if not isinstance(reward_config, Mapping):
         raise ValueError("reward config must be a mapping")
-    weights = reward_config.get("weights") or {"psnr": 1.0}
-    if not isinstance(weights, Mapping):
-        raise ValueError("reward.weights must be a mapping")
-    weights = {str(key): _finite(value, f"reward weight {key}") for key, value in weights.items()}
-    if "reward_weights" in summary:
-        saved_weights = summary["reward_weights"]
-        if not isinstance(saved_weights, Mapping) or weights != {
-            str(key): _finite(value, f"summary reward weight {key}")
-            for key, value in saved_weights.items()
-        }:
-            raise ValueError("Config reward.weights mismatch with original preference summary.reward_weights")
+    if "mode" not in reward_config:
+        weights = reward_config.get("weights") or {"psnr": 1.0}
+        if not isinstance(weights, Mapping):
+            raise ValueError("reward.weights must be a mapping")
+        weights = {str(key): _finite(value, f"reward weight {key}") for key, value in weights.items()}
+        if "reward_weights" in summary:
+            saved_weights = summary["reward_weights"]
+            if not isinstance(saved_weights, Mapping) or weights != {
+                str(key): _finite(value, f"summary reward weight {key}")
+                for key, value in saved_weights.items()
+            }:
+                raise ValueError("Config reward.weights mismatch with original preference summary.reward_weights")
+    validate_preference_reward({
+        "preference_manifest": str(original_pairs), "reward": reward_config,
+        "preference_filter": filtering,
+    })
     for key in ("num_candidate_rows", "num_source_images", "num_preference_pairs"):
         if isinstance(summary.get(key), bool) or not isinstance(summary.get(key), int) or summary[key] <= 0:
             raise ValueError(f"Original preference summary requires positive integer {key}")
@@ -366,6 +372,7 @@ def _publish_new(files: Mapping[Path, bytes]) -> None:
 
 def export_candidate_rewards(config: Mapping, input_csv=None, output_csv=None) -> dict:
     """Materialize exactly build_reward(config['reward']) on saved columns."""
+    require_scalar_reward(config.get("reward"))
     tail = normalize_tail_risk_config(config.get("tail_risk"))
     inputs = _inputs(config)
     csv_path = _path(input_csv) if input_csv is not None else inputs["original_csv"]
@@ -407,6 +414,7 @@ def export_candidate_rewards(config: Mapping, input_csv=None, output_csv=None) -
         "schema_version": 1, "operation": "saved_metrics_build_reward_export",
         "full_candidate_rewards_validated": True,
         "splits": ["train"], "reward_config": dict(config["reward"]),
+        "reward_contract": inputs["summary"].get("reward_contract"),
         "config": tail, "num_candidate_rows": len(rows),
         "num_unique_candidates": len(ledger),
         "num_source_images": len({row["group"] for row in ledger.values()}),
@@ -444,6 +452,7 @@ def _distribution(values: list[float]) -> dict:
 
 def weight_tail_risk(config: Mapping, input_pairs=None, output_dir=None) -> dict:
     """Weight the full original pair set using weather-specific full TRAIN rewards."""
+    require_scalar_reward(config.get("reward"))
     tail = normalize_tail_risk_config(config.get("tail_risk"))
     if not tail["enabled"]:
         raise ValueError("Offline weighting requires tail_risk.enabled: true")
@@ -472,6 +481,8 @@ def weight_tail_risk(config: Mapping, input_pairs=None, output_dir=None) -> dict
             raise ValueError("Export metadata candidate reward path mismatch")
         if export_metadata.get("reward_config") != config["reward"]:
             raise ValueError("Export metadata reward config mismatch")
+        if export_metadata.get("reward_contract") != inputs["summary"].get("reward_contract"):
+            raise ValueError("Export metadata reward contract mismatch")
         for key, path in (("source_manifest", inputs["source_path"]),
                           ("preference_manifest", inputs["pair_path"]),
                           ("original_candidate_metrics_file", inputs["original_csv"]),
@@ -545,6 +556,11 @@ def weight_tail_risk(config: Mapping, input_pairs=None, output_dir=None) -> dict
     content = b"".join((json.dumps(pair, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8") for pair in weighted)
     summary = dict(inputs["summary"])
     summary.update(candidate_metrics_path=str(csv_path), manifest_path=str(manifest))
+    if "manifest_sha256" in summary:
+        summary["manifest_sha256"] = hashlib.sha256(content).hexdigest()
+    if "candidate_metrics_sha256" in summary:
+        # The exported CSV is a derived ledger, not the scored CSV attested by the filter.
+        summary["candidate_metrics_path"] = str(inputs["original_csv"])
     summary_path = output / "preference_summary.json"
     summary_content = _json_bytes(summary)
     stats = {

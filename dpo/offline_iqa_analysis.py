@@ -577,6 +577,11 @@ def load_normalization(path: Path | None) -> dict | None:
     statistics_payload = payload.get("statistics")
     if not isinstance(statistics_payload, Mapping):
         raise ValueError(f"Normalization JSON has no statistics mapping: {path}")
+    if (payload.get("reward_signature") or {}).get("mode") == "dynamic":
+        raise ValueError(
+            "Dynamic preference has no scalar reward-best for this IQA analyzer. "
+            "Use the preference builder's per-pair Q/F diagnostics; do not rank by a proxy reward."
+        )
     return payload
 
 
@@ -584,6 +589,12 @@ def apply_reward_normalization(rows: Sequence[dict], normalization: Mapping | No
     """Apply one candidate-derived per-weather median/IQR scale to every set."""
     if not normalization:
         return
+    signature = normalization.get("reward_signature") or {}
+    mode_reward = None
+    if signature.get("mode") == "static":
+        from dpo.rewards import build_reward
+
+        mode_reward = build_reward(signature)
     statistics_payload = normalization["statistics"]
     statistics_by_weather = {
         str(weather).strip().casefold(): values
@@ -595,7 +606,8 @@ def apply_reward_normalization(rows: Sequence[dict], normalization: Mapping | No
     for row in rows:
         weather_stats = statistics_by_weather.get(str(row["weather"]).casefold())
         complete = isinstance(weather_stats, Mapping)
-        for metric in REWARD_METRICS:
+        required = (*REWARD_METRICS, "psnr", "ssim", "lpips") if mode_reward else REWARD_METRICS
+        for metric in required:
             value = finite(row.get(metric))
             metric_stats = weather_stats.get(metric) if complete else None
             median = finite(metric_stats.get("median")) if isinstance(metric_stats, Mapping) else None
@@ -606,10 +618,13 @@ def apply_reward_normalization(rows: Sequence[dict], normalization: Mapping | No
             else:
                 row[f"{metric}_z"] = float(np.clip((value - median) / scale, -clip_z, clip_z))
         if complete:
-            row["reward"] = sum(
+            row["reward"] = mode_reward(row) if mode_reward else sum(
                 REWARD_WEIGHTS[metric] * row[f"{metric}_z"] for metric in REWARD_METRICS
             )
-            row["reward_source"] = "shared_candidate_normalization"
+            row["reward_source"] = "shared_static_normalization" if mode_reward else "shared_candidate_normalization"
+        elif mode_reward:
+            row["reward"] = None
+            row["reward_source"] = "missing_static_components"
 
 
 def _file_sha256(path: Path) -> str:

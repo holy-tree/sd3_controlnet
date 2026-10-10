@@ -1,0 +1,33 @@
+# Shared candidate scores; only the reward/pairing contract changes between modes.
+base_config: "dpo_sd3.yaml"
+
+reward:
+  mode: "static"
+  # Positive relative weights, normalized to sum 1; LPIPS is negated once in F.
+  fr_weights:
+    psnr: 1.0
+    ssim: 1.0
+    lpips: 1.0
+  tau_q: 0.05
+  margin_static: 0.05
+  margin_fr: 0.05
+
+preference_filter:
+  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics_fr_nr.csv"
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static"
+  pairs_per_group: 9
+  pair_strategy: "all_pairs"
+  pair_selection: "uniform_without_replacement"
+  max_candidate_appearances: null
+
+tail_risk:
+  enabled: false
+
+training:
+  beta: 5000.0
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Static"
+  resume_from_checkpoint: null
+
+evaluation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_static"

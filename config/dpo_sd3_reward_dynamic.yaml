@@ -1,0 +1,16 @@
+# Same scores, normalization and fidelity constraints as static; pairwise Q/F switch.
+base_config: "dpo_sd3_reward_static.yaml"
+
+reward:
+  mode: "dynamic"
+
+preference_filter:
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic"
+
+training:
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic"
+  resume_from_checkpoint: null
+
+evaluation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic"

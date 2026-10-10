@@ -1,5 +1,7 @@
 # SD3 + ControlNet + RA DPO 使用说明
 
+新增的 static/dynamic 奖励与偏好筛选见 [REWARD_MODES.md](REWARD_MODES.md)。两种模式复用已有候选、天气归一化和同一筛选入口；旧配置不写 `reward.mode` 时保留历史实验语义。
+
 本流程始终冻结 SD3 Transformer 主干，并通过 YAML 独立控制是否使用 DPO 更新 ControlNet、RA，或同时更新二者。DPO 训练开始时加载的 ControlNet 和 RA 权重构成参考策略（reference policy）。
 
 ## 数据划分

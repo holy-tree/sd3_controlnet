@@ -356,8 +356,10 @@ def write_resume_metadata(
     num_processes: int,
     dataset_length: int,
 ) -> None:
+    from dpo.preference_provenance import validate_preference_reward
+
     metadata = {
-        "version": 3,
+        "version": 4,
         "global_step": global_step,
         "epoch": epoch,
         "next_batch_index": next_batch_index,
@@ -380,6 +382,7 @@ def write_resume_metadata(
         "gt_x0_l1_weight": float(train_config.get("gt_x0_l1_weight", 0.0)),
         "weight_by_psnr_gap": bool(train_config.get("weight_by_psnr_gap", False)),
         "tail_risk": tail_risk_resume_signature(train_config),
+        "reward_provenance": validate_preference_reward(train_config),
         "beta": float(train_config.get("beta", 0.1)),
         "controlnet_learning_rate": float(
             train_config.get("controlnet_learning_rate", 5e-8)
@@ -411,6 +414,8 @@ def validate_resume_metadata(
     num_processes: int,
     dataset_length: int,
 ) -> dict:
+    from dpo.preference_provenance import validate_preference_resume
+
     with (checkpoint_dir / "dpo_resume.json").open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
     expected = {
@@ -463,6 +468,7 @@ def validate_resume_metadata(
         raise ValueError(f"Resume configuration mismatch: {mismatches}")
     if metadata.get("tail_risk", {"enabled": False}) != tail_risk_resume_signature(train_config):
         raise ValueError("Resume tail-risk configuration/provenance mismatch")
+    validate_preference_resume(metadata, train_config)
     return metadata
 
 
@@ -673,12 +679,17 @@ def run_checkpoint_validation(
 
 
 def main() -> None:
+    from dpo.preference_provenance import validate_preference_resume, validate_preference_reward
+
     cli = parse_args()
     config = load_dpo_config(cli.config)
     model_config = dict(config["model"])
     train_config = dict(config["training"])
+    train_config["reward"] = copy.deepcopy(config.get("reward") or {})
+    train_config["preference_filter"] = copy.deepcopy(config.get("preference_filter") or {})
     train_config["tail_risk"] = normalize_tail_risk_config(config.get("tail_risk"))
     tail_risk = validate_tail_risk_training(train_config)
+    reward_provenance = validate_preference_reward(train_config)
     train_controlnet = bool(train_config.get("train_controlnet", False))
     train_ra_fusion = bool(train_config.get("train_ra_fusion", True))
     use_ema = bool(train_config.get("use_ema", False))
@@ -738,6 +749,14 @@ def main() -> None:
     model_config["device"] = device
     model_path = model_config["pretrained_model_name_or_path"]
     revision = model_config.get("revision")
+
+    resume_path = resolve_resume_checkpoint(
+        output_dir, train_config.get("resume_from_checkpoint"), train_controlnet,
+        train_ra_fusion, use_ema, accelerator.process_index,
+    )
+    if resume_path is not None:
+        with (resume_path / "dpo_resume.json").open(encoding="utf-8") as handle:
+            validate_preference_resume(json.load(handle), train_config)
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         model_path, subfolder="scheduler", revision=revision
@@ -942,14 +961,6 @@ def main() -> None:
     accelerator.register_save_state_pre_hook(save_state_model_hook)
     accelerator.register_load_state_pre_hook(load_state_model_hook)
 
-    resume_path = resolve_resume_checkpoint(
-        output_dir,
-        train_config.get("resume_from_checkpoint"),
-        train_controlnet,
-        train_ra_fusion,
-        use_ema,
-        accelerator.process_index,
-    )
     initial_global_step = 0
     resume_epoch = 0
     resume_batches = 0
@@ -1435,6 +1446,8 @@ def main() -> None:
                 "num_preference_pairs": len(dataset),
                 "beta": beta,
                 "tail_risk": tail_risk_resume_signature(train_config),
+                "reward_mode": reward_provenance["reward_mode"],
+                "reward_provenance": reward_provenance,
                 "sft_weight": float(train_config.get("sft_weight", 0.0)),
                 "gt_flow_weight": gt_flow_weight,
                 "gt_x0_l1_weight": gt_x0_l1_weight,

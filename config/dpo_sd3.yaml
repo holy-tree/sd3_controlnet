@@ -95,6 +95,8 @@ preference_filter:
 
 # ==================== 3. Offline reward ====================
 reward:
+  # Historical NR-only experiment: mode is intentionally absent for saved-data compatibility.
+  # Use dpo_sd3_reward_static.yaml / dpo_sd3_reward_dynamic.yaml for shared FR+NR modes.
   # Robust z-scores are produced by scripts/rescore_dpo_candidates.py.
   weights:
     musiq_z: 0.55

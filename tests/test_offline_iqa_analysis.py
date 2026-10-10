@@ -73,6 +73,30 @@ class FakeMetricRunner:
 
 
 class OfflineIqaLogicTest(unittest.TestCase):
+    def test_static_analysis_uses_fr_nr_reward_instead_of_old_q(self):
+        row = {"weather": "rain", "musiq": 1.0, "clipiqa": 1.0, "nima": 1.0,
+               "psnr": -1.0, "ssim": -1.0, "lpips": 1.0, "reward": 99.0}
+        normalization = {
+            "reward_signature": {"mode": "static"}, "clip_z": 3.0,
+            "statistics": {"rain": {metric: {"median": 0.0, "scale": 1.0}
+                                      for metric in ("musiq", "clipiqa", "nima", "psnr", "ssim", "lpips")}},
+        }
+        apply_reward_normalization([row], normalization)
+        self.assertAlmostEqual(row["reward"], 0.0)
+        self.assertEqual(row["reward_source"], "shared_static_normalization")
+        row["lpips"] = None
+        apply_reward_normalization([row], normalization)
+        self.assertIsNone(row["reward"])
+
+    def test_dynamic_analysis_does_not_invent_a_scalar_best(self):
+        from dpo.offline_iqa_analysis import load_normalization
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "normalization.json"
+            path.write_text(json.dumps({"statistics": {}, "reward_signature": {"mode": "dynamic"}}))
+            with self.assertRaisesRegex(ValueError, "no scalar reward-best"):
+                load_normalization(path)
+
     def test_metric_cache_recovers_valid_rows_around_torn_append(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "metric_cache.jsonl"

@@ -37,6 +37,11 @@ def validate_tail_risk_training(train_config: dict) -> dict:
     tail = normalize_tail_risk_config(train_config.get("tail_risk"))
     if not tail["enabled"]:
         return tail
+    from .preference_provenance import require_scalar_reward, validate_preference_reward
+
+    require_scalar_reward(train_config.get("reward"))
+    if "mode" in (train_config.get("reward") or {}):
+        validate_preference_reward(train_config)
     if bool(train_config.get("weight_by_psnr_gap", False)):
         raise ValueError(
             "tail_risk conflicts with training.weight_by_psnr_gap; explicitly set it to false"
@@ -56,6 +61,11 @@ def validate_tail_risk_training(train_config: dict) -> dict:
     stats_path = path.parent / "tail_risk_statistics.json"
     with stats_path.open(encoding="utf-8") as handle:
         metadata = json.load(handle)
+    if "mode" in (train_config.get("reward") or {}):
+        from .rewards import reward_signature
+
+        if reward_signature(metadata.get("reward_config")) != reward_signature(train_config["reward"]):
+            raise ValueError("Tail-risk reward configuration/provenance mismatch")
     if normalize_tail_risk_config(metadata["config"]) != tail:
         raise ValueError("Tail-risk configuration differs from offline weight generation")
     if metadata["output_manifest"]["sha256"] != file_sha256(path):
