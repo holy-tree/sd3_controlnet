@@ -36,7 +36,7 @@ from dpo.tail_risk import _publish_new, file_sha256, load_config
 RAW_METRICS = (*AESTHETIC_METRICS, "dists")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Rescore saved DPO candidates without rerunning diffusion inference"
     )
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--normalize_only", action="store_true",
                         help="Use only saved numeric scores; never load images or IQA models")
     parser.add_argument("--normalization_json", help="Frozen per-weather normalization parameters")
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _resolve_path(value: str, csv_dir: Path) -> Path:
@@ -243,8 +243,8 @@ def _verify_full_population(metadata: dict, input_csv: Path, rows: list[dict]) -
                         raise ValueError("Cannot attest full weather population for FR extension")
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     if args.batch_size <= 0:
         raise ValueError("batch_size must be positive")
     input_csv = Path(args.input_csv).expanduser().resolve()

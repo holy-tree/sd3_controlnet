@@ -63,24 +63,27 @@ class RewardModesSmokeTest(unittest.TestCase):
                     "reward": {"tau_q": 0.5, "margin_static": 0.01, "margin_fr": 0.01},
                     "preference_filter": {
                         "candidate_metrics_path": str(normalized), "output_dir": str(root / mode),
+                        "source_metrics_path": str(original),
                     },
                 }), encoding="utf-8")
                 configs[mode] = load_config(config_path)
-                if mode == "static":
-                    args = ["rescore", "--config", str(config_path), "--input_csv", str(original),
-                            "--output_csv", str(normalized), "--normalize_only"]
-                    with patch.object(sys, "argv", args), patch.object(
-                        rescore_dpo_candidates, "_rescore", side_effect=AssertionError("IQA must not run")
-                    ), contextlib.redirect_stdout(io.StringIO()):
-                        rescore_dpo_candidates.main()
-                before = normalized.read_bytes()
+                before = normalized.read_bytes() if normalized.is_file() else None
                 args = ["filter", "--config", str(config_path)]
                 captured = io.StringIO()
-                with patch.object(sys, "argv", args), contextlib.redirect_stdout(captured):
+                with patch.object(sys, "argv", args), patch.object(
+                    rescore_dpo_candidates, "main", wraps=rescore_dpo_candidates.main
+                ) as prepare, patch.object(
+                    rescore_dpo_candidates, "_rescore", side_effect=AssertionError("IQA must not run")
+                ), contextlib.redirect_stdout(captured):
                     filter_dpo_pairs.main()
+                self.assertEqual(prepare.call_count, 1 if mode == "static" else 0)
                 self.assertIn(f"reward_mode={mode}", captured.getvalue())
                 self.assertIn("DISTS degradation=0.01", captured.getvalue())
-                self.assertEqual(normalized.read_bytes(), before)
+                if before is not None:
+                    self.assertEqual(normalized.read_bytes(), before)
+                else:
+                    self.assertIn("auto-preparing shared FR/NR scores", captured.getvalue())
+                    self.assertTrue(normalized.is_file())
                 summaries[mode] = json.loads((root / mode / "preference_summary.json").read_text())
                 self.assertEqual(summaries[mode]["num_evaluated_pairs"], 3)
                 self.assertEqual(summaries[mode]["num_kept_groups"], 1)
@@ -103,6 +106,46 @@ class RewardModesSmokeTest(unittest.TestCase):
                 validate_preference_reward(mismatched)
             for path, digest in originals.items():
                 self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+    def test_missing_source_has_actionable_error_and_no_inference(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.yaml"
+            config.write_text(yaml.safe_dump({
+                "base_config": str(ROOT / "config" / "dpo_sd3_reward_static.yaml"),
+                "preference_filter": {
+                    "candidate_metrics_path": str(root / "shared.csv"),
+                    "source_metrics_path": str(root / "missing_aesthetic.csv"),
+                    "output_dir": str(root / "pairs"),
+                },
+            }), encoding="utf-8")
+            with patch.object(sys, "argv", ["filter", "--config", str(config)]), patch.object(
+                rescore_dpo_candidates, "main", side_effect=AssertionError("No scores to prepare")
+            ), self.assertRaisesRegex(FileNotFoundError, "source_metrics_path"):
+                filter_dpo_pairs.main()
+            self.assertFalse((root / "shared.csv").exists())
+            self.assertFalse((root / "pairs").exists())
+
+    def test_explicit_missing_csv_override_is_not_automatically_created(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.yaml"
+            source = root / "source.csv"
+            source.write_text("weather\nrain\n", encoding="utf-8")
+            config.write_text(yaml.safe_dump({
+                "base_config": str(ROOT / "config" / "dpo_sd3_reward_static.yaml"),
+                "preference_filter": {
+                    "candidate_metrics_path": str(root / "default.csv"),
+                    "source_metrics_path": str(source), "output_dir": str(root / "pairs"),
+                },
+            }), encoding="utf-8")
+            override = root / "explicit.csv"
+            args = ["filter", "--config", str(config), "--candidate_metrics_path", str(override)]
+            with patch.object(sys, "argv", args), patch.object(
+                rescore_dpo_candidates, "main", side_effect=AssertionError("Do not change explicit input")
+            ), self.assertRaises(FileNotFoundError):
+                filter_dpo_pairs.main()
+            self.assertFalse(override.exists())
 
 
 if __name__ == "__main__":

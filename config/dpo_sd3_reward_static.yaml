@@ -13,6 +13,8 @@ reward:
   margin_fr: 0.05
 
 preference_filter:
+  # Prepare the shared numeric z-scores automatically when the target CSV is absent.
+  source_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics_aesthetic.csv"
   candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates/per_candidate_metrics_fr_nr.csv"
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static"
   pairs_per_group: 9

@@ -28,6 +28,13 @@ The original `dpo_sd3.yaml` intentionally has no `reward.mode`, preserving alrea
 
 ## Prepare Shared Scores Once
 
+The example configs declare `preference_filter.source_metrics_path`. If the shared
+FR/NR CSV is missing, `filter_dpo_pairs` automatically performs numeric-only
+normalization from that existing aesthetic CSV before pairing. Therefore the
+static/dynamic filtering commands below also work on the first run. Existing
+shared CSVs are reused without rewriting them. An explicit
+`--candidate_metrics_path` override is never replaced with an inferred input.
+
 If the existing aesthetic CSV contains MUSIQ, CLIP-IQA, NIMA, PSNR, SSIM, LPIPS, and DISTS, no model needs to run:
 
 ```bash

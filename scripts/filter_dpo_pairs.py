@@ -29,6 +29,25 @@ def main() -> None:
         "candidate_metrics_path",
         f"{generation['output_dir']}/per_candidate_metrics.csv",
     )
+    target = Path(candidate_metrics).expanduser().resolve()
+    if (not target.is_file() and not args.candidate_metrics_path
+            and (config.get("reward") or {}).get("mode") in {"static", "dynamic"}):
+        source = filtering.get("source_metrics_path")
+        if not source or not Path(source).expanduser().is_file():
+            raise FileNotFoundError(
+                f"Shared FR/NR scores are missing: {target}. Cannot prepare from source_metrics_path={source!r}. "
+                "Set preference_filter.source_metrics_path to the existing aesthetic candidate CSV "
+                "containing MUSIQ/CLIP-IQA/NIMA/PSNR/SSIM/LPIPS scores. No model inference will be run."
+            )
+        from scripts.rescore_dpo_candidates import main as prepare_scores
+
+        print(f"[pairs] auto-preparing shared FR/NR scores from saved metrics: {source} -> {target}")
+        prepare_scores([
+            "--config", args.config,
+            "--input_csv", str(Path(source).expanduser().resolve()),
+            "--output_csv", str(target),
+            "--normalize_only",
+        ])
     summary = build_preference_pairs(
         candidate_metrics_path=candidate_metrics,
         output_dir=args.output_dir or filtering["output_dir"],
