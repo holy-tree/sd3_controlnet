@@ -46,6 +46,15 @@ class IqaLoaderTest(unittest.TestCase):
 
     @mock.patch.object(metrics_module, "_pyiqa_available", return_value=True)
     @mock.patch.object(metrics_module.importlib, "import_module")
+    def test_loader_initializes_on_requested_cpu_without_transient_cuda(self, import_module, _available):
+        pyiqa = mock.Mock()
+        import_module.return_value = pyiqa
+        metric = metrics_module._load_pyiqa_metric("musiq-spaq", device="cpu")
+        self.assertIs(metric, pyiqa.create_metric.return_value)
+        pyiqa.create_metric.assert_called_once_with("musiq-spaq", device="cpu")
+
+    @mock.patch.object(metrics_module, "_pyiqa_available", return_value=True)
+    @mock.patch.object(metrics_module.importlib, "import_module")
     def test_loader_caches_failures(self, import_module, _available):
         pyiqa = mock.Mock()
         pyiqa.create_metric.side_effect = RuntimeError("unavailable")

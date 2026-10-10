@@ -171,6 +171,9 @@ training:
   validation_strength: 1.0
   validation_seed: 42
   validation_lpips_net: "alex"
+  # Raw reward metrics at each checkpoint; CPU avoids retaining extra GPU IQA weights.
+  validation_compute_iqa: true
+  validation_iqa_device: "cpu"
   beta: 1.0
   # ControlNet is larger and easier to destabilize; use a lower LR than RA.
   controlnet_learning_rate: 5.0e-8
@@ -194,7 +197,9 @@ training:
   weight_by_psnr_gap: false
   # Refuse legacy/mismatched preference data unless explicitly disabled.
   require_candidate_provenance: true
-  report_to: null
+  report_to: "tensorboard"
+  # null selects <training.output_dir>/tensorboard for each experiment.
+  logging_dir: null
   seed: 42
 
 # ==================== 6. Inference/evaluation ====================

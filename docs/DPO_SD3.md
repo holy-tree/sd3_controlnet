@@ -351,9 +351,13 @@ training:
   validation_strength: 1.0
   validation_seed: 42
   validation_lpips_net: "alex"
+  validation_compute_iqa: true
+  validation_iqa_device: "cpu"
+  report_to: "tensorboard"
+  logging_dir: null
 ```
 
-每次保存 `checkpoint-N` 后，程序使用 `validation_eval_config` 中的 rain/snow/haze 测试路径，每种天气按确定性顺序取前 `validation_num_samples_per_weather` 张，计算 candidate-to-GT 的 PSNR、SSIM、LPIPS。验证使用固定 seed，并复用训练进程中当前的 ControlNet、RA、SD3 和 VAE，不重复加载完整模型。
+每次保存 `checkpoint-N` 后，程序使用 `validation_eval_config` 中的 rain/snow/haze 测试路径，每种天气按确定性顺序取前 `validation_num_samples_per_weather` 张，计算 PSNR、SSIM、LPIPS、MUSIQ、CLIP-IQA、NIMA。验证使用固定 seed，并复用训练进程中当前的 ControlNet、RA、SD3 和 VAE，不重复加载完整恢复模型。NR 三项默认在 CPU 上运行，缺失指标保留为空并记录有效样本数。
 
 每个 checkpoint 新增：
 
@@ -371,6 +375,9 @@ checkpoint-N/
 validation/overall_psnr
 validation/overall_ssim
 validation/overall_lpips
+validation/overall_musiq
+validation/overall_clipiqa
+validation/overall_nima
 validation/rain_psnr
 validation/snow_psnr
 validation/haze_psnr
@@ -378,6 +385,8 @@ validation/haze_psnr
 ```
 
 `checkpoints_total_limit: 3` 表示每次完成保存和验证后，只保留 step 最大的 3 个 `checkpoint-*` 目录，旧 checkpoint 会被递归删除。设为 `0` 表示不限制数量。最终输出目录下的 `controlnet/`、`ra_fusion/` 不计入该限制。
+
+实验根目录还会追加 `training.log`、`training_metrics.jsonl` 和独立的 `validation_metrics.jsonl`，不会随旧 checkpoint 删除。TensorBoard 默认写入 `<output_dir>/tensorboard`；Jupyter 查看方式和日志字段见 [DPO_LOGGING.md](DPO_LOGGING.md)。六项指标在验证时计算，不增加训练损失项。
 
 保存的模型组件由训练开关决定；此外 checkpoint 还包含 optimizer、scheduler、RNG 和训练游标状态，因此既可用于评估，也支持完整断点续训。
 

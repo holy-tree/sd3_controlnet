@@ -24,7 +24,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from accelerate import Accelerator
-from accelerate.utils import DataLoaderConfiguration, set_seed
+from accelerate.utils import DataLoaderConfiguration, ProjectConfiguration, set_seed
 from diffusers import (
     AutoencoderKL,
     FlowMatchEulerDiscreteScheduler,
@@ -46,7 +46,17 @@ from dpo.tail_risk_training import (
     training_dpo_loss,
     validate_tail_risk_training,
 )
-from dpo.validation import summarize_validation_rows, validation_prompt_for_record
+from dpo.validation import (
+    VALIDATION_METRICS,
+    append_validation_history,
+    build_validation_logs,
+    create_training_logger,
+    format_validation_metrics,
+    score_validation_iqa,
+    summarize_validation_rows,
+    tracker_config,
+    validation_prompt_for_record,
+)
 from models.ra_fusion_sd3 import RAFusionSD3Transformer2DModel
 from train_controlnet_sd3 import encode_prompt, import_model_class_from_model_name_or_path
 from transformers import CLIPTokenizer, T5TokenizerFast
@@ -600,6 +610,11 @@ def run_checkpoint_validation(
             lpips = float(lpips_batch(
                 lpips_model, prediction, gt_batch, device, weight_dtype
             )[0])
+            iqa_scores = (
+                score_validation_iqa(prediction, validation_config.get("validation_iqa_device", "cpu"))
+                if bool(validation_config.get("validation_compute_iqa", True))
+                else {metric: [None] for metric in ("musiq", "clipiqa", "nima")}
+            )
             prediction_path = ""
             lq_path = ""
             gt_path = ""
@@ -628,6 +643,7 @@ def run_checkpoint_validation(
                 "psnr": psnr,
                 "ssim": ssim,
                 "lpips": lpips,
+                **{metric: values[0] for metric, values in iqa_scores.items()},
                 "prediction_path": prediction_path,
                 "lq_path": lq_path,
                 "gt_path": gt_path,
@@ -656,9 +672,15 @@ def run_checkpoint_validation(
         "weights": weights_name,
         "per_weather": per_weather,
         "overall": overall,
+        "validation_seed": int(validation_config.get("validation_seed", 42)),
+        "iqa": {
+            "enabled": bool(validation_config.get("validation_compute_iqa", True)),
+            "device": str(validation_config.get("validation_iqa_device", "cpu")),
+            "models": {"musiq": "musiq-spaq", "clipiqa": "clipiqa+", "nima": "nima"},
+        },
     }
     with (checkpoint_dir / "validation_metrics.json").open("w", encoding="utf-8") as handle:
-        json.dump(result, handle, indent=2, ensure_ascii=False)
+        json.dump(result, handle, indent=2, ensure_ascii=False, allow_nan=False)
     with (checkpoint_dir / "validation_per_image.csv").open(
         "w", newline="", encoding="utf-8"
     ) as handle:
@@ -711,10 +733,15 @@ def main() -> None:
         raise ValueError("model.ra_fusion_path must point to the Baseline + RA checkpoint")
     validate_candidate_policy(model_config, train_config)
 
+    output_dir = Path(train_config["output_dir"])
+    logging_dir = Path(train_config.get("logging_dir") or output_dir / "tensorboard")
     accelerator = Accelerator(
         gradient_accumulation_steps=int(train_config.get("gradient_accumulation_steps", 1)),
         mixed_precision=str(train_config.get("mixed_precision", "bf16")),
         log_with=train_config.get("report_to"),
+        project_config=ProjectConfiguration(
+            project_dir=str(output_dir), logging_dir=str(logging_dir),
+        ),
         dataloader_config=DataLoaderConfiguration(
             use_seedable_sampler=True,
             data_seed=int(train_config.get("seed", 42)),
@@ -730,15 +757,20 @@ def main() -> None:
         )
     seed = int(train_config.get("seed", 42))
     set_seed(seed)
-    output_dir = Path(train_config["output_dir"])
+    training_logger = None
     if accelerator.is_main_process:
         output_dir.mkdir(parents=True, exist_ok=True)
+        training_logger = create_training_logger(output_dir)
+        training_logger.info("Starting DPO: %s", json.dumps(tracker_config(train_config), ensure_ascii=False))
+        print(f"[logging] training={output_dir / 'training.log'}, "
+              f"validation={output_dir / 'validation_metrics.jsonl'}, "
+              f"trackers={train_config.get('report_to')}, directory={logging_dir}")
         with (output_dir / "dpo_config.yaml").open("w", encoding="utf-8") as handle:
             saved_config = dict(config)
             saved_config["training"] = train_config
             yaml.safe_dump(saved_config, handle, sort_keys=False, allow_unicode=True)
     if train_config.get("report_to"):
-        accelerator.init_trackers("sd3_ra_dpo", config=train_config)
+        accelerator.init_trackers("sd3_ra_dpo", config=tracker_config(train_config))
 
     device = accelerator.device
     weight_dtype = torch.float32
@@ -1013,6 +1045,8 @@ def main() -> None:
                 train_config.get("validation_save_images", True)
             ),
             "lpips_net": train_config.get("validation_lpips_net", "alex"),
+            "validation_compute_iqa": bool(train_config.get("validation_compute_iqa", True)),
+            "validation_iqa_device": str(train_config.get("validation_iqa_device", "cpu")),
         })
         validation_records = build_validation_records(validation_config)
     tokenizers, text_encoders = load_text_components(
@@ -1088,28 +1122,38 @@ def main() -> None:
                 weight_dtype=weight_dtype,
                 weights_name=weights_name,
             )
-        validation_logs = {
-            "validation/overall_psnr": result["overall"]["psnr"],
-            "validation/overall_ssim": result["overall"]["ssim"],
-            "validation/overall_lpips": result["overall"]["lpips"],
-        }
-        for weather, metrics in result["per_weather"].items():
-            for metric in ("psnr", "ssim", "lpips"):
-                validation_logs[f"validation/{weather}_{metric}"] = metrics[metric]
+        append_validation_history(output_dir, result, accelerator.is_main_process)
+        validation_logs = build_validation_logs(result)
         if train_config.get("report_to"):
             accelerator.log(validation_logs, step=step)
+            for tracker in accelerator.trackers:
+                writer = getattr(tracker, "writer", None)
+                if writer is not None:
+                    writer.flush()
+        overall_text = format_validation_metrics(result["overall"])
         print(
             f"[validation][weights={weights_name}][step={step}] "
-            f"overall PSNR={result['overall']['psnr']:.4f} "
-            f"SSIM={result['overall']['ssim']:.4f} "
-            f"LPIPS={result['overall']['lpips']:.4f}"
+            f"overall n={result['overall']['n']} {overall_text}"
         )
+        if training_logger is not None:
+            training_logger.info("validation weights=%s step=%s overall n=%s %s",
+                                 weights_name, step, result["overall"]["n"], overall_text)
+            incomplete = [
+                f"{metric}={result['overall'].get(f'n_{metric}', 0)}/{result['overall']['n']}"
+                for metric in VALIDATION_METRICS
+                if result["overall"].get(f"n_{metric}", 0) < result["overall"]["n"]
+            ]
+            if incomplete:
+                training_logger.warning("Validation metric coverage incomplete: %s", ", ".join(incomplete))
         for weather, metrics in result["per_weather"].items():
+            weather_text = format_validation_metrics(metrics)
             print(
                 f"[validation][weights={weights_name}][step={step}][{weather}] "
-                f"n={metrics['n']} PSNR={metrics['psnr']:.4f} "
-                f"SSIM={metrics['ssim']:.4f} LPIPS={metrics['lpips']:.4f}"
+                f"n={metrics['n']} {weather_text}"
             )
+            if training_logger is not None:
+                training_logger.info("validation weights=%s step=%s weather=%s n=%s %s",
+                                     weights_name, step, weather, metrics["n"], weather_text)
         return result
 
     scheduler_timesteps = scheduler.timesteps.to(device)
@@ -1355,6 +1399,8 @@ def main() -> None:
                     if accelerator.is_main_process:
                         with (output_dir / "training_metrics.jsonl").open("a", encoding="utf-8") as handle:
                             handle.write(json.dumps({"step": global_step, **logs}) + "\n")
+                        training_logger.info("training step=%s %s", global_step,
+                                             json.dumps(logs, ensure_ascii=False))
                     if train_config.get("report_to"):
                         accelerator.log(logs, step=global_step)
                 if checkpoint_due:
@@ -1422,7 +1468,10 @@ def main() -> None:
                 ):
                     with latest_metrics.open("r", encoding="utf-8") as handle:
                         latest_result = json.load(handle)
-                    can_copy_latest = latest_result.get("weights", "raw") == final_weights_name
+                    can_copy_latest = (
+                        latest_result.get("weights", "raw") == final_weights_name
+                        and all(metric in latest_result.get("overall", {}) for metric in VALIDATION_METRICS)
+                    )
                 if can_copy_latest:
                     shutil.copy2(latest_metrics, output_dir / "validation_metrics.json")
                     shutil.copy2(latest_per_image, output_dir / "validation_per_image.csv")

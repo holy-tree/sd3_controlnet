@@ -329,7 +329,7 @@ def _pyiqa_available() -> bool:
     return importlib.util.find_spec("pyiqa") is not None
 
 
-def _load_pyiqa_metric(name: str):
+def _load_pyiqa_metric(name: str, device=None):
     """Load and cache a pyiqa metric. Returns None when pyiqa is unavailable."""
     if not _pyiqa_available():
         return None
@@ -337,7 +337,7 @@ def _load_pyiqa_metric(name: str):
         return _IQA_CACHE[name]
     try:
         pyiqa = importlib.import_module("pyiqa")
-        metric = pyiqa.create_metric(name)
+        metric = pyiqa.create_metric(name, **({"device": device} if device is not None else {}))
     except Exception as e:  # pragma: no cover - import depends on user env
         warnings.warn(f"[metrics] Failed to load pyiqa metric {name}: {e}")
         _IQA_CACHE[name] = None
@@ -363,7 +363,7 @@ def _move_pyiqa_to(metric, device) -> None:
 
 def _run_pyiqa_metric(name: str, pred_batch: torch.Tensor, device) -> list:
     """Run a pyiqa NR metric on pred_batch [N,3,H,W] in [0,1]."""
-    metric = _load_pyiqa_metric(name)
+    metric = _load_pyiqa_metric(name, device=device)
     if metric is None:
         return [float("nan")] * len(pred_batch)
     _move_pyiqa_to(metric, device)
