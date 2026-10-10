@@ -1,4 +1,6 @@
 # Shared candidate scores; only the reward/pairing contract changes between modes.
+# python -m scripts.filter_dpo_pairs --config config/dpo_sd3_reward_static.yaml
+# accelerate launch scripts/train_dpo_sd3.py --config config/dpo_sd3_reward_static.yaml
 base_config: "dpo_sd3.yaml"
 
 reward:

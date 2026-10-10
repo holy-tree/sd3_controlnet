@@ -151,19 +151,19 @@ training:
   # Checkpoint validation and the final controlnet/ra_fusion export use EMA.
   validation_use_ema: true
   resolution: 512
-  train_batch_size: 4
-  gradient_accumulation_steps: 2
+  train_batch_size: 8
+  gradient_accumulation_steps: 1
   dataloader_num_workers: 4
-  max_train_steps: 5000
-  checkpointing_steps: 500
+  max_train_steps: 10000
+  checkpointing_steps: 1000
   # Sample-counted logs across microbatches and processes; no effect on gradients.
   logging_steps: 10
   # Keep only the newest N checkpoint-* directories. 0 means unlimited.
-  checkpoints_total_limit: 3
+  checkpoints_total_limit: 2
   # Run a lightweight test-set validation after every checkpoint save.
   run_checkpoint_validation: true
   validation_eval_config: "./config/eval_sd3.yaml"
-  validation_num_samples_per_weather: 3
+  validation_num_samples_per_weather: 10
   # Save LQ/GT/pred triplets under checkpoint-N/validation/{ema|raw}/<weather>/.
   validation_save_images: true
   validation_num_inference_steps: 30
