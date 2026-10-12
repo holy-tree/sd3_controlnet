@@ -6,6 +6,7 @@ import contextlib
 import csv
 import hashlib
 import json
+import os
 import random
 import shutil
 import sys
@@ -39,6 +40,11 @@ from utils.evaluate_sd3 import (  # noqa: E402
     ssim_batch,
 )
 from dpo.provenance import checkpoint_checksum  # noqa: E402
+from dpo.candidate_sharding import (  # noqa: E402
+    _group_directory, _owned, _semantic, create_generation_plan,
+    load_generation_plan, load_group_cache, save_group_cache, shard_output_dir,
+    shard_records, write_shard_completion,
+)
 from utils.restoration_condition import encode_restoration_condition  # noqa: E402
 from utils.pipeline_inference import run_pipeline_with_fp32_decode  # noqa: E402
 
@@ -116,6 +122,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snow_psnr_gap", type=float, default=0.62)
     parser.add_argument("--haze_psnr_gap", type=float, default=2.5)
     parser.add_argument("--max_saved_groups_per_weather", type=int, default=7000)
+    parser.add_argument("--plan_only", action="store_true", default=False)
+    parser.add_argument("--generation_plan", default=None)
+    parser.add_argument("--num_shards", type=int, default=1)
+    parser.add_argument("--shard_index", type=int, default=None)
+    parser.add_argument("--resume", action="store_true", default=False)
     return parser.parse_args()
 
 
@@ -505,8 +516,84 @@ def run_candidate_group_with_guidance(
     return torch.stack(predictions)
 
 
+def generation_model_metadata(args_config, use_ra_fusion, ra_scales, resolution):
+    """Resolve the same checkpoint/config fallbacks as build_pipeline, without weights."""
+    controlnet = Path(resolve_controlnet_path(
+        args_config["controlnet_model_path"]
+    )).expanduser().resolve()
+    ra_path = args_config.get("ra_fusion_path")
+    if use_ra_fusion and not ra_path:
+        ra_path = next((path for path in (controlnet / "ra_fusion", controlnet.parent / "ra_fusion")
+                        if (path / "ra_fusion.safetensors").is_file()), None)
+    ra_path = Path(ra_path).expanduser().resolve() if ra_path is not None else None
+    scale_keys = ("ra_fusion_scale", "ra_spatial_gate_scale", "ra_how_token_scale")
+    if use_ra_fusion:
+        if ra_path is None:
+            raise FileNotFoundError("RA Fusion is enabled but no RA checkpoint was found")
+        with (ra_path / "config.json").open(encoding="utf-8") as handle:
+            ra_config = json.load(handle)
+        ra_scales = [float(value if value is not None else ra_config.get(key, fallback))
+                     for key, value, fallback in zip(scale_keys, ra_scales, (1.0, 0.0, 0.0))]
+    metadata = {
+        "controlnet_model_path": str(controlnet),
+        "controlnet_checksum_sha256": checkpoint_checksum(controlnet),
+        "ra_fusion_path": str(ra_path) if ra_path is not None else None,
+        "ra_fusion_checksum_sha256": checkpoint_checksum(ra_path) if ra_path is not None else None,
+        **dict(zip(scale_keys, ra_scales)),
+    }
+    # Pin auto-discovered LoRA weights too; build_pipeline enables discovery by default.
+    lora = args_config.get("transformer_lora_path")
+    if args_config.get("load_transformer_lora", True):
+        if not lora:
+            lora = next((path for path in (controlnet / "transformer_lora", controlnet.parent / "transformer_lora")
+                         if (path / "pytorch_lora_weights.safetensors").is_file()), None)
+    else:
+        lora = None
+    metadata["transformer_lora_checksum_sha256"] = checkpoint_checksum(lora) if lora else None
+    base = Path(args_config.get("pretrained_model_name_or_path") or "").expanduser()
+    vae_config = {}
+    scheduler = "FlowMatchEulerDiscreteScheduler"
+    if args_config.get("pretrained_model_name_or_path") and base.is_dir():
+        metadata["base_model_checksum_sha256"] = checkpoint_checksum(base)
+        metadata["base_model_config_checksums"] = {}
+        for relative in ("model_index.json", "scheduler/scheduler_config.json", "vae/config.json"):
+            path = base / relative
+            if path.is_file():
+                metadata["base_model_config_checksums"][relative] = checkpoint_checksum(path)
+                with path.open(encoding="utf-8") as handle:
+                    config = json.load(handle)
+                if relative == "vae/config.json":
+                    vae_config = config
+                elif relative == "model_index.json" and config.get("scheduler"):
+                    scheduler = config["scheduler"][1]
+                elif relative == "scheduler/scheduler_config.json":
+                    scheduler = config.get("_class_name", scheduler)
+    factor = 2 ** (len(vae_config.get("block_out_channels", [128, 256, 512, 512])) - 1)
+    metadata["latent_shape"] = [int(vae_config.get("latent_channels", 16)), resolution // factor, resolution // factor]
+    metadata["scheduler"] = scheduler
+    metadata["implementation_checksums"] = {
+        relative: checkpoint_checksum(ROOT / relative)
+        for relative in (
+            "utils/randomness_check.py", "utils/evaluate_sd3.py",
+            "utils/pipeline_inference.py", "utils/restoration_condition.py",
+            "models/ra_fusion_sd3.py",
+        )
+    }
+    return metadata
+
+
 def main() -> None:
     args = parse_args()
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError("Candidate generation is not a DDP generator; use independent shard workers, not WORLD_SIZE > 1")
+    if args.num_shards < 1:
+        raise ValueError("num_shards must be positive")
+    if args.plan_only and (args.generation_plan or args.shard_index is not None):
+        raise ValueError("plan_only cannot be combined with generation_plan/shard_index")
+    if bool(args.generation_plan) != (args.shard_index is not None):
+        raise ValueError("generation_plan and shard_index must be supplied together")
+    if not (args.plan_only or args.generation_plan) and (args.num_shards != 1 or args.resume):
+        raise ValueError("num_shards/resume require plan_only or generation_plan")
     args_config = load_config(args.config)
     for key in (
         "controlnet_model_path",
@@ -537,6 +624,8 @@ def main() -> None:
         args.num_candidates_per_image,
         float(args_config.get("guidance_scale", 1.5)),
     )
+    if not all(np.isfinite(value) for value in candidate_guidance_scales):
+        raise ValueError("Candidate guidance scales must be finite")
     if args.max_saved_groups_per_weather <= 0:
         raise ValueError("max_saved_groups_per_weather must be positive")
     weather_thresholds = {
@@ -544,7 +633,7 @@ def main() -> None:
         "snow": float(args.snow_psnr_gap),
         "haze": float(args.haze_psnr_gap),
     }
-    if any(value < 0.0 for value in weather_thresholds.values()):
+    if any(not np.isfinite(value) or value < 0.0 for value in weather_thresholds.values()):
         raise ValueError("Weather PSNR gap thresholds must be non-negative")
 
     strength = (
@@ -557,6 +646,8 @@ def main() -> None:
         args.max_inference_steps if args.max_inference_steps is not None
         else int(args_config.get("num_inference_steps", 30))
     )
+    if num_inference_steps < 1:
+        raise ValueError("num_inference_steps must be positive")
     use_ra_fusion = (
         bool(args_config.get("use_ra_fusion", False))
         if args.use_ra_fusion is None else args.use_ra_fusion
@@ -579,7 +670,6 @@ def main() -> None:
         else args_config.get("ra_how_token_scale")
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float32
     if args_config.get("mixed_precision") == "fp16":
         dtype = torch.float16
@@ -609,7 +699,13 @@ def main() -> None:
     sample_seed = int(args_config.get("seed", 20240805))
 
     selection_manifest = args_config.get("selection_manifest")
-    if selection_manifest:
+    plan = load_generation_plan(args.generation_plan) if args.generation_plan else None
+    if plan is not None:
+        if args.num_shards != plan["num_shards"]:
+            raise ValueError("num_shards does not match generation plan")
+        all_sample_records = plan["sample_records"]
+        n_dataset_images = plan["n_dataset_images"]
+    elif selection_manifest:
         all_sample_records = load_selection_manifest(selection_manifest)
         print(
             f"[random] loaded {len(all_sample_records)} source pairs from "
@@ -629,54 +725,24 @@ def main() -> None:
             }
             for gt_path, lq_path, weather, subdataset in raw_samples
         ]
-    all_sample_records = [
-        {**record, "global_index": index}
-        for index, record in enumerate(all_sample_records)
-    ]
-    pipeline = setup_pipeline(
-        args_config,
-        dtype,
-        device,
-        ra_fusion_scale,
-        use_ra_fusion,
-        ra_spatial_gate_scale,
-        ra_how_token_scale,
-    )
-    if use_ra_fusion and type(pipeline.transformer).__name__ != "RAFusionSD3Transformer2DModel":
-        raise RuntimeError("RA Fusion is enabled, but the transformer is not RA-aware")
-    if use_ra_fusion:
-        ra_fusion_scale = float(pipeline.transformer.ra_fusion_scale)
-        ra_spatial_gate_scale = float(pipeline.transformer.ra_spatial_gate_scale)
-        ra_how_token_scale = float(pipeline.transformer.ra_how_token_scale)
-
-    preprocess = build_preprocess(resolution)
-    first_lq = preprocess(Image.open(all_sample_records[0]["lq_path"]).convert("RGB"))
-    first_lq_pil = transforms.ToPILImage()(first_lq)
-    latent_shape = infer_latent_shape(
-        pipeline, first_lq_pil, resolution, device
-    )
-    sample_records = select_evaluation_records(
-        all_sample_records,
-        max_samples_per_weather,
-        sample_mode,
-        sample_seed,
-        weather_sample_limits,
-    )
-
-    try:
-        lpips_model = _get_lpips_model(
-            args_config.get("lpips_net", "alex"), device=device
+    if plan is None:
+        all_sample_records = [
+            {**record, "global_index": index}
+            for index, record in enumerate(all_sample_records)
+        ]
+        n_dataset_images = len(all_sample_records)
+        sample_records = select_evaluation_records(
+            all_sample_records, max_samples_per_weather, sample_mode,
+            sample_seed, weather_sample_limits,
         )
-    except Exception as error:  # pragma: no cover
-        raise RuntimeError("LPIPS is required for offline candidate metrics") from error
+    else:
+        sample_records = plan["sample_records"]
 
-    output_root = Path(args.output_dir).expanduser().resolve()
-    candidates_root = output_root / "candidates"
-    output_root.mkdir(parents=True, exist_ok=True)
-    if candidates_root.exists():
-        shutil.rmtree(candidates_root)
-    candidates_root.mkdir(parents=True, exist_ok=True)
-
+    output_root = Path(args.output_dir).expanduser().absolute()
+    if args.plan_only or plan is not None:
+        _owned(output_root, output_root)
+    else:
+        output_root = output_root.resolve()
     random.seed(args.seed)
     use_prompt = bool(args_config.get("use_prompt", False))
     weather_prompt_overrides = args_config.get("weather_prompts") or {}
@@ -687,8 +753,99 @@ def main() -> None:
             prompts[weather] = override
         else:
             prompts[weather] = maybe_make_prompt(weather, args_config)
-    if args.verify_reproducibility:
-        test_records = [sample_records[0]]
+    model_metadata = None
+    if args.plan_only or plan is not None:
+        model_metadata = generation_model_metadata(
+            args_config, use_ra_fusion,
+            (ra_fusion_scale, ra_spatial_gate_scale, ra_how_token_scale), resolution,
+        )
+        ra_fusion_scale = model_metadata["ra_fusion_scale"]
+        ra_spatial_gate_scale = model_metadata["ra_spatial_gate_scale"]
+        ra_how_token_scale = model_metadata["ra_how_token_scale"]
+        configuration = {
+            "candidate_seed": args.seed,
+            "num_candidates_per_image": args.num_candidates_per_image,
+            "candidate_guidance_scales": candidate_guidance_scales,
+            "resolution": resolution,
+            "weather_psnr_gap_thresholds": weather_thresholds,
+            "max_saved_groups_per_weather": args.max_saved_groups_per_weather,
+            "strength": strength, "num_inference_steps": num_inference_steps,
+            "sample_mode": sample_mode, "sample_seed": sample_seed,
+            "max_samples_per_weather": max_samples_per_weather,
+            "weather_sample_limits": weather_sample_limits,
+            "args_config": args_config, "dtype": str(dtype),
+            "use_ra_fusion": use_ra_fusion, "prompts": prompts,
+            "verify_reproducibility": args.verify_reproducibility,
+            **model_metadata,
+        }
+        configuration = json.loads(json.dumps(_semantic(configuration), sort_keys=True, allow_nan=False))
+        if args.plan_only:
+            plan = create_generation_plan(
+                output_root, sample_records, configuration, args.num_shards,
+                n_dataset_images, resume=args.resume,
+            )
+            print(f"[random] plan: selected={len(sample_records)} / {n_dataset_images}, "
+                  f"shard counts={[len(shard_records(plan, i)) for i in range(args.num_shards)]}")
+            return
+        if configuration != plan["configuration"]:
+            raise ValueError("Effective configuration/checkpoint checksums do not match generation plan")
+        if Path(args.generation_plan).expanduser().resolve() != output_root / "generation_plan.json":
+            raise ValueError("generation_plan must belong to output_dir (the global root)")
+        if not torch.cuda.is_available():
+            raise RuntimeError("Coordinated candidate shard workers require CUDA; CPU fallback is disabled")
+        sample_records = shard_records(plan, args.shard_index)
+        output_root = _owned(output_root, shard_output_dir(output_root, args.shard_index))
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    candidates_root = output_root / "candidates"
+    if plan is not None:
+        _owned(output_root, candidates_root)
+        _owned(output_root, output_root / "group_cache")
+        # A failed/restarted run must not advertise an old completion.
+        _owned(output_root, output_root / "COMPLETE.json").unlink(missing_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
+    if plan is not None:
+        candidates_root.mkdir(parents=True, exist_ok=True)
+    cached = {
+        record["global_index"]: load_group_cache(output_root, record, plan)
+        for record in sample_records
+    } if plan is not None and args.resume else {}
+    pending_records = [record for record in sample_records if cached.get(record["global_index"]) is None]
+    pipeline = None
+    latent_shape = tuple(model_metadata["latent_shape"]) if model_metadata else None
+    scheduler_name = model_metadata["scheduler"] if model_metadata else None
+    if pending_records:
+        pipeline = setup_pipeline(
+            args_config, dtype, device, ra_fusion_scale, use_ra_fusion,
+            ra_spatial_gate_scale, ra_how_token_scale,
+        )
+        if use_ra_fusion and type(pipeline.transformer).__name__ != "RAFusionSD3Transformer2DModel":
+            raise RuntimeError("RA Fusion is enabled, but the transformer is not RA-aware")
+        if use_ra_fusion:
+            actual_scales = tuple(float(getattr(pipeline.transformer, key)) for key in
+                                  ("ra_fusion_scale", "ra_spatial_gate_scale", "ra_how_token_scale"))
+            if plan is not None and actual_scales != (ra_fusion_scale, ra_spatial_gate_scale, ra_how_token_scale):
+                raise RuntimeError("Loaded RA scales differ from frozen configuration")
+            ra_fusion_scale, ra_spatial_gate_scale, ra_how_token_scale = actual_scales
+        preprocess = build_preprocess(resolution)
+        first_record = pending_records[0] if plan is not None else all_sample_records[0]
+        first_lq = preprocess(Image.open(first_record["lq_path"]).convert("RGB"))
+        first_lq_pil = tensor_to_pil(first_lq) if plan is not None else transforms.ToPILImage()(first_lq)
+        actual_shape = infer_latent_shape(pipeline, first_lq_pil, resolution, device)
+        actual_scheduler = type(pipeline.scheduler).__name__
+        if plan is not None and (tuple(actual_shape) != latent_shape or actual_scheduler != scheduler_name):
+            raise RuntimeError("Loaded VAE/scheduler differs from CPU-derived generation configuration")
+        latent_shape, scheduler_name = actual_shape, actual_scheduler
+        try:
+            lpips_model = _get_lpips_model(args_config.get("lpips_net", "alex"), device=device)
+        except Exception as error:  # pragma: no cover
+            raise RuntimeError("LPIPS is required for offline candidate metrics") from error
+    if plan is None:
+        if candidates_root.exists():
+            shutil.rmtree(candidates_root)
+        candidates_root.mkdir(parents=True, exist_ok=True)
+    if args.verify_reproducibility and pending_records:
+        test_records = [pending_records[0]]
         test_lq_pils, _, _ = load_image_batch(test_records, preprocess, device)
         test_noise, _ = make_candidate_noise(test_records, 0, latent_shape, args.seed)
         reproducibility_config = {
@@ -709,7 +866,7 @@ def main() -> None:
         second_checksum = output_checksum(second_output[0])
         max_difference = float((first_output - second_output).abs().max())
         print(
-            f"[random] reproducibility image_000000/candidate_00: "
+            f"[random] reproducibility image_{test_records[0]['global_index']:06d}/candidate_00: "
             f"checksum_1={first_checksum} checksum_2={second_checksum} "
             f"max_abs_diff={max_difference:.8f}"
         )
@@ -729,7 +886,17 @@ def main() -> None:
     for record in progress:
         weather = record["weather"]
         threshold = weather_thresholds[weather]
-        if retained_by_weather[weather] >= args.max_saved_groups_per_weather:
+        cached_result = cached.get(record["global_index"])
+        if cached_result is not None:
+            if cached_result["status"] == "retained":
+                retained_records.append(cached_result["group_record"])
+                candidate_rows.extend(sorted(cached_result["candidate_rows"], key=lambda row: row["candidate_index"]))
+                sample_summary_rows.append(cached_result["sample_summary"])
+                retained_by_weather[weather] += 1
+            else:
+                rejected_records.append(cached_result["group_record"])
+            continue
+        if plan is None and retained_by_weather[weather] >= args.max_saved_groups_per_weather:
             rejected_records.append({
                 **record,
                 "reason": "weather_group_limit",
@@ -738,6 +905,19 @@ def main() -> None:
             })
             progress.set_postfix(weather=weather, status="limit", kept=retained_by_weather[weather])
             continue
+
+        image_dir = candidates_root / weather / (
+            f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
+        )
+        if plan is not None:
+            image_dir = _group_directory(output_root, record)
+            if image_dir.exists():
+                if not image_dir.is_dir():
+                    raise ValueError(f"Owned group path is not a directory: {image_dir}")
+                # Check descendants before recursive repair, including Windows junctions.
+                for child in image_dir.rglob("*"):
+                    _owned(output_root, child)
+                shutil.rmtree(image_dir)
 
         lq_pils, lq_batch, gt_batch = load_image_batch([record], preprocess, device)
         candidate_gt_batch = gt_batch.repeat(args.num_candidates_per_image, 1, 1, 1)
@@ -769,6 +949,11 @@ def main() -> None:
         except Exception as error:  # pragma: no cover
             raise RuntimeError("Failed to compute candidate LPIPS") from error
 
+        if plan is not None and any(
+            len(values) != args.num_candidates_per_image or not all(np.isfinite(value) for value in values)
+            for values in (psnrs, ssims, lpips_values)
+        ):
+            raise ValueError("Candidate metrics must contain finite scores for all candidates")
         psnr_gap = max(psnrs) - min(psnrs)
         group_record = {
             **record,
@@ -776,31 +961,9 @@ def main() -> None:
             "psnr_gap": psnr_gap,
             "psnr_gap_threshold": threshold,
         }
-        progress.set_postfix(
-            weather=weather,
-            psnr=f"{np.mean(psnrs):.2f}",
-            ssim=f"{np.mean(ssims):.4f}",
-            lpips=f"{np.mean(lpips_values):.4f}",
-            gap=f"{psnr_gap:.3f}/{threshold:.3f}",
-            kept=retained_by_weather[weather],
-            status="rejected" if psnr_gap + 1e-9 < threshold else "qualified",
-        )
-        if psnr_gap + 1e-9 < threshold:
-            rejected_records.append({**group_record, "reason": "psnr_gap_below_threshold"})
-            continue
-
-        weather_dir = candidates_root / weather
-        weather_dir.mkdir(parents=True, exist_ok=True)
-        image_dir = weather_dir / (
-            f"image_{record['global_index']:06d}_{Path(record['lq_path']).stem}"
-        )
-        image_dir.mkdir(parents=True, exist_ok=False)
-        tensor_to_pil(lq_batch[0]).save(image_dir / "lq.png")
-        tensor_to_pil(gt_batch[0]).save(image_dir / "gt.png")
         group_rows = []
         for candidate_index in range(args.num_candidates_per_image):
             candidate_path = image_dir / f"candidate_{candidate_index:02d}.png"
-            tensor_to_pil(predictions[candidate_index]).save(candidate_path)
             group_rows.append({
                 **record,
                 "candidate_index": candidate_index,
@@ -812,8 +975,37 @@ def main() -> None:
                 "lpips": lpips_values[candidate_index],
                 "prompt": prompts[weather],
                 "candidate_path": str(candidate_path),
-                "output_checksum_sha256": output_checksum(predictions[candidate_index]),
+                # Journals validate RGB PNG bytes; preserve legacy CHW checksums standalone.
+                "output_checksum_sha256": (
+                    hashlib.sha256(tensor_to_pil(predictions[candidate_index]).tobytes()).hexdigest()
+                    if plan is not None else output_checksum(predictions[candidate_index])
+                ),
             })
+        progress.set_postfix(
+            weather=weather,
+            psnr=f"{np.mean(psnrs):.2f}",
+            ssim=f"{np.mean(ssims):.4f}",
+            lpips=f"{np.mean(lpips_values):.4f}",
+            gap=f"{psnr_gap:.3f}/{threshold:.3f}",
+            kept=retained_by_weather[weather],
+            status="rejected" if psnr_gap + 1e-9 < threshold else "qualified",
+        )
+        if psnr_gap + 1e-9 < threshold:
+            group_record = {**group_record, "reason": "psnr_gap_below_threshold"}
+            rejected_records.append(group_record)
+            if plan is not None:
+                save_group_cache(output_root, record, plan, {
+                    "status": "rejected", "group_record": group_record,
+                    "candidate_rows": group_rows, "sample_summary": None,
+                })
+            continue
+
+        image_dir.parent.mkdir(parents=True, exist_ok=True)
+        image_dir.mkdir(parents=True, exist_ok=False)
+        tensor_to_pil(lq_batch[0]).save(image_dir / "lq.png")
+        tensor_to_pil(gt_batch[0]).save(image_dir / "gt.png")
+        for candidate_index in range(args.num_candidates_per_image):
+            tensor_to_pil(predictions[candidate_index]).save(group_rows[candidate_index]["candidate_path"])
         write_group_metrics(image_dir, group_rows, psnr_gap, threshold)
         candidate_rows.extend(group_rows)
         retained_records.append(group_record)
@@ -833,6 +1025,11 @@ def main() -> None:
             "best_lpips_noise_index": best_lpips_index,
             "best_lpips_guidance_scale": candidate_guidance_scales[best_lpips_index],
         })
+        if plan is not None:
+            save_group_cache(output_root, record, plan, {
+                "status": "retained", "group_record": group_record,
+                "candidate_rows": group_rows, "sample_summary": sample_summary_rows[-1],
+            })
         progress.set_postfix(
             weather=weather,
             psnr=f"{np.mean(psnrs):.2f}",
@@ -844,6 +1041,10 @@ def main() -> None:
         )
     progress.close()
 
+    if plan is not None:
+        for name in ("selected_samples.json", "rejected_samples.json", "per_candidate_metrics.csv",
+                     "sample_summary.csv", "dataset_per_noise.csv", "dataset_summary.csv", "summary.json"):
+            _owned(output_root, output_root / name)
     with (output_root / "selected_samples.json").open("w", encoding="utf-8") as handle:
         json.dump({"samples": retained_records}, handle, indent=2, ensure_ascii=False)
     with (output_root / "rejected_samples.json").open("w", encoding="utf-8") as handle:
@@ -916,7 +1117,7 @@ def main() -> None:
         "n_generated_images": len(sample_records),
         "n_retained_images": len(retained_records),
         "n_rejected_images": len(rejected_records),
-        "n_dataset_images": len(all_sample_records),
+        "n_dataset_images": n_dataset_images,
         "max_samples_per_weather": max_samples_per_weather,
         "weather_sample_limits": weather_sample_limits,
         "weather_psnr_gap_thresholds": weather_thresholds,
@@ -931,7 +1132,7 @@ def main() -> None:
             "controlnet_conditioning_scale", 1.0
         ),
         "guidance_scale": args_config.get("guidance_scale", 1.5),
-        "scheduler": type(pipeline.scheduler).__name__,
+        "scheduler": scheduler_name,
         "use_ra_fusion": use_ra_fusion,
         "ra_fusion_scale": ra_fusion_scale,
         "ra_spatial_gate_scale": ra_spatial_gate_scale,
@@ -982,10 +1183,14 @@ def main() -> None:
         "revision": args_config.get("revision"),
         "variant": args_config.get("variant"),
         "controlnet_model_path": str(resolved_controlnet_path),
-        "controlnet_checksum_sha256": checkpoint_checksum(resolved_controlnet_path),
+        "controlnet_checksum_sha256": (
+            model_metadata["controlnet_checksum_sha256"] if model_metadata is not None
+            else checkpoint_checksum(resolved_controlnet_path)
+        ),
         "ra_fusion_path": str(resolved_ra_path) if resolved_ra_path is not None else None,
         "ra_fusion_checksum_sha256": (
-            checkpoint_checksum(resolved_ra_path) if resolved_ra_path is not None else None
+            model_metadata["ra_fusion_checksum_sha256"] if model_metadata is not None
+            else checkpoint_checksum(resolved_ra_path) if resolved_ra_path is not None else None
         ),
         "controlnet_conditioning_scale": float(args_config.get(
             "controlnet_conditioning_scale", 1.0
@@ -998,6 +1203,13 @@ def main() -> None:
         "candidate_guidance_scales": candidate_guidance_scales,
         "candidate_noise_strategy": "independent_seed_per_candidate",
     }
+    if plan is not None:
+        candidate_policy.update(model_metadata)
+        candidate_policy.update({
+            "dtype": str(dtype), "resolution": resolution, "use_ra_fusion": use_ra_fusion,
+            "load_transformer_lora": bool(args_config.get("load_transformer_lora", True)),
+        })
+        settings["shard_index"] = args.shard_index
     with (output_root / "summary.json").open("w", encoding="utf-8") as handle:
         json.dump(
             json_safe({
@@ -1010,6 +1222,8 @@ def main() -> None:
             ensure_ascii=False,
             allow_nan=False,
         )
+    if plan is not None:
+        write_shard_completion(output_root, plan, args.shard_index)
 
     print("\n=== Seeded candidate summary ===")
     for row in dataset_summary_rows:

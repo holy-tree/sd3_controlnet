@@ -16,6 +16,8 @@
 
 只有将 `selection_manifest` 设为 `null` 时，才会回退到按天气目录扫描。
 
+多卡候选生成支持 `--gpu_ids 0 1 2`，按源图组分片并统一合并，不使用 DDP。为避免覆盖已有候选，应指定新输出目录；启动、恢复和日志说明见 [MULTI_GPU_CANDIDATES.md](MULTI_GPU_CANDIDATES.md)。
+
 ## 1. 生成离线候选组
 
 配置文件为 `config/dpo_sd3.yaml`：
