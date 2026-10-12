@@ -11,15 +11,127 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from tqdm.auto import tqdm
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from dpo.candidate_sharding import (
-    load_generation_plan, merge_candidate_shards, shard_records,
+    SCHEMA_VERSION, _fingerprint, load_generation_plan, load_group_cache,
+    merge_candidate_shards, shard_output_dir, shard_records,
     validate_shard_completion,
 )
 from dpo.tail_risk import load_config
+
+
+class CandidateProgress:
+    """Count atomic group journals, without repeatedly reading candidate PNGs."""
+
+    def __init__(self, output_root, plan, gpu_ids=None, verify_existing=False):
+        self.root, self.plan = Path(output_root), plan
+        if gpu_ids is not None and len(gpu_ids) != plan["num_shards"]:
+            raise ValueError("Progress GPU labels must match the frozen shard count")
+        self.records = [{int(row["global_index"]): row for row in shard_records(plan, i)}
+                        for i in range(plan["num_shards"])]
+        self.labels = [f"GPU{gpu_ids[i]}" if gpu_ids else f"shard{i}"
+                       for i in range(plan["num_shards"])]
+        self.completed = [set() for _ in self.records]
+        self.signatures = {}
+        if verify_existing:
+            existing = [(i, index, row) for i, rows in enumerate(self.records)
+                        for index, row in rows.items()
+                        if (shard_output_dir(self.root, i) / "group_cache" / f"{index}.json").is_file()]
+            for i, index, row in tqdm(existing, desc="Verify cached source groups", unit="group", leave=False):
+                path = shard_output_dir(self.root, i) / "group_cache" / f"{index}.json"
+                signature = self.file_signature(path)
+                if signature is not None:
+                    self.signatures[(i, index)] = signature
+                    if load_group_cache(shard_output_dir(self.root, i), row, plan) is not None:
+                        self.completed[i].add(index)
+        initial = sum(map(len, self.completed))
+        self.bar = tqdm(total=len(plan["sample_records"]), initial=initial,
+                        desc="Generate source groups", unit="group", dynamic_ncols=True, mininterval=2)
+        self.refresh()
+
+    @staticmethod
+    def file_signature(path):
+        try:
+            stat = path.stat()
+            return stat.st_mtime_ns, stat.st_size, stat.st_ino
+        except OSError:
+            return None
+
+    def refresh(self):
+        for i, records in enumerate(self.records):
+            directory = shard_output_dir(self.root, i) / "group_cache"
+            present = set()
+            if directory.is_dir():
+                for path in directory.glob("*.json"):
+                    if not path.stem.isdecimal():
+                        continue
+                    index = int(path.stem)
+                    if index not in records or path.name != f"{index}.json":
+                        continue
+                    present.add(index)
+                    signature = self.file_signature(path)
+                    if signature is None or self.signatures.get((i, index)) == signature:
+                        continue
+                    self.signatures[(i, index)] = signature
+                    self.completed[i].discard(index)
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                        result = payload.get("result", {})
+                        if (payload.get("schema_version") == SCHEMA_VERSION
+                                and payload.get("plan_fingerprint") == self.plan["fingerprint"]
+                                and payload.get("global_index") == index
+                                and result.get("status") in {"retained", "rejected"}
+                                and payload.get("fingerprint") == _fingerprint({
+                                    key: value for key, value in payload.items() if key != "fingerprint"
+                                })):
+                            self.completed[i].add(index)
+                    except (OSError, ValueError, TypeError, AttributeError):
+                        pass
+            self.completed[i].intersection_update(present)
+            for index in records.keys() - present:
+                self.signatures.pop((i, index), None)
+        total = sum(map(len, self.completed))
+        if total != self.bar.n:
+            self.bar.update(total - self.bar.n)
+        status = "loading/first group" if not total else (
+            "checking/merging" if total == len(self.plan["sample_records"]) else "generating"
+        )
+        self.bar.set_postfix({**{label: f"{len(done)}/{len(rows)}" for label, done, rows in
+                               zip(self.labels, self.completed, self.records)}, "stage": status})
+
+    def close(self):
+        self.bar.close()
+
+
+def monitor_candidates(output_root, gpu_ids=None):
+    """Observe an existing coordinator without launching or stopping any worker."""
+    root = Path(output_root)
+    plan = load_generation_plan(root / "generation_plan.json")
+    progress = CandidateProgress(root, plan, gpu_ids, verify_existing=True)
+    lock = root.parent / f".{root.name}.generation.lock"
+    try:
+        while True:
+            progress.refresh()
+            try:
+                complete = json.loads((root / "COMPLETE.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                complete = {}
+            if complete.get("plan_fingerprint") == plan["fingerprint"]:
+                print("[candidate] merged generation complete", flush=True)
+                return
+            if not lock.is_file():
+                print("[candidate] coordinator is not active and merged COMPLETE is absent; check shard logs", flush=True)
+                return
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("[candidate] monitor stopped; generation workers are not affected", flush=True)
+    finally:
+        progress.close()
 
 
 @contextmanager
@@ -60,6 +172,7 @@ def generate_shards(command: list[str], output_root: Path, gpu_ids: list[str], r
         print(f"[candidate] source groups={len(plan['sample_records'])}; "
               f"groups per GPU={[len(shard_records(plan, i)) for i in range(count)]}", flush=True)
         running, handles = [], []
+        progress = CandidateProgress(output_root, plan, gpu_ids, verify_existing=resume)
         try:
             for index, gpu in enumerate(gpu_ids):
                 if resume and validate_shard_completion(output_root, plan, index):
@@ -85,6 +198,7 @@ def generate_shards(command: list[str], output_root: Path, gpu_ids: list[str], r
                 running.append((index, process))
             pending = list(running)
             while pending:
+                progress.refresh()
                 remaining = []
                 for index, process in pending:
                     code = process.poll()
@@ -114,6 +228,8 @@ def generate_shards(command: list[str], output_root: Path, gpu_ids: list[str], r
                     process.wait()
             for handle in handles:
                 handle.close()
+            progress.refresh()
+            progress.close()
         print("[candidate] verifying and merging all shards", flush=True)
         summary = merge_candidate_shards(output_root, plan)
         print(json.dumps(summary["parallel_generation"], indent=2), flush=True)
@@ -128,6 +244,7 @@ def main() -> None:
     parser.add_argument("--gpu_ids", nargs="+", help="Independent workers, e.g. --gpu_ids 0 1 2; not DDP")
     parser.add_argument("--output_dir", help="Override candidate_generation.output_dir; use a fresh directory")
     parser.add_argument("--resume", action="store_true", help="Reuse a matching frozen plan and verified groups")
+    parser.add_argument("--monitor", action="store_true", help="Read-only progress for an already running generation job")
     args = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         raise ValueError("Candidate generation is not DDP; use ordinary python with --gpu_ids 0 1 2")
@@ -137,10 +254,15 @@ def main() -> None:
         raise ValueError("gpu_ids must be unique CUDA device IDs or UUIDs, one per worker")
     if args.resume and not args.gpu_ids:
         raise ValueError("--resume requires the coordinated --gpu_ids generation mode")
+    if args.monitor and (args.resume or args.dry_run):
+        raise ValueError("--monitor is read-only; do not combine it with --resume or --dry_run")
     config = load_config(args.config)
     generation = dict(config["candidate_generation"])
     if args.output_dir:
         generation["output_dir"] = args.output_dir
+    if args.monitor:
+        monitor_candidates(Path(generation["output_dir"]).expanduser().absolute(), args.gpu_ids)
+        return
     model = config["model"]
     command = [
         sys.executable,

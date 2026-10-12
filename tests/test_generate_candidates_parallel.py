@@ -40,14 +40,48 @@ class FakeProcess:
         return self.code
 
 
+class FakeProgressBar:
+    def __init__(self, iterable=(), **kwargs):
+        self.iterable = iterable
+        self.n = kwargs.get("initial", 0)
+        self.postfix = {}
+        self.closed = False
+
+    def __iter__(self):
+        return iter(self.iterable)
+
+    def update(self, count):
+        self.n += count
+
+    def set_postfix(self, values):
+        self.postfix = values
+
+    def close(self):
+        self.closed = True
+
+
 class CandidateCoordinatorTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.base = Path(temporary.name).resolve()
         self.output = self.base / "output"
-        self.plan = {"num_shards": 3, "sample_records": [{"global_index": i} for i in range(5)]}
+        self.plan = {"num_shards": 3, "fingerprint": "test-plan",
+                     "sample_records": [{"global_index": i} for i in range(5)]}
         self.summary = {"parallel_generation": {"num_shards": 3, "n_candidates": 60}}
+        progress_patch = patch.object(cli, "tqdm", FakeProgressBar)
+        progress_patch.start()
+        self.addCleanup(progress_patch.stop)
+
+    def journal(self, shard, index, fingerprint="test-plan", corrupt=False):
+        directory = cli.shard_output_dir(self.output, shard) / "group_cache"
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {"schema_version": cli.SCHEMA_VERSION, "plan_fingerprint": fingerprint,
+                   "global_index": index, "result": {"status": "retained"}}
+        payload["fingerprint"] = "corrupt" if corrupt else cli._fingerprint(payload)
+        path = directory / f"{index}.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
 
     def run_coordinator(self, processes=None, resume=False, completed=()):
         processes = processes if processes is not None else [FakeProcess() for _ in range(3)]
@@ -165,6 +199,87 @@ class CandidateCoordinatorTest(unittest.TestCase):
         run.assert_called_once()
         spawn.assert_not_called()
         self.assertNotIn("--plan_only", run.call_args.args[0])
+
+    def test_progress_counts_only_matching_atomic_owned_journals(self):
+        first = self.journal(0, 0)
+        self.journal(0, 1)  # Not owned by shard zero.
+        self.journal(1, 1, fingerprint="different-plan")
+        self.journal(2, 2, corrupt=True)
+        progress = cli.CandidateProgress(self.output, self.plan, ["0", "1", "2"])
+        self.assertEqual(progress.bar.n, 1)
+        self.assertEqual(progress.bar.postfix["GPU0"], "1/2")
+        self.assertEqual(progress.bar.postfix["GPU1"], "0/2")
+        self.journal(1, 1)
+        self.journal(2, 2)
+        progress.refresh()
+        self.assertEqual(progress.bar.n, 3)
+        first.unlink()
+        progress.refresh()
+        self.assertEqual(progress.bar.n, 2)
+        progress.close()
+        self.assertTrue(progress.bar.closed)
+
+    def test_resume_progress_excludes_damaged_existing_cache(self):
+        self.journal(0, 0)
+        self.journal(1, 1)
+        with patch.object(cli, "load_group_cache", side_effect=lambda root, row, plan:
+                          {} if row["global_index"] == 0 else None) as validate:
+            progress = cli.CandidateProgress(self.output, self.plan, ["0", "1", "2"], verify_existing=True)
+        self.assertEqual(validate.call_count, 2)
+        self.assertEqual(progress.bar.n, 1)
+        progress.refresh()  # Unchanged damaged cache must not become valid by recounting.
+        self.assertEqual(progress.bar.n, 1)
+        self.journal(1, 1)
+        progress.refresh()
+        self.assertEqual(progress.bar.n, 2)
+        progress.close()
+
+    def test_monitor_is_read_only_and_does_not_start_generation(self):
+        self.output.mkdir()
+        complete = self.output / "COMPLETE.json"
+        complete.write_text(json.dumps({"plan_fingerprint": self.plan["fingerprint"]}))
+        before = complete.read_bytes()
+        with patch.object(cli, "load_generation_plan", return_value=self.plan), \
+                patch.object(cli.subprocess, "run") as run, patch.object(cli.subprocess, "Popen") as spawn, \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            cli.monitor_candidates(self.output, ["0", "1", "2"])
+        run.assert_not_called()
+        spawn.assert_not_called()
+        self.assertIn("merged generation complete", printed.getvalue())
+        self.assertEqual(complete.read_bytes(), before)
+
+    def test_cli_monitor_dispatches_without_plan_or_worker_launch(self):
+        root = Path(__file__).resolve().parents[1]
+        args = ["generate", "--config", str(root / "config" / "dpo_sd3.yaml"),
+                "--gpu_ids", "0", "1", "2", "--output_dir", str(self.output), "--monitor"]
+        with patch.object(sys, "argv", args), patch.dict(os.environ, {"WORLD_SIZE": "1"}), \
+                patch.object(cli, "monitor_candidates") as monitor, \
+                patch.object(cli, "generate_shards") as generate, patch.object(cli.subprocess, "run") as run:
+            cli.main()
+        monitor.assert_called_once_with(self.output, ["0", "1", "2"])
+        generate.assert_not_called()
+        run.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_stopping_monitor_does_not_stop_workers_or_remove_lock(self):
+        self.output.mkdir()
+        lock = self.base / ".output.generation.lock"
+        lock.write_text('{"pid": 123}')
+        with patch.object(cli, "load_generation_plan", return_value=self.plan), \
+                patch.object(cli.time, "sleep", side_effect=KeyboardInterrupt), \
+                patch.object(cli.subprocess, "Popen") as spawn, contextlib.redirect_stdout(io.StringIO()) as printed:
+            cli.monitor_candidates(self.output)
+        spawn.assert_not_called()
+        self.assertTrue(lock.is_file())
+        self.assertIn("workers are not affected", printed.getvalue())
+
+    def test_monitor_stops_when_coordinator_has_failed(self):
+        self.output.mkdir()
+        with patch.object(cli, "load_generation_plan", return_value=self.plan), \
+                patch.object(cli.time, "sleep") as sleep, contextlib.redirect_stdout(io.StringIO()) as printed:
+            cli.monitor_candidates(self.output)
+        sleep.assert_not_called()
+        self.assertIn("coordinator is not active", printed.getvalue())
 
 
 if __name__ == "__main__":

@@ -111,6 +111,32 @@ Monitor a worker on the server:
 tail -f /root/autodl-tmp/sd3/experiment/dpo_candidates_3gpu/shard-0000.log
 ```
 
+The coordinator now displays one overall source-group progress bar with each
+GPU's completed/assigned counts and a combined rate/ETA. A group is counted
+after its atomic completion journal is published, including groups rejected by
+the quality threshold. It is not an individual-candidate or training-step bar.
+For 32 candidates per group, the bar can stay at zero during model loading and
+the first complete 32-candidate group. At 100%, reports may still be checked and
+merged; wait for the root `COMPLETE.json` and final success message.
+
+To observe a job already launched with an older coordinator, open another
+terminal and run this read-only command using the same output directory:
+
+```bash
+python -m scripts.generate_dpo_candidates \
+  --config config/dpo_sd3.yaml \
+  --gpu_ids 0 1 2 \
+  --output_dir /root/autodl-tmp/sd3/experiment/dpo_candidates_3gpu \
+  --monitor
+```
+
+Monitoring starts no processes, writes no generation artifacts, and does not
+affect workers when stopped with Ctrl+C. Existing journals are checked once
+against their PNG caches; subsequent updates inspect new atomic journals rather
+than repeatedly reading all images. Final integrity is still enforced by the
+merger. Omit GPU IDs to label bars by shard number. Current inference workers and
+frozen plan formats are unchanged by this display feature.
+
 Each worker has separate reports and group journals. Before merge, all assigned
 groups, candidate indices/seeds, PNG dimensions/checksums, metric records,
 model provenance and frozen settings are validated. Final paths are rewritten
