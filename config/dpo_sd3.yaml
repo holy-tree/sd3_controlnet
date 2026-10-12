@@ -23,10 +23,14 @@ candidate_generation:
   selection_manifest: "/root/autodl-tmp/datasets2/manifests/dpo_source_selection.json"
   splits: ["train"]
   output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates"
-  # Generate exactly six candidates for every source image.
-  num_candidates_per_image: 12
-  # Each candidate uses a different CFG and independently seeded initial noise.
-  candidate_guidance_scales: [1.0, 1.0, 1.0, 1.0,1.0, 1.0,1.0, 1.0,1.0, 1.0,1.0, 1.0]
+  # Generate 32 candidates per source with independent seeds and fixed CFG.
+  num_candidates_per_image: 32
+  candidate_guidance_scales: [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+  ]
   # Per-candidate noise is generated directly from this base seed.
   seed: 20240805
   # Non-destructive expansion is run with scripts/expand_dpo_candidates.py.
