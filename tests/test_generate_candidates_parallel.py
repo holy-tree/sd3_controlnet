@@ -261,6 +261,93 @@ class CandidateCoordinatorTest(unittest.TestCase):
         run.assert_not_called()
         self.assertFalse(self.output.exists())
 
+    def test_merge_only_uses_existing_plan_and_no_child_processes(self):
+        self.output.mkdir()
+        with patch.object(cli, "load_generation_plan", return_value=self.plan) as load, \
+                patch.object(cli, "validate_shard_completion", return_value=True) as validate, \
+                patch.object(cli, "merge_candidate_shards", return_value=self.summary) as merge, \
+                patch.object(cli.subprocess, "run") as run, patch.object(cli.subprocess, "Popen") as spawn, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.merge_only(self.output), self.summary)
+        load.assert_called_once_with(self.output / "generation_plan.json")
+        self.assertEqual(validate.call_count, 3)
+        merge.assert_called_once_with(self.output, self.plan)
+        run.assert_not_called()
+        spawn.assert_not_called()
+        self.assertFalse((self.base / ".output.generation.lock").exists())
+
+    def test_merge_only_rejects_unfinished_shards_without_generation(self):
+        self.output.mkdir()
+        with patch.object(cli, "load_generation_plan", return_value=self.plan), \
+                patch.object(cli, "validate_shard_completion", side_effect=lambda root, plan, i: i != 1), \
+                patch.object(cli, "merge_candidate_shards") as merge, \
+                patch.object(cli.subprocess, "Popen") as spawn, contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaisesRegex(RuntimeError, "incomplete/corrupt shards: \\[1\\]"):
+            cli.merge_only(self.output)
+        merge.assert_not_called()
+        spawn.assert_not_called()
+        self.assertFalse((self.base / ".output.generation.lock").exists())
+
+    def test_cli_merge_only_dispatches_before_generation_configuration(self):
+        root = Path(__file__).resolve().parents[1]
+        args = ["generate", "--config", str(root / "config" / "dpo_sd3.yaml"),
+                "--output_dir", str(self.output), "--merge_only"]
+        with patch.object(sys, "argv", args), patch.dict(os.environ, {"WORLD_SIZE": "1"}), \
+                patch.object(cli, "merge_only") as merge, patch.object(cli, "generate_shards") as generate, \
+                patch.object(cli.subprocess, "run") as run:
+            cli.main()
+        merge.assert_called_once_with(self.output)
+        generate.assert_not_called()
+        run.assert_not_called()
+
+    def test_merge_only_respects_active_generation_lock(self):
+        lock = self.base / ".output.generation.lock"
+        lock.write_text('{"pid": 123}')
+        with patch.object(cli, "load_generation_plan") as load, self.assertRaisesRegex(RuntimeError, "lock exists"):
+            cli.merge_only(self.output)
+        load.assert_not_called()
+        self.assertTrue(lock.is_file())
+
+    def test_cli_complete_group_export_is_independent_and_starts_no_workers(self):
+        root = Path(__file__).resolve().parents[1]
+        export = self.base / "snapshot"
+        args = ["generate", "--config", str(root / "config" / "dpo_sd3.yaml"),
+                "--output_dir", str(self.output), "--export_complete_groups", "--export_dir", str(export)]
+        with patch.object(sys, "argv", args), patch.dict(os.environ, {"WORLD_SIZE": "1"}), \
+                patch.object(cli, "export_complete_groups") as recover, \
+                patch.object(cli.subprocess, "run") as run, patch.object(cli.subprocess, "Popen") as spawn:
+            cli.main()
+        recover.assert_called_once_with(self.output, export)
+        run.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_complete_group_export_locks_destination_not_stale_source_lock(self):
+        export = self.base / "snapshot"
+        source_lock = self.base / ".output.generation.lock"
+        source_lock.write_text('{"pid": 123}')
+        summary = {"dataset_scope": "verified_completed_groups", "generation_finished": False,
+                   "settings": {"n_planned_images": 5, "n_retained_images": 4, "n_excluded_images": 1},
+                   "parallel_generation": {"n_candidates": 128}}
+        with patch("dpo.candidate_recovery.export_completed_groups", return_value=summary) as recover, \
+                patch.object(cli.subprocess, "Popen") as spawn, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.export_complete_groups(self.output, export), summary)
+        recover.assert_called_once_with(self.output, export)
+        spawn.assert_not_called()
+        self.assertTrue(source_lock.is_file())
+        self.assertFalse((self.base / ".snapshot.generation.lock").exists())
+
+    def test_partial_experiment_configs_share_scores_not_old_data_paths(self):
+        root = Path(__file__).resolve().parents[1]
+        static = cli.load_config(root / "config" / "dpo_sd3_reward_static_m32_partial.yaml")
+        dynamic = cli.load_config(root / "config" / "dpo_sd3_reward_dynamic_m32_partial.yaml")
+        self.assertEqual(static["preference_filter"]["candidate_metrics_path"], dynamic["preference_filter"]["candidate_metrics_path"])
+        self.assertIn("dpo_candidates_m32_complete_groups", static["preference_filter"]["candidate_metrics_path"])
+        self.assertNotEqual(static["training"]["preference_manifest"], dynamic["training"]["preference_manifest"])
+        self.assertEqual(static["training"]["beta"], 5000)
+        self.assertEqual(dynamic["training"]["beta"], 5000)
+        self.assertFalse(static["tail_risk"]["enabled"])
+        self.assertFalse(dynamic["tail_risk"]["enabled"])
+
     def test_stopping_monitor_does_not_stop_workers_or_remove_lock(self):
         self.output.mkdir()
         lock = self.base / ".output.generation.lock"

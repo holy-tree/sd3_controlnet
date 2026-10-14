@@ -2,6 +2,11 @@
 
 Only the independent analysis directory is written. PIL is imported lazily for
 optional RGB/legacy CHW pixel checksums; no model or dpo modules are imported.
+
+python -m scripts.summarize_dpo_candidates \
+  --candidate-dir /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_selected2000_3gpu \
+  --expected-candidates 32 \
+  --check-files
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ OUTPUT_NAMES = (
 )
 METADATA_NAMES = (
     "summary.json", "selected_samples.json", "rejected_samples.json",
+    "excluded_samples.json", "snapshot_manifest.json",
     "generation_plan.json", "COMPLETE.json", "sample_summary.csv",
     "dataset_summary.csv", "dataset_per_noise.csv", "per_candidate_metrics.csv",
 )
@@ -257,6 +263,21 @@ def _report(summary):
                       _table(["Rank", "Source ID", "Value", "Trustworthy", "LQ Path"],
                              [(row["rank"], row["group_id"], row[field], row["trustworthy"], row["lq_path"])
                               for row in rows]), ""]
+    if summary["partial_export"]:
+        population = summary["generation_population"]
+        subset_lines = ["## Snapshot Scope", "",
+                        "Certified VERIFIED_SUBSET accepted with warning. Original generation is incomplete."
+                        if summary["partial_export_certified"] else "Declared partial snapshot is NOT certified.", "",
+                        _table(["Weather", "Planned", "Processed", "Retained", "Rejected", "Excluded"],
+                               [(weather, *(counts[key] for key in
+                                 ("planned", "generated", "retained", "rejected", "excluded")))
+                                for weather, counts in population["by_weather"].items()]), ""]
+        if population["processed_ratio"] is not None:
+            subset_lines += [f"Processed: {population['processed_ratio']:.1%}; "
+                             f"excluded/missing: {population['excluded_ratio']:.1%} of the original plan. "
+                             "This is not completion of the original run. Source global-index holes are preserved; "
+                             "each retained group must still contain candidate slots 0..M-1.", ""]
+        lines[4:4] = subset_lines
     return "\n".join(lines)
 
 
@@ -320,6 +341,16 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
     saved = metadata.get("summary.json", {})
     plan = metadata.get("generation_plan.json", {})
     completion = metadata.get("COMPLETE.json", {})
+    manifest = metadata.get("snapshot_manifest.json", {})
+    partial_export = "snapshot_manifest.json" in metadata or any(
+        value.get("partial_export") not in (None, False) or value.get("dataset_scope") == "verified_completed_groups"
+        or value.get("generation_finished") is False for value in (saved, completion, manifest))
+    if partial_export:
+        for label, value in (("summary", saved), ("COMPLETE", completion), ("snapshot_manifest", manifest)):
+            if (value.get("partial_export") is not True
+                    or value.get("dataset_scope") != "verified_completed_groups"
+                    or value.get("generation_finished") is not False):
+                issue("partial_export_declaration_mismatch", f"{label} must declare a verified, unfinished partial export")
 
     def object_field(parent, key):
         value = parent.get(key, {})
@@ -341,6 +372,8 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
     if not settings or not policy:
         issue("configuration_unknown", "Missing generation settings or candidate model policy", "warning")
     merged_completion = "present" if completion else "unknown (legacy)"
+    if partial_export:
+        merged_completion = "uncertified partial snapshot; original generation incomplete"
     if (plan or parallel) and not completion:
         merged_completion = "not confirmed merged complete"
         issue("merged_completion_missing", merged_completion)
@@ -357,7 +390,8 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
         canonical = plan.get("configuration_canonical_json")
         if canonical is not None and canonical != json.dumps(configuration, sort_keys=True, separators=(",", ":"), ensure_ascii=False):
             issue("plan_configuration_mismatch", "Saved canonical configuration differs")
-    for label, value in (("completion", completion), ("parallel_generation", parallel)):
+    for label, value in (("completion", completion), ("parallel_generation", parallel),
+                         ("snapshot_manifest", manifest)):
         if value and fingerprint and value.get("plan_fingerprint") != fingerprint:
             issue("plan_fingerprint_mismatch", f"{label} fingerprint differs from plan")
     if completion and parallel and completion.get("plan_fingerprint") != parallel.get("plan_fingerprint"):
@@ -405,6 +439,8 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
 
     def records(name, field="samples"):
         container = metadata.get(name, {}) if name != "generation_plan.json" else plan
+        if partial_export and field not in container:
+            issue("metadata_invalid", f"Partial snapshot requires {name}.{field}")
         value = container.get(field, [])
         if not isinstance(value, list):
             issue("metadata_invalid", f"{name}.{field} must be a list")
@@ -424,6 +460,7 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
 
     selected = records("selected_samples.json")
     rejected = records("rejected_samples.json")
+    excluded = records("excluded_samples.json") if partial_export else []
     planned = records("generation_plan.json", "sample_records")
 
     def membership(values, label):
@@ -440,6 +477,8 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
     selected_map = membership(selected, "selected_samples")
     rejected_map = membership(rejected, "rejected_samples")
     plan_map = membership(planned, "generation_plan")
+    excluded_map = membership(excluded, "excluded_samples")
+    processed_map = {**selected_map, **rejected_map}
     path_rows = {}
     raw_rows = duplicate_records = 0
     directions = {name: DIRECTIONS[name] for name in ("psnr", "ssim", "lpips")}
@@ -613,13 +652,18 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
             groups[identifier]["trustworthy"] = False
     if set(selected_map) & set(rejected_map):
         issue("selected_rejected_overlap", sorted(set(selected_map) & set(rejected_map)))
-    if plan and set(plan_map) != set(selected_map) | set(rejected_map):
-        issue("plan_membership_mismatch", "Plan groups differ from selected + rejected membership")
-    for identifier, record in {**selected_map, **rejected_map}.items():
+    if set(excluded_map) & set(processed_map):
+        issue("excluded_membership_overlap", "Excluded groups overlap selected/rejected groups")
+    if plan and set(plan_map) != set(processed_map) | set(excluded_map):
+        issue("plan_membership_mismatch", "Plan groups differ from selected + rejected"
+              + (" + excluded membership" if partial_export else " membership"))
+    for identifier, record in {**processed_map, **excluded_map}.items():
         if identifier in plan_map:
             for field in ("lq_path", "gt_path"):
                 if _path(record.get(field), root) != _path(plan_map[identifier].get(field), root):
-                    issue("metadata_source_conflict", f"Selected/rejected {field} differs from plan", group_id=identifier)
+                    issue("metadata_source_conflict", f"Selected/rejected/excluded {field} differs from plan", group_id=identifier)
+            if partial_export and any(record.get(key) != value for key, value in plan_map[identifier].items()):
+                issue("metadata_source_conflict", "Snapshot does not preserve the full planned source record", group_id=identifier)
     for identifier, group in groups.items():
         for label, declared in (("selected", selected_map), ("plan", plan_map)):
             if identifier in declared:
@@ -627,9 +671,15 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
                     if _path(declared[identifier].get(field), root) != group[field]:
                         issue("metadata_source_conflict", f"{label} {field} differs from CSV", group_id=identifier)
 
-    def compare_count(label, expected, actual):
-        if expected is not None and _integer(expected) != actual:
+    def compare_count(label, expected, actual, required=False):
+        if (required and _integer(expected) is None) or (expected is not None and _integer(expected) != actual):
             issue("metadata_count_mismatch", f"{label}: declared={expected}, computed={actual}")
+
+    def compare_indices(label, declared, members):
+        indices = [_integer(record.get("global_index")) for record in members.values()]
+        if (not isinstance(declared, list) or any(_integer(value) is None for value in declared)
+                or Counter(map(_integer, declared)) != Counter(indices)):
+            issue("completion_membership_mismatch", f"{label} differs from saved source membership")
 
     unique_candidates = sum(len(group["members"]) for group in groups.values())
     compare_count("settings.n_retained_images", settings.get("n_retained_images"), len(groups))
@@ -642,12 +692,10 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
         compare_count(f"parallel_generation.{key}", parallel.get(key), actual)
     if completion:
         for key, members in (("retained_global_indices", selected_map or groups),
-                             ("global_indices", plan_map or {**selected_map, **rejected_map})):
-            if key in completion:
-                declared = completion[key]
-                indices = [_integer(record.get("global_index")) for record in members.values()]
-                if not isinstance(declared, list) or any(_integer(value) is None for value in declared) or Counter(map(_integer, declared)) != Counter(indices):
-                    issue("completion_membership_mismatch", f"{key} differs from saved source membership")
+                             ("global_indices", processed_map if partial_export else plan_map or processed_map),
+                             ("excluded_global_indices", excluded_map)):
+            if key in completion or partial_export:
+                compare_indices(f"COMPLETE.{key}", completion.get(key), members)
         compare_count("COMPLETE.num_shards", completion.get("num_shards"), _integer(plan.get("num_shards")) or _integer(parallel.get("num_shards")))
         hashes = object_field(completion, "output_hashes")
         for name in METADATA_NAMES:
@@ -657,6 +705,10 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
                     issue("completion_output_hash_mismatch", f"{name}: recorded={hashes[name]}, actual={actual}", path=root / name)
         if not hashes:
             issue("completion_hashes_missing", "Completion does not certify metadata hashes", "warning")
+        if partial_export:
+            for name in METADATA_NAMES:
+                if name != "COMPLETE.json" and (name.endswith(".json") or (root / name).exists()) and name not in hashes:
+                    issue("partial_export_hash_missing", f"COMPLETE must bind {name}")
         if verify_checksums:
             for name, checksum in hashes.items():
                 if not str(name).lower().endswith(".png"):
@@ -688,9 +740,15 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
     weather_selected = Counter(record.get("weather") or "" for record in selected_map.values())
     weather_rejected = Counter(record.get("weather") or "" for record in rejected_map.values())
     weather_planned = Counter(record.get("weather") or "" for record in plan_map.values())
+    weather_excluded = Counter(record.get("weather") or "" for record in excluded_map.values())
+    population_weather = {
+        weather: dict(planned=weather_planned[weather], generated=weather_selected[weather] + weather_rejected[weather],
+                      retained=weather_retained[weather], rejected=weather_rejected[weather], excluded=weather_excluded[weather])
+        for weather in sorted(set(weather_planned) | set(weather_selected) | set(weather_rejected) | set(weather_excluded))
+    }
     declared_weather = object_field(settings, "groups_per_weather")
     if "groups_per_weather" in settings:
-        for weather in set(weather_retained) | set(weather_rejected):
+        for weather in set(weather_retained) | set(weather_rejected) | set(weather_excluded):
             if weather not in declared_weather:
                 issue("weather_metadata_missing", f"Weather {weather!r} is absent from groups_per_weather")
     for weather, values in declared_weather.items():
@@ -700,8 +758,80 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
             issue("metadata_invalid", f"groups_per_weather.{weather} is not an object")
             continue
         for key, actual in (("retained", weather_retained[weather]), ("rejected", weather_rejected[weather]),
-                            ("generated", weather_planned[weather] if plan else weather_selected[weather] + weather_rejected[weather])):
+                            ("generated", weather_planned[weather] if plan and not partial_export else weather_selected[weather] + weather_rejected[weather])):
             compare_count(f"groups_per_weather.{weather}.{key}", values.get(key), actual)
+    if partial_export:
+        required = ("summary.json", "generation_plan.json", "selected_samples.json", "rejected_samples.json",
+                    "excluded_samples.json", "snapshot_manifest.json", "COMPLETE.json")
+        for name in required:
+            if name not in metadata:
+                issue("partial_export_metadata_missing", f"Partial snapshot requires {name}")
+        if not fingerprint or not parallel or manifest.get("plan_fingerprint") != fingerprint:
+            issue("plan_fingerprint_mismatch", "Partial snapshot requires plan, summary, completion and manifest fingerprints")
+        for label, members in (("planned", plan_map), ("processed", processed_map), ("excluded", excluded_map)):
+            indices = [_integer(record.get("global_index")) for record in members.values()]
+            if any(index is None or index < 0 for index in indices) or len(set(indices)) != len(indices):
+                issue("partial_export_indices_invalid", f"{label} must have unique nonnegative original global indices")
+        for key, members in (("global_indices", processed_map), ("retained_global_indices", selected_map),
+                             ("excluded_global_indices", excluded_map)):
+            compare_indices(f"snapshot_manifest.{key}", manifest.get(key), members)
+        population_counts = dict(planned=len(plan_map), generated=len(processed_map), retained=len(selected_map),
+                                 rejected=len(rejected_map), excluded=len(excluded_map), candidates=unique_candidates)
+        manifest_counts = object_field(manifest, "counts")
+        for key, actual in population_counts.items():
+            compare_count(f"snapshot_manifest.counts.{key}", manifest_counts.get(key), actual, required=True)
+        for key, actual in (("n_planned_images", len(plan_map)), ("n_generated_images", len(processed_map)),
+                            ("n_excluded_images", len(excluded_map)), ("n_retained_images", len(selected_map)),
+                            ("n_rejected_images", len(rejected_map))):
+            compare_count(f"settings.{key}", settings.get(key), actual, required=True)
+        for key, actual in (("n_selected_groups", len(processed_map)), ("n_retained_groups", len(selected_map)),
+                            ("n_rejected_groups", len(rejected_map)), ("n_candidates", unique_candidates)):
+            compare_count(f"parallel_generation.{key}", parallel.get(key), actual, required=True)
+        manifest_weather = object_field(manifest, "groups_per_weather")
+        for label, declarations in (("settings.groups_per_weather", declared_weather),
+                                    ("snapshot_manifest.groups_per_weather", manifest_weather)):
+            for weather in set(population_weather) | set(declarations):
+                values = declarations.get(weather)
+                if not isinstance(values, dict):
+                    issue("weather_metadata_missing", f"{label}.{weather} must declare all snapshot counts")
+                    continue
+                for key in ("planned", "generated", "retained", "rejected", "excluded"):
+                    compare_count(f"{label}.{weather}.{key}", values.get(key),
+                                  population_weather.get(weather, {}).get(key, 0), required=True)
+        plan_hash = start_hashes.get(str(root / "generation_plan.json"))
+        copied_hashes = object_field(manifest, "copied_hashes")
+        if (manifest.get("source_plan_sha256") != plan_hash
+                or copied_hashes.get("generation_plan.json") != plan_hash):
+            issue("snapshot_plan_hash_mismatch", "Snapshot must bind the unchanged full generation plan")
+        output_hashes = object_field(completion, "output_hashes")
+        if any(output_hashes.get(name) != checksum for name, checksum in copied_hashes.items()):
+            issue("snapshot_copied_hash_mismatch", "Copied hashes differ from COMPLETE output hashes")
+        if manifest.get("generation_plan_resumable") is not False:
+            issue("partial_export_declaration_mismatch", "Snapshot plan is provenance, not resumable")
+        shards = _integer(plan.get("num_shards"))
+        if shards is None or shards <= 0:
+            issue("metadata_count_mismatch", "Partial snapshot requires a positive planned num_shards")
+        for label, value in (("snapshot_manifest", manifest), ("COMPLETE", completion), ("parallel_generation", parallel)):
+            compare_count(f"{label}.num_shards", value.get("num_shards"), shards, required=True)
+        for record in excluded:
+            index = _integer(record.get("global_index"))
+            if not record.get("reason") or not shards or index is None or _integer(record.get("shard_index")) != index % shards:
+                issue("excluded_record_invalid", "Exclusions require a reason and original shard ownership")
+        journals = object_field(manifest, "journals")
+        journal_records = []
+        processed_indices = {_integer(record.get("global_index")): record for record in processed_map.values()}
+        for entry in journals.values():
+            if not isinstance(entry, dict):
+                issue("metadata_invalid", "Snapshot journal entry must be an object")
+                continue
+            index = _integer(entry.get("global_index"))
+            record = processed_indices.get(index)
+            if (record is None or entry.get("weather") != record.get("weather") or not shards
+                    or _integer(entry.get("shard_index")) != index % shards
+                    or not entry.get("sha256") or not entry.get("fingerprint")):
+                issue("snapshot_journal_mismatch", "Journal attestation differs from processed source membership")
+            journal_records.append(entry)
+        compare_indices("snapshot_manifest.journals", [entry.get("global_index") for entry in journal_records], processed_map)
     cap = _integer(setting("max_saved_groups_per_weather"))
     if setting("max_saved_groups_per_weather") is not None and (cap is None or cap < 0):
         issue("group_cap_invalid", setting("max_saved_groups_per_weather"))
@@ -791,6 +921,14 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
         for path in before:
             if before[path] != after[path]:
                 issue("input_changed_during_audit", f"{label} SHA256 changed", path=path)
+    processed_ratio = len(processed_map) / len(plan_map) if plan_map else None
+    excluded_ratio = len(excluded_map) / len(plan_map) if plan_map else None
+    partial_export_certified = partial_export and not any(item["severity"] == "critical" for item in issues)
+    if partial_export_certified:
+        merged_completion = "certified verified subset; original generation incomplete"
+        issue("verified_subset_accepted", f"VERIFIED_SUBSET: {len(processed_map)}/{len(plan_map)} processed "
+              f"({processed_ratio:.1%}); {len(excluded_map)} excluded/missing ({excluded_ratio:.1%}). "
+              "Partial snapshot accepted; original generation is not complete.", "warning")
     issue_counts = {severity: dict(Counter(item["code"] for item in issues if item["severity"] == severity))
                     for severity in ("critical", "warning")}
     critical = sum(issue_counts["critical"].values())
@@ -808,6 +946,9 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
                          "seed_strategy": setting("candidate_seed_strategy") or setting("candidate_noise_strategy"),
                          "configuration_status": "available" if settings and policy else "unknown/partial"}
     counts = dict(raw_rows=raw_rows, unique_candidates=unique_candidates, source_groups=len(groups),
+                  planned_groups=len(plan_map) if plan else None,
+                  processed_groups=len(processed_map) if retained_population_known else None,
+                  excluded_groups=len(excluded_map), retained_groups=len(selected_map), rejected_groups=len(rejected_map),
                   complete_groups=sum(group["complete"] for group in groups.values()),
                   incomplete_groups=sum(not group["complete"] for group in groups.values()),
                   duplicate_records=duplicate_records,
@@ -827,6 +968,19 @@ def run_analysis(candidate_dir, expected_candidates=None, metrics_csv=None,
                       finished_at=datetime.now(timezone.utc).isoformat())
     summary = dict(status="critical" if critical else "ok_with_warnings" if counts["warnings"] else "ok",
                    exit_code=2 if critical else 0, merged_completion=merged_completion,
+                   partial_export=partial_export, partial_export_certified=partial_export_certified,
+                   dataset_scope="verified_completed_groups" if partial_export else saved.get("dataset_scope"),
+                   generation_finished=False if partial_export else saved.get("generation_finished"),
+                   generation_population=dict(planned=len(plan_map) if plan else None,
+                                              processed=len(processed_map) if retained_population_known else None,
+                                              retained=len(selected_map), rejected=len(rejected_map), excluded=len(excluded_map),
+                                              processed_ratio=processed_ratio, excluded_ratio=excluded_ratio,
+                                              by_weather=population_weather),
+                   exclusions=dict(unique_groups=len(excluded_map),
+                                   global_indices=sorted(_integer(record.get("global_index")) for record in excluded_map.values()
+                                                         if _integer(record.get("global_index")) is not None),
+                                   by_weather=dict(weather_excluded),
+                                   by_reason=dict(Counter(record.get("reason") or "unknown" for record in excluded))),
                    expected_candidates=m, expected_candidates_basis=basis, counts=counts,
                    by_weather=by_weather, by_subdataset=by_subdataset,
                    candidate_count_distribution={str(key): value for key, value in sorted(distributions.items())},

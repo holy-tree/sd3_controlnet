@@ -237,6 +237,49 @@ def generate_shards(command: list[str], output_root: Path, gpu_ids: list[str], r
         return summary
 
 
+def merge_only(output_root: Path) -> dict:
+    """Publish completed shards from the frozen plan, without inference or children."""
+    with generation_lock(output_root):
+        plan = load_generation_plan(output_root / "generation_plan.json")
+        incomplete = []
+        for index in range(plan["num_shards"]):
+            shard = shard_output_dir(output_root, index)
+            print(f"[candidate] checking shard={index}, "
+                  f"assigned groups={len(shard_records(plan, index))}, "
+                  f"completion marker={(shard / 'COMPLETE.json').is_file()}", flush=True)
+            if not validate_shard_completion(output_root, plan, index):
+                incomplete.append(index)
+        if incomplete:
+            raise RuntimeError(
+                f"Cannot merge incomplete/corrupt shards: {incomplete}. "
+                "No inference was started. Inspect shard logs and completion markers; "
+                "use the original generation settings with --resume if recovery is required."
+            )
+        print("[candidate] all shards verified; merging without inference", flush=True)
+        summary = merge_candidate_shards(output_root, plan)
+        print(json.dumps(summary["parallel_generation"], indent=2), flush=True)
+        print(f"[candidate] merged complete: {output_root / 'per_candidate_metrics.csv'}", flush=True)
+        return summary
+
+
+def export_complete_groups(source_root: Path, export_root: Path) -> dict:
+    """Snapshot verified groups without modifying or resuming the interrupted job."""
+    from dpo.candidate_recovery import export_completed_groups
+
+    with generation_lock(export_root):
+        summary = export_completed_groups(source_root, export_root)
+        print(json.dumps({
+            "dataset_scope": summary["dataset_scope"],
+            "generation_finished": summary["generation_finished"],
+            "planned_groups": summary["settings"]["n_planned_images"],
+            "retained_groups": summary["settings"]["n_retained_images"],
+            "excluded_groups": summary["settings"]["n_excluded_images"],
+            "candidates": summary["parallel_generation"]["n_candidates"],
+            "csv": str(export_root / "per_candidate_metrics.csv"),
+        }, indent=2), flush=True)
+        return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate SD3 restoration DPO candidates")
     parser.add_argument("--config", default="./config/dpo_sd3.yaml")
@@ -245,6 +288,9 @@ def main() -> None:
     parser.add_argument("--output_dir", help="Override candidate_generation.output_dir; use a fresh directory")
     parser.add_argument("--resume", action="store_true", help="Reuse a matching frozen plan and verified groups")
     parser.add_argument("--monitor", action="store_true", help="Read-only progress for an already running generation job")
+    parser.add_argument("--merge_only", action="store_true", help="Validate and merge completed shards; never starts inference")
+    parser.add_argument("--export_complete_groups", action="store_true", help="Snapshot only verified cached groups; skip unfinished groups without inference")
+    parser.add_argument("--export_dir", help="New independent destination for --export_complete_groups")
     args = parser.parse_args()
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         raise ValueError("Candidate generation is not DDP; use ordinary python with --gpu_ids 0 1 2")
@@ -256,12 +302,27 @@ def main() -> None:
         raise ValueError("--resume requires the coordinated --gpu_ids generation mode")
     if args.monitor and (args.resume or args.dry_run):
         raise ValueError("--monitor is read-only; do not combine it with --resume or --dry_run")
+    if args.merge_only and (args.resume or args.monitor or args.dry_run):
+        raise ValueError("--merge_only cannot be combined with --resume, --monitor, or --dry_run")
+    if args.export_complete_groups and (not args.export_dir or args.resume or args.monitor or args.merge_only or args.dry_run):
+        raise ValueError("--export_complete_groups requires --export_dir and cannot combine with other operation modes")
+    if args.export_dir and not args.export_complete_groups:
+        raise ValueError("--export_dir requires --export_complete_groups")
     config = load_config(args.config)
     generation = dict(config["candidate_generation"])
     if args.output_dir:
         generation["output_dir"] = args.output_dir
+    if args.export_complete_groups:
+        export_complete_groups(
+            Path(generation["output_dir"]).expanduser().absolute(),
+            Path(args.export_dir).expanduser().absolute(),
+        )
+        return
     if args.monitor:
         monitor_candidates(Path(generation["output_dir"]).expanduser().absolute(), args.gpu_ids)
+        return
+    if args.merge_only:
+        merge_only(Path(generation["output_dir"]).expanduser().absolute())
         return
     model = config["model"]
     command = [

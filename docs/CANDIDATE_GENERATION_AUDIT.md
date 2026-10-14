@@ -43,6 +43,19 @@ Critical problems produce exit code 2 after writing the report; warning-only
 or clean results return 0. Legacy absence of a completion marker is reported as
 unknown, while a missing merged marker for a sharded run is a problem.
 
+## Verified Partial Exports
+
+An interrupted job can be exported into a new verified-complete-group snapshot
+without generating missing images; see
+[PARTIAL_CANDIDATE_RECOVERY.md](PARTIAL_CANDIDATE_RECOVERY.md). Audit that new root,
+not the original incomplete root or an individual shard. The auditor validates
+partial scope, plan fingerprint, completion/manifest counts, hashes and the
+selected/rejected/excluded partition against the original planned population.
+A certified subset reports `partial_export_certified: true` and an unfinished-job
+warning with exit code 0. It does not claim the original planned population was
+fully generated. Missing/inconsistent certification or incomplete retained groups
+still produce critical issues and exit code 2.
+
 ## What It Reports
 
 - Raw versus deduplicated candidate rows, retained source groups, expected slots,

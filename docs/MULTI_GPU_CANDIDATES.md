@@ -50,10 +50,37 @@ jobs from writing one output. After abnormal termination, inspect the PID in the
 sibling `.dpo_candidates_3gpu.generation.lock` file and confirm the job stopped
 before removing that stale lock.
 
+If all workers finished but the coordinator stopped before final merge, recover
+the merged files without starting inference:
+
+```bash
+python -m scripts.generate_dpo_candidates \
+  --config config/dpo_sd3.yaml \
+  --output_dir /root/autodl-tmp/sd3/experiment/dpo_candidates_3gpu \
+  --merge_only
+```
+
+This reads the existing frozen plan, checks all shard completion records and
+images, then publishes the ordinary root CSV/summary/COMPLETE files. No GPU IDs
+or model inference are needed. Missing/corrupt shards are rejected rather than
+silently merged; use `--resume` with original settings when actual recovery is
+needed. Do not merge concurrently with a live generator. A lock error requires
+checking that generator's status, not blindly removing the lock. The check may
+take time for a large M32 pool because image integrity is verified.
+
 Do not use `accelerate launch --multi_gpu` for generation. DDP environment
 launches are explicitly rejected. Without `--gpu_ids`, the old single-process
 entry point remains available, including its historical candidate cleanup
 behavior; `--resume` belongs to the coordinated mode.
+
+To keep only verified complete groups from an interrupted job without generating
+missing groups, use `--export_complete_groups --export_dir <new_directory>`.
+This reads group journals even when worker CSVs/completion markers are absent,
+copies an independent subset, and never modifies/resumes the original job.
+The subset is explicitly marked as partial; its completion marker does not mean
+the original generation finished. See
+[PARTIAL_CANDIDATE_RECOVERY.md](PARTIAL_CANDIDATE_RECOVERY.md) for export, audit,
+shared scoring, static/dynamic filtering and separate training commands.
 
 ## Selection And Seeds
 

@@ -1,0 +1,18 @@
+# Independent experiment on a verified complete-group snapshot of interrupted M32 generation.
+base_config: "dpo_sd3_reward_static.yaml"
+
+candidate_generation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups"
+
+preference_filter:
+  source_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_aesthetic.csv"
+  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_fr_nr.csv"
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static_m32_partial"
+
+training:
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static_m32_partial/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Static_M32_Partial"
+  resume_from_checkpoint: null
+
+evaluation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_static_m32_partial"

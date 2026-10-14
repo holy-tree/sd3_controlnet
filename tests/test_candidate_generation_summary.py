@@ -25,7 +25,7 @@ class CandidateGenerationSummaryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name) / "pool"
+        self.root = Path(self.temporary.name).resolve() / "pool"
         self.root.mkdir()
         self.seed = 81
 
@@ -117,6 +117,280 @@ class CandidateGenerationSummaryTests(unittest.TestCase):
     def issue_codes(self):
         with (self.root / "generation_analysis" / "issues.csv").open(newline="", encoding="utf-8") as handle:
             return [row["code"] for row in csv.DictReader(handle)]
+
+    def refresh_completion_hashes(self):
+        completion = json.loads((self.root / "COMPLETE.json").read_text())
+        completion["output_hashes"] = {name: audit.file_sha256(self.root / name) for name in audit.METADATA_NAMES
+                                       if name != "COMPLETE.json" and (self.root / name).is_file()}
+        self.write_json("COMPLETE.json", completion)
+
+    def partial_snapshot(self, planned_count=28):
+        retained_indices = {0, 2, planned_count - 1}
+        excluded_indices = set(range(1, 25)) - {2}
+        planned, retained, rejected, excluded, rows = [], [], [], [], []
+        for index in range(planned_count):
+            record, members = self.group(index=index, count=32 if index in retained_indices else 0,
+                                         weather="snow" if index == planned_count - 1 else "rain")
+            record.update(pair_id=f"original-{index}", source_extra=f"preserve-{index}")
+            planned.append(record)
+            if index in retained_indices:
+                retained.append(record)
+                rows.extend({**member, "pair_id": record["pair_id"], "source_extra": record["source_extra"]}
+                            for member in members)
+            elif index in excluded_indices:
+                excluded.append({**record, "shard_index": index % 2, "reason": "missing_cache"})
+            else:
+                rejected.append({**record, "reason": "psnr_gap_below_threshold"})
+        self.write_rows(rows)
+        self.metadata(retained, m=32, rejected=rejected, parallel=True)
+        plan = json.loads((self.root / "generation_plan.json").read_text())
+        plan["sample_records"] = planned
+        plan.pop("fingerprint")
+        plan["fingerprint"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":"),
+                                                       ensure_ascii=False).encode()).hexdigest()
+        self.write_json("generation_plan.json", plan)
+        flags = dict(partial_export=True, dataset_scope="verified_completed_groups", generation_finished=False)
+        saved = json.loads((self.root / "summary.json").read_text())
+        saved.update(flags)
+        saved["parallel_generation"]["plan_fingerprint"] = plan["fingerprint"]
+        saved["settings"].update(n_planned_images=planned_count, n_excluded_images=len(excluded))
+        weather_counts = saved["settings"]["groups_per_weather"]
+        for weather, values in weather_counts.items():
+            values.update(planned=sum(record["weather"] == weather for record in planned),
+                          excluded=sum(record["weather"] == weather for record in excluded))
+        self.write_json("summary.json", saved)
+        self.write_json("excluded_samples.json", {"samples": excluded})
+        processed = sorted(retained + rejected, key=lambda record: record["global_index"])
+        lists = dict(global_indices=[record["global_index"] for record in processed],
+                     retained_global_indices=sorted(retained_indices), excluded_global_indices=sorted(excluded_indices))
+        plan_hash = audit.file_sha256(self.root / "generation_plan.json")
+        manifest = dict(schema_version=1, source_root=str(self.root.parent / "interrupted"),
+                        plan_fingerprint=plan["fingerprint"], source_plan_sha256=plan_hash,
+                        generation_plan_resumable=False, num_shards=2, **flags, **lists,
+                        counts=dict(planned=planned_count, generated=len(processed), retained=len(retained),
+                                    rejected=len(rejected), excluded=len(excluded), candidates=len(rows)),
+                        groups_per_weather=weather_counts, copied_hashes={"generation_plan.json": plan_hash},
+                        journals={f"_shards/{record['global_index'] % 2}/group_cache/{record['global_index']}.json":
+                                  dict(global_index=record["global_index"], shard_index=record["global_index"] % 2,
+                                       weather=record["weather"], sha256="1" * 64, fingerprint="2" * 64)
+                                  for record in processed})
+        self.write_json("snapshot_manifest.json", manifest)
+        completion = json.loads((self.root / "COMPLETE.json").read_text())
+        completion.update(flags, **lists, plan_fingerprint=plan["fingerprint"])
+        self.write_json("COMPLETE.json", completion)
+        self.write_rows(retained, "sample_summary.csv")
+        self.write_rows([dict(scope="all", n_images=len(retained), num_candidates_per_image=32)], "dataset_summary.csv")
+        self.write_rows([dict(scope="all", noise_index=slot, psnr=10 + slot * 2) for slot in range(32)],
+                        "dataset_per_noise.csv")
+        self.refresh_completion_hashes()
+        return rows
+
+    def test_verified_subset_5977_of_6000_accepted_without_inference_or_renumbering(self):
+        rows = self.partial_snapshot(planned_count=6000)
+        before = {path: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
+        with mock.patch.dict(sys.modules, {"torch": None, "diffusers": None, "accelerate": None, "dpo": None, "PIL": None}):
+            summary = self.run_audit(expected_candidates=32)
+        self.assertEqual(summary["exit_code"], 0)
+        self.assertEqual(summary["status"], "ok_with_warnings")
+        self.assertTrue(summary["partial_export_certified"])
+        self.assertFalse(summary["generation_finished"])
+        self.assertEqual(summary["merged_completion"], "certified verified subset; original generation incomplete")
+        self.assertEqual(summary["counts"]["planned_groups"], 6000)
+        self.assertEqual(summary["counts"]["processed_groups"], 5977)
+        self.assertEqual(summary["counts"]["excluded_groups"], 23)
+        self.assertEqual(summary["counts"]["complete_groups"], 3)
+        self.assertEqual(summary["candidate_count_distribution"], {"32": 3})
+        self.assertEqual(summary["metrics"]["overall"]["psnr"]["n_valid_values"], 96)
+        self.assertEqual(summary["generation_population"]["by_weather"]["rain"],
+                         dict(planned=5999, generated=5976, retained=2, rejected=5974, excluded=23))
+        self.assertAlmostEqual(summary["generation_population"]["processed_ratio"], 5977 / 6000)
+        self.assertIn("verified_subset_accepted", self.issue_codes())
+        for code in ("plan_membership_mismatch", "completion_membership_mismatch", "candidate_slots_incomplete"):
+            self.assertNotIn(code, self.issue_codes())
+        self.assertEqual({int(row["global_index"]) for row in self.group_metrics()}, {0, 2, 5999})
+        with (self.root / "per_candidate_metrics.csv").open(newline="") as handle:
+            dataframe_rows = list(csv.DictReader(handle))
+        for row in dataframe_rows:
+            index, slot = int(row["global_index"]), int(row["candidate_index"])
+            self.assertEqual(int(row["candidate_seed"]), audit.stable_candidate_seed(self.seed, slot, index))
+            self.assertEqual(row["pair_id"], f"original-{index}")
+        self.assertEqual(len(dataframe_rows), len(rows))
+        report = (self.root / "generation_analysis" / "report.md").read_text()
+        for text in ("VERIFIED_SUBSET", "99.6%", "0.4%", "Original generation is incomplete", "| Planned | Processed |"):
+            self.assertIn(text, report)
+        self.assertEqual(summary["run_config"]["input_sha256_start"], summary["run_config"]["input_sha256_end"])
+        for path, contents in before.items():
+            self.assertEqual(path.read_bytes(), contents)
+        for name in ("excluded_samples.json", "snapshot_manifest.json"):
+            self.assertEqual(summary["run_config"]["input_sha256_start"][str(self.root / name)],
+                             audit.file_sha256(self.root / name))
+
+    def test_partial_missing_or_tampered_exclusions_critical_even_with_updated_hashes(self):
+        for mutation in ("missing", "membership", "source", "overlap", "duplicate", "shard"):
+            with self.subTest(mutation=mutation):
+                self.partial_snapshot()
+                path = self.root / "excluded_samples.json"
+                excluded = json.loads(path.read_text())
+                if mutation == "missing":
+                    path.unlink()
+                else:
+                    if mutation == "membership":
+                        excluded["samples"][0]["global_index"] = 999
+                    elif mutation == "source":
+                        excluded["samples"][0]["pair_id"] = "not-original"
+                    elif mutation == "overlap":
+                        retained = json.loads((self.root / "selected_samples.json").read_text())["samples"][0]
+                        excluded["samples"][0].update(retained)
+                    elif mutation == "duplicate":
+                        excluded["samples"].append(dict(excluded["samples"][0]))
+                    else:
+                        excluded["samples"][0]["shard_index"] = 99
+                    self.write_json("excluded_samples.json", excluded)
+                self.refresh_completion_hashes()
+                summary = self.run_audit()
+                self.assertEqual(summary["exit_code"], 2)
+                self.assertFalse(summary["partial_export_certified"])
+                self.assertNotIn("verified_subset_accepted", self.issue_codes())
+
+    def test_partial_declarations_must_agree_across_all_three_artifacts(self):
+        for name in ("summary.json", "COMPLETE.json", "snapshot_manifest.json"):
+            for field, value in (("partial_export", False), ("dataset_scope", "full_generation"),
+                                 ("generation_finished", True)):
+                with self.subTest(name=name, field=field):
+                    self.partial_snapshot()
+                    artifact = json.loads((self.root / name).read_text())
+                    artifact[field] = value
+                    self.write_json(name, artifact)
+                    self.refresh_completion_hashes()
+                    self.assertEqual(self.run_audit()["exit_code"], 2)
+                    self.assertIn("partial_export_declaration_mismatch", self.issue_codes())
+        for declared_in in ("summary.json", "COMPLETE.json", "snapshot_manifest.json"):
+            with self.subTest(declared_in=declared_in):
+                self.partial_snapshot()
+                for name in ("summary.json", "COMPLETE.json", "snapshot_manifest.json"):
+                    if name != declared_in:
+                        artifact = json.loads((self.root / name).read_text())
+                        for field in ("partial_export", "dataset_scope", "generation_finished"):
+                            artifact.pop(field)
+                        self.write_json(name, artifact)
+                self.refresh_completion_hashes()
+                self.assertEqual(self.run_audit()["exit_code"], 2)
+                self.assertIn("partial_export_declaration_mismatch", self.issue_codes())
+
+    def test_partial_counts_membership_and_provenance_strict(self):
+        mutations = (("summary.json", "settings", "n_planned_images", 27),
+                     ("summary.json", "settings", "n_planned_images", None),
+                     ("summary.json", "settings", "n_generated_images", 28),
+                     ("summary.json", "settings", "n_excluded_images", 22),
+                     ("summary.json", "parallel_generation", "n_selected_groups", 28),
+                     ("snapshot_manifest.json", "counts", "excluded", 22),
+                     ("snapshot_manifest.json", "counts", "excluded", None),
+                     ("snapshot_manifest.json", None, "global_indices", [0, 1, 2, 26]),
+                     ("snapshot_manifest.json", None, "retained_global_indices", [0, 2]),
+                     ("snapshot_manifest.json", None, "excluded_global_indices", [999]),
+                     ("COMPLETE.json", None, "global_indices", list(range(28))),
+                     ("COMPLETE.json", None, "excluded_global_indices", [999]),
+                     ("snapshot_manifest.json", None, "plan_fingerprint", "wrong"),
+                     ("snapshot_manifest.json", None, "source_plan_sha256", "wrong"),
+                     ("snapshot_manifest.json", None, "generation_plan_resumable", True),
+                     ("snapshot_manifest.json", None, "num_shards", None),
+                     ("COMPLETE.json", None, "num_shards", None),
+                     ("summary.json", "parallel_generation", "num_shards", None),
+                     ("snapshot_manifest.json", None, "journals", {}))
+        for name, parent, key, value in mutations:
+            with self.subTest(name=name, parent=parent, key=key):
+                self.partial_snapshot()
+                artifact = json.loads((self.root / name).read_text())
+                (artifact[parent] if parent else artifact)[key] = value
+                self.write_json(name, artifact)
+                self.refresh_completion_hashes()
+                self.assertEqual(self.run_audit()["exit_code"], 2)
+        for name in ("summary.json", "snapshot_manifest.json"):
+            for key in ("planned", "generated", "retained", "rejected", "excluded", "null_count"):
+                with self.subTest(name=name, weather_count=key):
+                    self.partial_snapshot()
+                    artifact = json.loads((self.root / name).read_text())
+                    parent = artifact["settings"] if name == "summary.json" else artifact
+                    if key == "null_count":
+                        parent["groups_per_weather"]["rain"]["generated"] = None
+                    else:
+                        parent["groups_per_weather"]["rain"][key] += 1
+                    self.write_json(name, artifact)
+                    self.refresh_completion_hashes()
+                    self.assertEqual(self.run_audit()["exit_code"], 2)
+                    self.assertIn("metadata_count_mismatch", self.issue_codes())
+
+    def test_partial_metadata_hash_binding_and_start_end_checks(self):
+        for name in ("excluded_samples.json", "snapshot_manifest.json"):
+            with self.subTest(name=name, check="tamper"):
+                self.partial_snapshot()
+                artifact = json.loads((self.root / name).read_text())
+                artifact["tampered"] = True
+                self.write_json(name, artifact)
+                self.assertEqual(self.run_audit()["exit_code"], 2)
+                self.assertIn("completion_output_hash_mismatch", self.issue_codes())
+            with self.subTest(name=name, check="missing_hash"):
+                self.partial_snapshot()
+                completion = json.loads((self.root / "COMPLETE.json").read_text())
+                completion["output_hashes"].pop(name)
+                self.write_json("COMPLETE.json", completion)
+                self.assertEqual(self.run_audit()["exit_code"], 2)
+                self.assertIn("partial_export_hash_missing", self.issue_codes())
+            with self.subTest(name=name, check="changed_during_audit"):
+                self.partial_snapshot()
+                real_hash = audit.file_sha256
+                calls = 0
+
+                def changing_hash(path):
+                    nonlocal calls
+                    if Path(path).name == name:
+                        calls += 1
+                        if calls == 2:
+                            return "0" * 64
+                    return real_hash(path)
+
+                with mock.patch.object(audit, "file_sha256", side_effect=changing_hash):
+                    summary = self.run_audit()
+                self.assertEqual(summary["exit_code"], 2)
+                self.assertFalse(summary["partial_export_certified"])
+                self.assertIn("input_changed_during_audit", self.issue_codes())
+
+    def test_partial_subset_still_requires_all_m32_candidate_slots_and_complete_marker(self):
+        rows = self.partial_snapshot()
+        self.write_rows(rows[1:])
+        self.refresh_completion_hashes()
+        self.assertEqual(self.run_audit()["exit_code"], 2)
+        self.assertIn("candidate_slots_incomplete", self.issue_codes())
+        self.partial_snapshot()
+        (self.root / "COMPLETE.json").unlink()
+        self.assertEqual(self.run_audit()["exit_code"], 2)
+        self.assertIn("merged_completion_missing", self.issue_codes())
+
+    def test_full_generation_cannot_silently_accept_excluded_plan_members(self):
+        record, rows = self.group()
+        absent, _ = self.group(index=9)
+        self.write_rows(rows)
+        self.metadata([record], parallel=True)
+        self.assertEqual(self.run_audit()["merged_completion"], "present")
+        plan = json.loads((self.root / "generation_plan.json").read_text())
+        plan["sample_records"].append(absent)
+        plan.pop("fingerprint")
+        plan["fingerprint"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":"),
+                                                       ensure_ascii=False).encode()).hexdigest()
+        self.write_json("generation_plan.json", plan)
+        saved = json.loads((self.root / "summary.json").read_text())
+        saved["parallel_generation"]["plan_fingerprint"] = plan["fingerprint"]
+        self.write_json("summary.json", saved)
+        completion = json.loads((self.root / "COMPLETE.json").read_text())
+        completion["plan_fingerprint"] = plan["fingerprint"]
+        self.write_json("COMPLETE.json", completion)
+        self.write_json("excluded_samples.json", {"samples": [{**absent, "reason": "missing_cache"}]})
+        self.refresh_completion_hashes()
+        summary = self.run_audit()
+        self.assertEqual(summary["exit_code"], 2)
+        self.assertFalse(summary["partial_export"])
+        self.assertIn("plan_membership_mismatch", self.issue_codes())
+        self.assertIn("completion_membership_mismatch", self.issue_codes())
 
     def test_m32_complete_seeds_cfg_and_read_only_inputs(self):
         record, rows = self.group(count=32, images=True)
