@@ -152,6 +152,10 @@ run downstream consumers against a directory while it is being merged.
 
 ## Downstream Workflow
 
+After merge, the read-only `scripts/summarize_dpo_candidates.py` audits the M32
+pool and summarizes saved metrics without scoring or inference. See
+[CANDIDATE_GENERATION_AUDIT.md](CANDIDATE_GENERATION_AUDIT.md) for the command.
+
 After successful merge, use the existing rescoring and filtering commands on the
 merged CSV. NR/FR normalization must be fit once on the complete merged candidate
 population, not separately per GPU. Set subsequent config paths to the new tree:
