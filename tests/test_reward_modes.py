@@ -112,6 +112,26 @@ class RewardModesTest(unittest.TestCase):
         self.assertEqual(pairs[0]["reward_branch"], "static")
         self.assertEqual(summary["branch_counts_before_filter"]["static"], 1)
 
+    def test_static_weighted_tradeoff_can_prefer_musiq_gain_despite_other_metric_degradation(self):
+        rows = [candidate(0, musiq_z=1, clipiqa_z=-0.25, nima_z=-0.25,
+                          psnr_z=-0.1, ssim_z=-0.1, lpips_z=0.1,
+                          psnr=29.9, dists=0.105), candidate(1)]
+        summary, pairs = self.build(rows, selection={
+            "min_psnr_gap": -0.15,
+            "fidelity_constraints": {
+                "max_dists_pair_degradation": 0.01, "baseline_mode": "group_median",
+                "baseline_psnr_tolerance": 0.5, "baseline_dists_tolerance": 0.02,
+            },
+        })
+        self.assertEqual(summary["num_preference_pairs"], 1)
+        pair = pairs[0]
+        self.assertEqual(pair["chosen_noise_index"], 0)
+        self.assertLess(pair["chosen_f"], pair["rejected_f"])
+        self.assertLess(pair["chosen_metrics"]["clipiqa_z"], pair["rejected_metrics"]["clipiqa_z"])
+        self.assertLess(pair["chosen_metrics"]["nima_z"], pair["rejected_metrics"]["nima_z"])
+        self.assertGreater(pair["chosen_metrics"]["lpips_z"], pair["rejected_metrics"]["lpips_z"])
+        self.assertAlmostEqual(pair["reward_gap"], 0.16875)
+
     def test_static_tie_below_margin_and_exact_margin(self):
         for gap, reason, count in ((0, "static_tie", 0), (0.0625, "static_gap", 0), (0.125, None, 1)):
             with self.subTest(gap=gap):

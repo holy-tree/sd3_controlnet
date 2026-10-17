@@ -1,17 +1,20 @@
-# M=8 / M=12 逐图 Seed 随机性测试
+# M=8 / M=12 逐图随机种子测试
+
+这是比较随机性统计估计稳定性的独立实验，不改变当前 M=32 候选生成配置。
+候选评分、偏好筛选和单卡训练见[DPO 主流程](DPO_SD3.md)。
 
 入口 `scripts/evaluate_seed_randomness.py` 复用项目已有的：
 
 - `build_dataset_for_eval()`：天气、子数据集和 LQ/GT 映射。
 - `select_evaluation_records()`：按天气固定随机抽样。
 - `setup_pipeline()`：ControlNet、RA Fusion、LoRA 和 VAE 加载。
-- `run_with_initial_noise()`：strength、steps、CFG、ControlNet scale、prompt 和预处理一致的固定噪声推理。
+- `run_with_initial_noise()`：强度、步数、CFG、ControlNet 缩放系数、提示词和预处理一致的固定噪声推理。
 - `utils.metrics`：PSNR、SSIM 和 LPIPS 实现。
 
-脚本只生成每图 12 个候选。M=8 读取配置 Seed 列表的前 8 个结果，M=12
+脚本只生成每图 12 个候选。M=8 读取配置种子列表的前 8 个结果，M=12
 读取全部 12 个结果，不会执行第二套推理。
-每张源图都会分别将 CPU noise generator 重置为配置中的 Seed，因此 Seed 含义不受
-图片顺序、batch size 或断点恢复位置影响；相同 Seed 在不同图片上使用相同初始噪声。
+每张源图都会分别将 CPU 噪声生成器重置为配置中的随机种子，因此种子含义不受
+图片顺序、批大小或断点恢复位置影响；相同种子在不同图片上使用相同初始噪声。
 
 ## 配置
 
@@ -40,7 +43,7 @@ stability_relative_error_threshold: 0.20
 ```
 
 `batch_size` 是同一源图一次推理或度量的候选数量。`num_workers` 只负责预读取
-LQ/GT；启用 worker 时使用 `spawn`，避免 CUDA 初始化后 fork。
+LQ/GT；启用工作进程时使用 `spawn`，避免在 CUDA 初始化后通过 `fork` 创建进程。
 
 ## 运行
 
@@ -65,14 +68,14 @@ uv run python -m scripts.evaluate_seed_randomness \
 对每张图、每个 M 和每个质量指标：
 
 ```text
-mean            = M 个 Seed 结果的平均值
+mean            = M 个随机种子结果的平均值
 sample_variance = 与 mean 的平方差之和 / (M - 1)
 sample_std      = sample_variance 的平方根
 Worst@M         = ↑指标的最小值，或 ↓指标的最大值
 ```
 
-同时输出 min、max、median、p10、p90 和 range。总体统计严格先计算逐图统计，
-再在 overall、weather 和 subdataset 内求平均：
+同时输出最小值、最大值、中位数、第 10/90 百分位和极差。
+总体统计严格先计算逐图统计，再在整体（`overall`）、天气（`weather`）和子数据集（`subdataset`）内求平均：
 
 ```text
 Mean         = 逐图 mean 的平均值
@@ -81,11 +84,11 @@ MeanVariance = 逐图 sample_variance 的平均值
 Worst@M      = 逐图 Worst@M 的平均值
 ```
 
-输出多样性不使用 GT。它在同一输入的 M 个输出之间计算：平均 pairwise LPIPS、
-平均 pairwise DISTS、平均 pairwise L1，以及 M 个输出逐像素标准差的平均值。
+输出多样性不使用 GT。它在同一输入的 M 个输出之间计算：平均两两 LPIPS、
+平均两两 DISTS、平均两两 L1，以及 M 个输出逐像素标准差的平均值。
 
 M=8 稳定性分析精确枚举全部 `C(12,8)=495` 个子集。CSV 同时保存配置前 8 个
-Seed 的方差误差、495 个子集的平均绝对/相对误差、方差 95% 区间和遗漏 M=12
+种子的方差误差、495 个子集的平均绝对/相对误差、方差 95% 区间和遗漏 M=12
 最差候选的概率。报告中的结论阈值来自
 `stability_relative_error_threshold`；M 的差异仅表示估计样本量变化，不表示模型
 分布发生变化。
@@ -108,20 +111,20 @@ Seed 的方差误差、495 个子集的平均绝对/相对误差、方差 95% �
 ```
 
 - `sample_manifest.csv`：固定的 60 张图及其天气、子数据集、LQ/GT 路径。
-- `per_seed_metrics.csv`：每张图每个 Seed 的七项 GT/NR 质量指标。
+- `per_seed_metrics.csv`：每张图每个随机种子的七项全参考/无参考质量指标。
 - `per_image_randomness.csv`：逐图 M=8/M=12 质量统计和输出多样性。
-- `randomness_summary.csv`：overall/weather/subdataset 的逐图优先汇总。
-- `m8_vs_m12_bootstrap.csv`：精确 8-of-12 子集稳定性分析。
+- `randomness_summary.csv`：整体、各天气、各子数据集的逐图优先汇总。
+- `m8_vs_m12_bootstrap.csv`：从 12 个结果中选取 8 个的精确子集稳定性分析。
 - `report.md`：中文结论、总体表格及每项指标的高方差异常图片。
 
 ## 断点续跑
 
-相同命令默认启用 resume。每个候选 PNG 和 JSON sidecar 都会校验：运行策略指纹、
-image_id、Seed、prompt、尺寸和 SHA-256。有效缓存不会重新生成；缺失、损坏或指纹
-不一致的候选会单独补算。质量指标和 diversity 也分别缓存并绑定候选 checksum。
+相同命令默认启用断点续跑。每个候选 PNG 和 JSON 附加文件都会校验运行策略指纹、
+图像 ID、随机种子、提示词、尺寸和 SHA-256。有效缓存不会重新生成；缺失、损坏或指纹
+不一致的候选会单独补算。质量指标和多样性指标也分别缓存，并绑定候选校验和。
 
-模型、checkpoint、输入内容、prompt、strength、steps、CFG、scale、dtype、Seed 或
-采样列表改变时，旧缓存不会被静默复用。策略不一致的 resume 会要求使用新目录或：
+模型、检查点、输入内容、提示词、强度、步数、CFG、缩放系数、数据类型、随机种子或
+采样列表改变时，旧缓存不会被静默复用。续跑时策略不一致，会要求使用新目录或运行：
 
 ```bash
 uv run python -m scripts.evaluate_seed_randomness \

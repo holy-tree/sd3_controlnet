@@ -39,6 +39,7 @@ from dpo.dataset import PreferencePairDataset, collate_preference_pairs
 from dpo.ema import ModelEMA
 from dpo.losses import flow_matching_gt_losses
 from dpo.provenance import checkpoint_checksum
+from dpo.reference import snapshot_reference_parameters
 from dpo.tail_risk import load_config as load_dpo_config, normalize_tail_risk_config
 from dpo.tail_risk_training import (
     DPOLogWindow,
@@ -369,12 +370,13 @@ def write_resume_metadata(
     from dpo.preference_provenance import validate_preference_reward
 
     metadata = {
-        "version": 4,
+        "version": 5,
         "global_step": global_step,
         "epoch": epoch,
         "next_batch_index": next_batch_index,
         "train_controlnet": train_controlnet,
         "train_ra_fusion": train_ra_fusion,
+        "reference_controlnet_precision": "policy_dtype_v1" if train_controlnet else None,
         "train_batch_size": int(train_config.get("train_batch_size", 1)),
         "gradient_accumulation_steps": int(
             train_config.get("gradient_accumulation_steps", 1)
@@ -455,6 +457,10 @@ def validate_resume_metadata(
         "lr_scheduler": str(train_config.get("lr_scheduler", "constant_with_warmup")),
         "lr_warmup_steps": int(train_config.get("lr_warmup_steps", 50)),
     }
+    if train_controlnet:
+        # Old checkpoints trained against a quantized reference. Do not silently
+        # change the DPO objective while restoring their optimizer state.
+        expected["reference_controlnet_precision"] = "policy_dtype_v1"
     use_ema = bool(train_config.get("use_ema", False))
     expected["use_ema"] = use_ema
     if use_ema:
@@ -811,10 +817,6 @@ def main() -> None:
     controlnet = _load_controlnet_smart(controlnet_path).to(device=device)
     reference_controlnet = None
     if train_controlnet:
-        reference_controlnet = {
-            name: parameter.detach().to(dtype=weight_dtype).clone()
-            for name, parameter in controlnet.named_parameters()
-        }
         controlnet.requires_grad_(True).train()
         for parameter in controlnet.parameters():
             if parameter.is_floating_point() and parameter.dtype != torch.float32:
@@ -822,6 +824,7 @@ def main() -> None:
         for buffer in controlnet.buffers():
             if buffer.is_floating_point() and buffer.dtype != weight_dtype:
                 buffer.data = buffer.data.to(dtype=weight_dtype)
+        reference_controlnet = snapshot_reference_parameters(controlnet)
         if bool(train_config.get("gradient_checkpointing", True)):
             controlnet.enable_gradient_checkpointing()
     else:
@@ -832,14 +835,7 @@ def main() -> None:
         transformer.enable_gradient_checkpointing()
 
     # Reference snapshots share module structure and the frozen SD3 backbone.
-    reference_ra = (
-        {
-            name: parameter.detach().clone()
-            for name, parameter in transformer.named_parameters()
-            if name.startswith("ra_")
-        }
-        if train_ra_fusion else {}
-    )
+    reference_ra = snapshot_reference_parameters(transformer, prefix="ra_") if train_ra_fusion else {}
     ra_trainable = [
         parameter for parameter in transformer.ra_fusion_parameters() if parameter.requires_grad
     ]
@@ -1155,6 +1151,20 @@ def main() -> None:
                 training_logger.info("validation weights=%s step=%s weather=%s n=%s %s",
                                      weights_name, step, weather, metrics["n"], weather_text)
         return result
+
+    if (
+        validation_enabled
+        and bool(train_config.get("validation_before_training", False))
+        and resume_path is None
+    ):
+        # Measure the original SFT policy through exactly the same validation
+        # path before attributing a bad first checkpoint to DPO updates.
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            baseline_dir = output_dir / "initial_validation"
+            baseline_dir.mkdir(parents=True, exist_ok=True)
+            validate_current_policy(baseline_dir, 0, "raw")
+        accelerator.wait_for_everyone()
 
     scheduler_timesteps = scheduler.timesteps.to(device)
     scheduler_sigmas = scheduler.sigmas.to(device)

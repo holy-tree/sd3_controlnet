@@ -1,24 +1,24 @@
-# Tail-Risk Weighted DPO
+# 尾部风险加权 DPO
 
-Reward-mode compatibility: static uses a single scalar and is supported. Dynamic
-preferences switch between Q/F per pair and cannot use this scalar tail algorithm;
-export, weighting, and enabled tail training reject it explicitly. Use ordinary
-DPO with `tail_risk.enabled: false`, or define a separate tail algorithm first.
-See [REWARD_MODES.md](REWARD_MODES.md) for shared scores and pair construction.
+本文是独立的加权对照实验。候选评分、静态/动态筛选、单卡训练、日志和续训的统一说明见
+[DPO 主流程](DPO_SD3.md)。当前主流程默认关闭尾部加权，无需执行本文命令。
 
-This is an experimental pair-weighting scheme, not a guarantee of reduced seed
-variance. The tail is low reward within each weather's complete TRAIN candidate
-population, not an abnormal seed for a particular input or a generation failure.
-It cannot add tail examples absent from the existing preference pairs.
+奖励模式兼容性：静态模式使用统一标量奖励，受本算法支持。
+动态偏好按偏好对在 Q/F 之间切换，不能使用此标量尾部算法；导出、权重生成和启用尾部加权的训练都会明确拒绝它。
+动态模式应使用 `tail_risk.enabled: false` 的普通 DPO，或先单独定义适配的尾部算法。
+共用评分与偏好对构建说明见[DPO 主流程的奖励规则](DPO_SD3.md#奖励与偏好规则)。
 
-## Scope
+这是实验性的偏好对加权方案，不保证降低随机种子方差。
+尾部指各天气完整训练候选总体中的低奖励输出，不表示某个输入的异常种子或生成失败。
+它无法添加已有偏好对中不存在的尾部样本。
 
-The original pairs, chosen/rejected paths, order, weather proportions, reward
-formula, normalization, SFT initialization, trainable modules, beta, learning
-rates, training steps, and auxiliary loss coefficients are unchanged.
-Only the DPO term receives pair weights. Candidate images and IQA are not rerun.
+## 作用范围
 
-For weather w, use unique candidate identities from the full candidate ledger:
+原偏好对、偏好/非偏好候选路径、顺序、天气比例、奖励公式、归一化、SFT 初始化、
+可训练模块、beta、学习率、训练步数及辅助损失系数均保持不变。
+只有 DPO 项应用偏好对权重，不重新生成候选或计算 IQA。
+
+对天气 w，使用完整候选台账中按唯一身份去重的候选：
 
 ```text
 T_w = Q20(candidate reward)
@@ -28,15 +28,14 @@ raw_pair_weight = 1 + lambda_tail * tail_deficit
 pair_weight = raw_pair_weight / mean(raw_pair_weight for all final pairs of w)
 ```
 
-The mean of pair_weight is 1 separately for each represented weather, computed
-offline over the full pair set. Ordinary pairs typically have weight below 1;
-tail pairs have larger weights relative to ordinary pairs, but a shallow tail
-pair can still be below 1 after normalization. The default raw weight range is
-[1, 3]; normalized weights do not have that same range.
+在每种实际存在的天气内，离线对完整偏好对集合计算归一化，使 `pair_weight` 的平均值为 1。
+普通偏好对的权重通常小于 1；尾部偏好对相对普通偏好对权重更大，
+但偏离阈值较浅的尾部对在归一化后仍可能小于 1。默认原始权重范围为 [1,3]，
+归一化后的权重不再具有相同范围。
 
-## Configuration
+## 配置
 
-The existing `config/dpo_sd3.yaml` contains disabled defaults:
+现有 `config/dpo_sd3.yaml` 包含默认关闭的设置：
 
 ```yaml
 tail_risk:
@@ -48,29 +47,28 @@ tail_risk:
   eps: 1.0e-8
 ```
 
-Two runnable comparison configs inherit all existing settings via `base_config`,
-resolved relative to the referring YAML. Each top-level section is overridden
-by key (not a general-purpose recursive merge):
+两份可直接运行的对照配置通过 `base_config` 继承已有设置，路径相对于引用它的 YAML 解析。
+各顶层配置段按键覆盖，不进行通用的递归合并：
 
-- `config/dpo_sd3_tail_risk_standard.yaml`: weights forced to 1.
-- `config/dpo_sd3_tail_risk.yaml`: offline pair weights enabled.
+- `config/dpo_sd3_tail_risk_standard.yaml`：强制将有效权重设为 1。
+- `config/dpo_sd3_tail_risk.yaml`：启用离线偏好对权重。
 
-Both read the exact same weighted JSONL, use the same seed, sampler, preprocessing,
-initialization and training parameters. They differ only in effective pair weights
-and separate result directories. Before running, the base `model` paths and scales
-must match `candidate_policy` in the original preference summary. These examples
-do not change your checkpoint. Keep `require_candidate_provenance: true`.
+这两份独立配置继承基础 `dpo_sd3.yaml` 的旧版无参奖励与路径，不是 M32 静态/动态主配置。
+若要对当前静态奖励执行尾部实验，需显式配置一致的奖励契约、候选评分、偏好文件与新输出目录，
+不能把旧版加权文件直接当作当前静态偏好使用。
 
-## Offline Commands
+两者读取完全相同的加权 JSONL，使用相同随机种子、采样器、预处理、初始化和训练参数，
+仅有效偏好对权重及结果目录不同。运行前，基础 `model` 路径与缩放系数必须和原偏好汇总中的
+`candidate_policy` 一致。这些示例不会改变所选检查点。
+请保持 `require_candidate_provenance: true`。
 
-The existing aesthetic CSV does not contain the final scalar reward. First
-materialize the existing reward into a NEW file, using saved z-scores and the
-unchanged `build_reward` formula. This is an explicit export, not IQA inference,
-new normalization, or a new reward definition. Both chosen and rejected scores
-are checked against the original pair scores; all exported candidate rewards are
-also bound to the full original saved metrics, including candidates absent from
-pairs. Mismatches stop the command. The weight generator requires validated export
-metadata, unless the original full candidate CSV already contains explicit rewards.
+## 离线命令
+
+已有美学 CSV 不包含最终标量奖励。首先使用已保存的标准化分数和不变的 `build_reward` 公式，
+将现有奖励写入新文件。这是显式导出，不运行 IQA 推理、不重新归一化，也不定义新奖励。
+偏好与非偏好候选分数都会与原偏好对中的分数核对；所有导出的候选奖励还绑定完整的原始指标，
+包括未出现在偏好对中的候选。不匹配时命令会停止。
+除非原完整候选 CSV 已包含显式奖励，否则权重生成器要求提供通过验证的导出元数据。
 
 ```bash
 python -m scripts.export_dpo_candidate_rewards \
@@ -80,23 +78,18 @@ python -m scripts.weight_dpo_tail_risk \
   --config config/dpo_sd3_tail_risk.yaml
 ```
 
-Export defaults to `tail_risk.candidate_reward_file`. Weight generation reads
-the original unweighted JSONL from `preference_filter.output_dir`, not the new
-training manifest. Input/output paths can also be provided with `--input_csv`,
-`--output_csv`, `--input_pairs`, and `--output_dir` as appropriate.
+默认导出到 `tail_risk.candidate_reward_file`。权重生成从 `preference_filter.output_dir`
+读取原始未加权 JSONL，不读取新的训练清单。
+也可按需通过 `--input_csv`、`--output_csv`、`--input_pairs` 和 `--output_dir` 指定输入输出路径。
 
-The scripts refuse to overwrite existing outputs. If running another experiment,
-choose new paths and update both matched configs. They require `splits: [train]`
-and the training `selection_manifest`, check candidate LQ/GT/weather membership,
-and check the full candidate identity set against the original metrics CSV and
-preference summary. No fallback to rejected-only distributions is allowed.
-Duplicate candidate rows with identical identity/reward are counted once;
-conflicting duplicates, missing reward, near-zero IQR, and missing key fields fail.
-Moving pairs to a new directory requires absolute image paths, as produced by
-the current filter. Relative paths are rejected rather than silently rewriting
-the original pair fields.
+脚本拒绝覆盖已有输出。运行另一组实验时，请选择新路径，并同步更新两份对照配置。
+程序要求 `splits: [train]` 和训练用 `selection_manifest`，检查候选的 LQ/GT/天气归属，
+并将完整候选身份集合与原指标 CSV 和偏好汇总核对。不允许回退为只使用非偏好候选的分布。
+身份和奖励均相同的重复候选只计一次；重复项冲突、奖励缺失、IQR 接近零或关键字段缺失都会报错。
+将偏好对移至新目录时，需要使用当前筛选器生成的绝对图片路径。
+相对路径会被拒绝，不会静默改写原偏好对字段。
 
-New outputs:
+新增输出：
 
 ```text
 dpo_candidates/
@@ -108,71 +101,59 @@ dpo_preferences_tail_risk/
   tail_risk_statistics.json
 ```
 
-Each new pair preserves all original fields and adds only `tail_threshold`,
-`tail_deficit`, `raw_pair_weight`, `pair_weight`, and `is_tail_pair`.
-Statistics include thresholds, IQR, unique candidate/pair counts, tail-pair
-fractions, raw-weight means, normalized weight distributions, input/output hashes,
-and configuration. The copied preference summary preserves model provenance.
+每条新偏好对保留全部原字段，仅增加 `tail_threshold`、`tail_deficit`、`raw_pair_weight`、
+`pair_weight` 和 `is_tail_pair`。统计包括阈值、IQR、去重候选/偏好对数量、尾部对比例、
+原始权重均值、归一化权重分布、输入输出哈希及配置。复制的偏好汇总保留模型来源信息。
 
 ```bash
 python -c "import json; p=json.load(open('/root/autodl-tmp/sd3/experiment/dpo_preferences_tail_risk/tail_risk_statistics.json')); print(json.dumps(p['per_weather'], indent=2))"
 ```
 
-No statistics for server data are claimed until these commands are run there.
+只有在服务器上实际执行这些命令后，才能获得对应服务器数据的统计结果。
 
-## Matched Training
+## 匹配对照训练
 
-Use fresh output directories; do not replace existing results. Do not rerun source
-selection, candidate generation, IQA, or preference filtering for this comparison.
+使用新输出目录，不替换已有结果。进行此对照时，不要重新选源图、生成候选、计算 IQA 或筛选偏好对。
 
 ```bash
-# Standard DPO, same pair file with all effective weights equal to 1
-accelerate launch scripts/train_dpo_sd3.py \
+# 标准 DPO：使用同一偏好对文件，全部有效权重设为 1
+CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 \
   --config config/dpo_sd3_tail_risk_standard.yaml
 
-# Tail-risk DPO
-accelerate launch scripts/train_dpo_sd3.py \
+# 尾部风险加权 DPO
+CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 \
   --config config/dpo_sd3_tail_risk.yaml
 ```
 
-The original command still runs with tail risk disabled:
+当前主流程的静态/动态配置保持尾部加权关闭，单卡启动命令见[DPO 主流程](DPO_SD3.md)。
 
-```bash
-accelerate launch scripts/train_dpo_sd3.py --config config/dpo_sd3.yaml
-```
+旧偏好对默认权重为 1。关闭模式会完全忽略已存储权重。
+启用模式但使用旧版偏好对时，会提示权重全部为 1，即没有重新加权。
+启用加权训练时，加载模型前会验证离线配置、文件哈希、数量及各天气平均权重。
+本实验要求显式关闭已有的 PSNR 差值加权，同时启用两种加权方式会报错。
 
-Old pairs default to weight 1. Disabled mode ignores stored weights entirely.
-Enabled mode with legacy pairs reports that weights are all 1 (no reweighting).
-Enabled weighted training validates the offline config, file hashes, counts,
-and per-weather mean weights before loading models. Existing PSNR-gap weighting
-must explicitly be false for this experiment; simultaneous enabling is an error.
-
-## Loss, Logs And Resume
+## 损失、日志与断点续训
 
 ```python
 per_pair_loss, stats = diffusion_dpo_loss(..., reduction="none")
 weighted_dpo_loss = (pair_weight * per_pair_loss).mean()
 loss = weighted_dpo_loss + sft_weight * chosen_mse.mean()
-# GT flow and GT x0 objectives retain their existing independent backward pass.
+# GT 流匹配和 GT x0 目标保持原有的独立反向传播。
 ```
 
-There is no division by the weight sum or manual accumulation-step division.
-Accelerate handles gradient accumulation as before. Weighting is not applied to
-SFT, GT flow, GT x0 or other auxiliary losses.
+不除以权重总和，也不手动除以梯度累积步数。梯度累积仍由 Accelerate 处理。
+权重不应用于 SFT、GT 流匹配、GT x0 或其他辅助损失。
 
-`training_metrics.jsonl` and configured trackers receive `dpo_loss_unweighted`,
-`dpo_loss_weighted`, `pair_weight_mean`, `pair_weight_min`, `pair_weight_max`, and
-`tail_pair_fraction`, plus existing margin/accuracy and auxiliary-loss statistics.
-Logs aggregate by sample count over all microbatches and processes in a window
-of `training.logging_steps` optimizer updates (default 10). Windows flush at
-checkpoints and the final update too, so batch size 1 does not normally log only
-one pair. These are observed-window weights, not batch-renormalized weights;
-their mean need not equal 1 in every window. Tail labels are retained for logging
-in both comparison runs; legacy pairs without labels report tail fraction 0.
+`training_metrics.jsonl` 和配置的跟踪器会记录 `dpo_loss_unweighted`、`dpo_loss_weighted`、
+`pair_weight_mean`、`pair_weight_min`、`pair_weight_max`、`tail_pair_fraction`，
+以及已有的间隔/准确率和辅助损失统计。日志以 `training.logging_steps` 次优化器更新为一个窗口
+（默认 10），按样本数汇总全部微批次和进程。保存检查点和最后一次更新时也会刷新窗口，
+因此批大小为 1 时，通常不会只记录一对样本。
+这些是观测窗口内的权重，不是在批次内重新归一化后的权重，每个窗口的均值不一定等于 1。
+两组对照训练均保留尾部标签供日志使用；没有标签的旧偏好对报告尾部比例为 0。
 
-For resume, set `training.resume_from_checkpoint: latest` in the relevant config.
-`dpo_resume.json` saves/checks effective tail configuration, candidate reward and
-statistics hashes, along with the existing preference-file hash, sampler/optimizer
-settings and RNG state. Switching weighting or changing the offline inputs cannot
-silently resume the same experiment. Old checkpoints remain resumable with tail
-weighting disabled, subject to the existing compatibility checks.
+断点续训时，在对应配置中设置 `training.resume_from_checkpoint: latest`。
+`dpo_resume.json` 保存并校验实际生效的尾部配置、候选奖励和统计文件哈希，
+以及已有的偏好文件哈希、采样器/优化器设置和随机数生成器（RNG）状态。
+切换加权方式或修改离线输入后，不能静默续训同一实验。
+旧检查点在关闭尾部加权且满足原兼容性检查时，仍支持断点续训。

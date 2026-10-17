@@ -166,6 +166,8 @@ training:
   checkpoints_total_limit: 2
   # Run a lightweight test-set validation after every checkpoint save.
   run_checkpoint_validation: true
+  # Optional step-0 SFT baseline through the same validation path on a fresh run.
+  validation_before_training: false
   validation_eval_config: "./config/eval_sd3.yaml"
   validation_num_samples_per_weather: 10
   # Save LQ/GT/pred triplets under checkpoint-N/validation/{ema|raw}/<weather>/.

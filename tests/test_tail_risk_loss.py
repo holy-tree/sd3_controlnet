@@ -32,6 +32,17 @@ class TailRiskLossTest(unittest.TestCase):
                     torch.testing.assert_close(actual_grad, expected_grad, rtol=0, atol=0)
                 self.assertFalse(stats["loss_dpo"].requires_grad)
 
+    def test_relative_preference_improvement_does_not_guarantee_absolute_denoising_improvement(self):
+        reference_chosen, reference_rejected = torch.tensor([0.1]), torch.tensor([0.2])
+        initial, _ = diffusion_dpo_loss(reference_chosen, reference_rejected,
+                                        reference_chosen, reference_rejected, beta=5000)
+        worse_chosen, worse_rejected = torch.tensor([0.3]), torch.tensor([0.5])
+        improved_preference, _ = diffusion_dpo_loss(worse_chosen, worse_rejected,
+                                                   reference_chosen, reference_rejected, beta=5000)
+        self.assertGreater(worse_chosen.item(), reference_chosen.item())
+        self.assertGreater(worse_rejected.item(), reference_rejected.item())
+        self.assertLess(improved_preference.item(), initial.item())
+
     def test_external_all_one_weights_preserve_legacy_value_and_gradients(self):
         inputs = self.inputs()
         chosen, rejected, ref_chosen, ref_rejected = inputs

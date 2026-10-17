@@ -78,19 +78,14 @@ pairwise output diversity, and exact 8-of-12 stability analysis.
 
 ## DPO Workflow
 
-The optional DPO pipeline uses `config/dpo_sd3.yaml`:
+The complete, maintained workflow is documented in [DPO 主流程](docs/DPO_SD3.md):
+M32 generation/simple export, IQA scoring, static/dynamic preferences, single-GPU training,
+validation logs, EMA, resume, and evaluation. After candidates are available, the required
+sequence is aesthetic scoring -> preference construction -> training -> evaluation.
 
-```bash
-python scripts/select_dpo_sources.py \
-  --dataset-root /root/autodl-tmp/datasets2 \
-  --output /root/autodl-tmp/datasets2/manifests/dpo_source_selection.json
-python scripts/generate_dpo_candidates.py --config config/dpo_sd3.yaml
-python scripts/filter_dpo_pairs.py --config config/dpo_sd3.yaml
-accelerate launch scripts/train_dpo_sd3.py --config config/dpo_sd3.yaml
-python scripts/evaluate_dpo.py --config config/dpo_sd3.yaml
-```
-
-See `docs/DPO_SD3.md` for provenance, filtering, EMA, resume, and validation details.
+The current M32 experiments use `config/dpo_sd3_reward_static_m32_partial.yaml` and
+`config/dpo_sd3_reward_dynamic_m32_partial.yaml`. `config/dpo_sd3.yaml` supplies generation
+and shared defaults and retains legacy reward semantics; it is not the static/dynamic training preset.
 
 ## Main Files
 
@@ -101,4 +96,7 @@ See `docs/DPO_SD3.md` for provenance, filtering, EMA, resume, and validation det
 - `utils/training_losses.py`: auxiliary and reconstruction loss helpers.
 - `config/train.yaml`: training configuration.
 - `config/eval_sd3.yaml`: evaluation configuration.
-- `config/dpo_sd3.yaml`: DPO workflow configuration.
+- `docs/DPO_SD3.md`: canonical DPO workflow and commands.
+- `config/dpo_sd3.yaml`: candidate generation and shared DPO defaults.
+- `config/dpo_sd3_reward_static_m32_partial.yaml`: current static M32 experiment.
+- `config/dpo_sd3_reward_dynamic_m32_partial.yaml`: current dynamic M32 experiment.

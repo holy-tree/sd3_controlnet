@@ -57,6 +57,36 @@ class FakePipeline:
 
 
 class ValidationLoggingIntegrationTest(unittest.TestCase):
+    def test_optional_initial_validation_runs_only_for_fresh_enabled_main_process(self):
+        tree = ast.parse((ROOT / "scripts/train_dpo_sd3.py").read_text(encoding="utf-8"))
+        main = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        condition = next(node for node in main.body if isinstance(node, ast.If) and any(
+            isinstance(value, ast.Constant) and value.value == "validation_before_training"
+            for value in ast.walk(node.test)
+        ))
+        program = compile(ast.Module(body=[condition], type_ignores=[]), "initial_validation", "exec")
+        with tempfile.TemporaryDirectory() as work:
+            for enabled, requested, resume, is_main, expected_calls, barriers in (
+                (True, True, None, True, 1, 2),
+                (True, False, None, True, 0, 0),
+                (False, True, None, True, 0, 0),
+                (True, True, "checkpoint-100", True, 0, 0),
+                (True, True, None, False, 0, 2),
+            ):
+                with self.subTest(enabled=enabled, requested=requested, resume=resume, main=is_main):
+                    callback, wait = Mock(), Mock()
+                    namespace = {
+                        "validation_enabled": enabled, "train_config": {"validation_before_training": requested},
+                        "resume_path": resume, "accelerator": SimpleNamespace(is_main_process=is_main,
+                                                                                wait_for_everyone=wait),
+                        "output_dir": Path(work), "validate_current_policy": callback,
+                    }
+                    exec(program, namespace)
+                    self.assertEqual(callback.call_count, expected_calls)
+                    self.assertEqual(wait.call_count, barriers)
+                    if expected_calls:
+                        callback.assert_called_once_with(Path(work) / "initial_validation", 0, "raw")
+
     def test_actual_validation_writes_all_six_without_saved_images(self):
         target = torch.full((1, 3, 16, 16), 0.5)
         iqa = Mock(return_value={"musiq": [55.0], "clipiqa": [0.6], "nima": [5.0]})
