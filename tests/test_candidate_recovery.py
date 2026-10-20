@@ -278,7 +278,7 @@ class CandidateRecoveryTest(unittest.TestCase):
         for mode in ("static", "dynamic"):
             path = self.base / f"{mode}.yaml"
             path.write_text(yaml.safe_dump({
-                "base_config": str(repo / "config" / f"dpo_sd3_reward_{mode}_m32_partial.yaml"),
+                "base_config": str(repo / "config" / f"dpo_sd3_reward_{mode}.yaml"),
                 "preference_filter": {
                     "source_metrics_path": str(aesthetic), "candidate_metrics_path": str(normalized),
                     "output_dir": str(self.base / f"pairs_{mode}"),

@@ -187,11 +187,22 @@ def reward_signature(reward_config: Mapping[str, object] | None) -> dict:
     }
 
 
+def psnr_pair_constraint_enabled(mode: str, selection: Mapping[str, object]) -> bool:
+    """The optional lower pair-PSNR gate is a static-only ablation."""
+    if mode != "static":
+        return True
+    enabled = selection.get("enable_psnr_pair_constraint", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("selection.enable_psnr_pair_constraint must be a boolean")
+    return enabled
+
+
 def preference_signature(reward_config: Mapping[str, object] | None,
                          selection: Mapping[str, object]) -> dict:
     """Effective pairing/fidelity contract; ignored legacy knobs do not affect new modes."""
     reward = reward_signature(reward_config)
     new_mode = reward["mode"] != "legacy"
+    psnr_pair_enabled = psnr_pair_constraint_enabled(reward["mode"], selection)
     fidelity = dict(selection.get("fidelity_constraints") or {})
     baseline = str(fidelity.get("baseline_mode", "none"))
     if baseline not in {"none", "group_median"}:
@@ -221,11 +232,11 @@ def preference_signature(reward_config: Mapping[str, object] | None,
         "random_seed": int(selection.get("random_seed", 42)),
         "shuffle": bool(selection.get("shuffle", True)),
         "max_pairs_per_weather": int(max_weather) if max_weather is not None and int(max_weather) > 0 else None,
-        "min_psnr_gap": finite(selection.get("min_psnr_gap", 0.0), "selection.min_psnr_gap"),
+        "min_psnr_gap": finite(selection.get("min_psnr_gap", 0.0), "selection.min_psnr_gap") if psnr_pair_enabled else None,
         "weather_specific_thresholds": {
             str(key): finite(value, "weather PSNR threshold") for key, value in
             sorted((selection.get("weather_specific_thresholds") or {}).items())
-        },
+        } if psnr_pair_enabled else {},
         "max_psnr_gap": finite(selection["max_psnr_gap"], "selection.max_psnr_gap")
                         if selection.get("max_psnr_gap") is not None else None,
         "fidelity_constraints": {
@@ -236,6 +247,10 @@ def preference_signature(reward_config: Mapping[str, object] | None,
                                           if fidelity.get("max_dists_pair_degradation") is not None else None,
         },
     }
+    # Keep enabled/default contracts byte-for-byte compatible with existing
+    # preferences. The disabled ablation gets an explicit, distinct signature.
+    if not psnr_pair_enabled:
+        signature["enable_psnr_pair_constraint"] = False
     if not new_mode:
         signature["min_reward_gap"] = float(selection.get("min_reward_gap", 0.0))
     return signature

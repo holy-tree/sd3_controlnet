@@ -180,7 +180,7 @@ training:
   # Raw reward metrics at each checkpoint; CPU avoids retaining extra GPU IQA weights.
   validation_compute_iqa: true
   validation_iqa_device: "cpu"
-  beta: 1.0
+  beta: 5000
   # ControlNet is larger and easier to destabilize; use a lower LR than RA.
   controlnet_learning_rate: 5.0e-8
   ra_fusion_learning_rate: 1.0e-7

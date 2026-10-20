@@ -22,12 +22,14 @@ per_candidate_metrics.csv
 
 | 配置 | 用途 |
 |---|---|
-| `config/dpo_sd3.yaml` | 候选生成及共用基础设置；未指定 `reward.mode`，保留旧版奖励语义 |
-| `config/dpo_sd3_reward_static_m32_partial.yaml` | 本批 M32 候选的静态偏好筛选、单卡训练与评估 |
-| `config/dpo_sd3_reward_dynamic_m32_partial.yaml` | 同一候选集的动态偏好筛选、单卡训练与评估 |
+| `config/dpo_sd3_reward_static.yaml` | 独立完整的 M32 静态配置，包含评分、筛选、训练与评估全部参数 |
+| `config/dpo_sd3_reward_dynamic.yaml` | 独立完整的 M32 动态配置，包含评分、筛选、训练与评估全部参数 |
+| `config/dpo_sd3.yaml` | 保留的历史配置，供旧实验使用；不是上述两份配置的父配置 |
 
-本流程训练和筛选使用后两份配置，不直接使用基础配置代替静态/动态配置。
-它们通过 `base_config` 继承设置，共用候选评分，分别保存偏好与训练结果。
+静态和动态各只保留一份配置，均不使用 `base_config`，也不相互继承。
+修改某种模式时，直接编辑该模式的文件；另一模式不会自动改变。
+两份配置共用 M32 候选评分，分别保存偏好、训练和评估结果。做公平对照时，请同步共同超参数。
+静态 PSNR 下界消融也直接修改 `dpo_sd3_reward_static.yaml`，不再使用额外叠加文件。
 
 ### 本批数据的固定路径
 
@@ -48,7 +50,7 @@ per_candidate_metrics.csv
 
 ### 当前生效的训练设置
 
-以下是两份 M32 配置合并继承后的值，以实际 YAML 为准：
+以下是两份独立 M32 配置直接定义的值，以实际 YAML 为准：
 
 | 参数 | 当前值 |
 |---|---:|
@@ -66,7 +68,7 @@ per_candidate_metrics.csv
 | `training.use_ema` / `training.validation_use_ema` | `true` / `true` |
 | `training.resume_from_checkpoint` | `null` |
 | `tail_risk.enabled` | `false` |
-| `preference_filter.pairs_per_group` | 9 |
+| `preference_filter.pairs_per_group` | 12 |
 
 模型初始路径位于 `model` 配置，当前为 `SD3ControlNet_RA_Joint/checkpoint-5000` 及其
 `ra_fusion`。它们必须与生成候选时记录的参考模型一致；候选来源会在训练前检查。
@@ -118,7 +120,7 @@ CSV 中的原始 LQ/GT 路径仍用于后续来源检查，请保持原数据集
 
 ```bash
 python -m scripts.rescore_dpo_candidates \
-  --config config/dpo_sd3_reward_static_m32_partial.yaml \
+  --config config/dpo_sd3_reward_static.yaml \
   --input_csv /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics.csv \
   --output_csv /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_aesthetic.csv \
   --device cuda:0 \
@@ -147,10 +149,10 @@ CLIP 后端缺少 `pkg_resources` 时，可运行 `python -m pip install "setupt
 
 ```bash
 python -m scripts.filter_dpo_pairs \
-  --config config/dpo_sd3_reward_static_m32_partial.yaml
+  --config config/dpo_sd3_reward_static.yaml
 
 python -m scripts.filter_dpo_pairs \
-  --config config/dpo_sd3_reward_dynamic_m32_partial.yaml
+  --config config/dpo_sd3_reward_dynamic.yaml
 ```
 
 首次筛选时，若 `per_candidate_metrics_fr_nr.csv` 不存在，会从已有美学 CSV 自动执行
@@ -184,10 +186,10 @@ LPIPS 标准化分数保留原始方向，只在 F 中取负一次。
 
 等于阈值时接受。动态模式逐对决定分支，不构建全组动态排序。
 每组 32 个候选有 `32*31/2=496` 个无序组合，应用奖励和保真约束后，
-用固定随机种子无放回均匀抽样，最多保留 `pairs_per_group=9` 对。
+用固定随机种子无放回均匀抽样，最多保留 `pairs_per_group=12` 对。
 此数量可配置，不是程序硬编码上限。
 
-两种模式使用相同保真约束，Q 分支也必须满足：
+默认情况下，两种模式使用相同保真约束，Q 分支也必须满足：
 
 ```text
 chosen_PSNR - rejected_PSNR >= -0.15 dB
@@ -195,6 +197,53 @@ chosen_DISTS - rejected_DISTS <= 0.01
 chosen_PSNR >= group_median_PSNR - 0.50 dB
 chosen_DISTS <= group_median_DISTS + 0.02
 ```
+
+#### 静态消融：是否启用 PSNR 对间差值下界
+
+直接修改唯一的静态配置 `config/dpo_sd3_reward_static.yaml` 中的布尔项：
+
+```yaml
+preference_filter:
+  enable_psnr_pair_constraint: true
+```
+
+- `true`（默认）：应用 `chosen_PSNR - rejected_PSNR >= min_psnr_gap`，天气单独设置优先；当前通常为 `-0.15 dB`。
+- `false`：只跳过上述下界，包括 `weather_specific_thresholds` 对该下界的覆盖。
+  PSNR 仍参与 F，组中位数 PSNR 下限、DISTS 约束，以及可选的 `max_psnr_gap` 都继续生效。
+- 此项只控制 `reward.mode: static`。动态及旧模式忽略该开关，保留原 PSNR 对间检查。
+  必须填写 YAML 布尔值 `true`/`false`，不能写字符串 `"false"` 或数字。
+
+进行消融时，不新建或叠加 YAML；在同一静态配置中修改以下字段，保留其他参数：
+
+```yaml
+preference_filter:
+  enable_psnr_pair_constraint: false
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static_m32_no_psnr_pair"
+training:
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_static_m32_no_psnr_pair/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Static_M32_NoPSNRPair"
+  resume_from_checkpoint: null
+evaluation:
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_static_m32_no_psnr_pair"
+```
+
+这样可以保留原启用约束的对照数据。候选评分和每组 12 对的设置仍共用原值。
+命令始终使用同一个静态文件名：
+
+```bash
+python -m scripts.filter_dpo_pairs \
+  --config config/dpo_sd3_reward_static.yaml
+
+CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 \
+  --config config/dpo_sd3_reward_static.yaml
+```
+
+无需重新生成候选或重跑 IQA，但切换开关后必须重新筛选偏好，不能直接复用另一开关状态的数据或检查点。
+默认启用/未配置时保持已有偏好契约兼容；关闭时会写入不同契约，并在训练及续训前检查。
+筛选终端会显示 `PSNR minimum=disabled`，偏好汇总和健康检查结果会报告
+`psnr_pair_constraint_enabled: false`。对照和消融应使用同版本代码及相同的其他参数，
+并记录最终保留组数、偏好对数及各天气分布，因为关闭门槛后合格候选对集合可能改变。
+每次训练输出中的 `dpo_config.yaml` 会记录当次配置；将开关改回 `true` 时，也需同步恢复或指定对应对照实验路径。
 
 新模式不使用旧版的覆盖优先选择、候选出现次数上限、`max_samples_per_pair` 或
 `min_reward_gap`。不要通过这些旧参数调整当前每组对数，使用 `pairs_per_group`。
@@ -212,14 +261,14 @@ chosen_DISTS <= group_median_DISTS + 0.02
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 \
-  --config config/dpo_sd3_reward_static_m32_partial.yaml
+  --config config/dpo_sd3_reward_static.yaml
 ```
 
 动态模式：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 \
-  --config config/dpo_sd3_reward_dynamic_m32_partial.yaml
+  --config config/dpo_sd3_reward_dynamic.yaml
 ```
 
 每次运行一个实验。训练脚本内部使用 Accelerate，直接通过 Python 启动即为普通单卡流程，
@@ -336,10 +385,10 @@ training:
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python -m scripts.evaluate_dpo \
-  --config config/dpo_sd3_reward_static_m32_partial.yaml
+  --config config/dpo_sd3_reward_static.yaml
 
 CUDA_VISIBLE_DEVICES=0 python -m scripts.evaluate_dpo \
-  --config config/dpo_sd3_reward_dynamic_m32_partial.yaml
+  --config config/dpo_sd3_reward_dynamic.yaml
 ```
 
 评估优先使用训练根目录的最终组件；尚未最终导出时，回退到最近的完整检查点，
@@ -401,7 +450,7 @@ python -m scripts.check_candidate_health \
 python -m scripts.check_candidate_health \
   --candidate-csv /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_fr_nr.csv \
   --pairs /root/autodl-tmp/sd3/experiment/dpo_preferences_static_m32_partial/preference_pairs.jsonl \
-  --config config/dpo_sd3_reward_static_m32_partial.yaml \
+  --config config/dpo_sd3_reward_static.yaml \
   --output-dir /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/health_static_pairs \
   --expected-candidates 32 \
   --check-files \
@@ -417,7 +466,7 @@ python -m scripts.check_candidate_health \
 重点查看：
 
 - `issue_counts`：缺编号、重复种子、路径/GT 错配、标准化不一致、偏好反向或保真门槛违规等。
-- `pairs.configured_pairs_per_group`：实际生效的每组对数。想要 12 对时应显示 12，而不是仍显示继承值 9。
+- `pairs.configured_pairs_per_group`：实际生效的每组对数。当前配置为 12；若预期 12 却报告 9，核对实际启动的配置和旧偏好契约。
 - `pairs.metric_deltas`：偏好候选相对非偏好候选的指标差及变差比例。
 - `pairs.musiq_up_but_clipiqa_and_nima_down`：MUSIQ 上升而另外两项无参指标下降的偏好对数量。
 - `pairs.max_candidate_appearances`：候选是否在偏好清单中反复出现。
@@ -439,23 +488,22 @@ python -m scripts.check_candidate_health \
 
 ### 从头生成新的 M32 候选集
 
-已有候选时不需要重复本节。基础配置当前每图 32 个独立种子、全部 CFG=1.0，
+已有候选时不需要重复本节。两份独立配置的候选设置均为每图 32 个独立种子、全部 CFG=1.0，
 基础种子 20240805、每种天气最多选 2000 张、30 步推理。
-`candidate_generation.expansion` 是独立的旧候选扩展配置，不由普通生成命令自动触发。
 
 源图优先读取 `selection_manifest`；设为 `null` 才扫描天气目录。
-新任务先核对所用清单、`sample_mode` 和每种天气数量限制。
-要复用全部已筛选样本，应保证清单与采样设置一致，不在工作进程中二次抽样。
+当前指向 `dpo_source_selection_2000.json`，按 `sample_mode: head` 使用预选清单。
+新任务先确认清单存在、每种天气数量限制与清单一致；不在工作进程中二次抽样。
 
 ```bash
 python -m scripts.generate_dpo_candidates \
-  --config config/dpo_sd3.yaml \
+  --config config/dpo_sd3_reward_static.yaml \
   --gpu_ids 0 1 2 \
   --output_dir /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_new_3gpu \
   --dry_run
 
 python -m scripts.generate_dpo_candidates \
-  --config config/dpo_sd3.yaml \
+  --config config/dpo_sd3_reward_static.yaml \
   --gpu_ids 0 1 2 \
   --output_dir /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_new_3gpu
 ```
@@ -477,7 +525,7 @@ python -m scripts.generate_dpo_candidates \
 
 ```bash
 python -m scripts.generate_dpo_candidates \
-  --config config/dpo_sd3.yaml \
+  --config config/dpo_sd3_reward_static.yaml \
   --output_dir /root/autodl-tmp/sd3/experiment/dpo_candidates_m32_new_3gpu \
   --merge_only
 ```

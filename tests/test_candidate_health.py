@@ -132,6 +132,23 @@ class CandidateHealthTest(unittest.TestCase):
         for code in ("zscore_mismatch", "pair_contract_mismatch", "too_many_pairs_per_group"):
             self.assertIn(code, result["issue_counts"])
 
+    def test_pair_audit_accepts_disabled_static_psnr_gate_without_disabling_other_checks(self):
+        self.rows[1].update(musiq=100, clipiqa=.99, nima=9)
+        stats, _ = normalize_candidate_scores(self.rows, verify_existing=False)
+        self.write_csv()
+        (self.data / "candidates_normalization.json").write_text(json.dumps({
+            "statistics": stats, "normalization": NORMALIZATION, "clip_z": 3.0,
+        }), encoding="utf-8")
+        self.config["preference_filter"]["enable_psnr_pair_constraint"] = False
+        self.config_path.write_text(yaml.safe_dump(self.config), encoding="utf-8")
+        pairs = self.make_pairs()
+        records = [json.loads(line) for line in pairs.read_text().splitlines()]
+        self.assertTrue(any(row["psnr_gap"] < -.15 for row in records))
+        result = self.run_check(pairs=pairs, config_path=self.config_path)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["pairs"]["psnr_pair_constraint_enabled"])
+        self.assertEqual(result["pairs"]["invalid_pairs"], 0)
+
     def test_sampled_corruption_and_changed_old_prefix_are_reported(self):
         baseline = self.data / "baseline.csv"
         baseline_rows = [dict(self.rows[0])]

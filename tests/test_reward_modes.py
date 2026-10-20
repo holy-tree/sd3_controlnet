@@ -337,6 +337,123 @@ class RewardModesTest(unittest.TestCase):
                     self.assertEqual(summary["branch_counts_after_filter"][branch], 0)
                     self.assertEqual(summary["branch_counts_final"][branch], 0)
 
+    def test_static_psnr_pair_ablation_bypasses_both_default_and_weather_lower_bounds(self):
+        rows = [candidate(0, q=1, psnr=29.7, dists=0.105), candidate(1)]
+        selection = {"min_psnr_gap": -10, "weather_specific_thresholds": {"rain": -0.15},
+                     "fidelity_constraints": {"max_dists_pair_degradation": 0.01,
+                                              "baseline_mode": "group_median",
+                                              "baseline_psnr_tolerance": 0.5,
+                                              "baseline_dists_tolerance": 0.02}}
+        for enabled in (None, True, False):
+            options = dict(selection)
+            if enabled is not None:
+                options["enable_psnr_pair_constraint"] = enabled
+            summary, pairs = self.build(rows, selection=options)
+            self.assertEqual(len(pairs), 1 if enabled is False else 0)
+            self.assertEqual(summary["psnr_pair_constraint_enabled"], enabled is not False)
+            if enabled is False:
+                self.assertLess(pairs[0]["psnr_gap"], -0.15)
+                self.assertIn("PSNR minimum=disabled", self.last_log)
+                self.assertIsNone(summary["reward_contract"]["min_psnr_gap"])
+                self.assertEqual(summary["reward_contract"]["weather_specific_thresholds"], {})
+            else:
+                self.assertEqual(summary["rejected_by_reason"], {"rain:psnr_gap": 1})
+
+    def test_static_ablation_keeps_other_fidelity_and_reward_gates(self):
+        cases = (
+            ({"psnr": 31}, {"max_psnr_gap": 0.5}, "max_psnr_gap"),
+            ({"dists": 0.3}, {"fidelity_constraints": {"max_dists_pair_degradation": 0.05}}, "dists_gap"),
+            ({"psnr": 29}, {"fidelity_constraints": {"baseline_mode": "group_median",
+              "baseline_psnr_tolerance": 0.125, "baseline_dists_tolerance": 1}}, "baseline_floor"),
+            ({"dists": 0.3}, {"fidelity_constraints": {"baseline_mode": "group_median",
+              "baseline_psnr_tolerance": 1, "baseline_dists_tolerance": 0.01}}, "baseline_floor"),
+        )
+        for chosen, options, reason in cases:
+            with self.subTest(reason=reason):
+                summary, pairs = self.build([candidate(0, q=1, **chosen), candidate(1)], selection={
+                    **options, "enable_psnr_pair_constraint": False,
+                })
+                self.assertFalse(pairs)
+                self.assertEqual(summary["rejected_by_reason"], {f"rain:{reason}": 1})
+        summary, pairs = self.build([candidate(0, q=0.01), candidate(1)], selection={
+            "enable_psnr_pair_constraint": False,
+        })
+        self.assertFalse(pairs)
+        self.assertEqual(summary["rejected_by_reason"], {"rain:static_gap": 1})
+
+    def test_static_ablation_does_not_change_dynamic_or_legacy_behavior(self):
+        rows = [candidate(0, q=1, f=1, psnr=29), candidate(1)]
+        summary, pairs = self.build(rows, {"mode": "dynamic"}, {
+            "enable_psnr_pair_constraint": False, "min_psnr_gap": -0.15,
+        })
+        self.assertFalse(pairs)
+        self.assertTrue(summary["psnr_pair_constraint_enabled"])
+        self.assertEqual(summary["rejected_by_reason"], {"rain:psnr_gap": 1})
+        with self.assertRaisesRegex(ValueError, "No preference pairs"):
+            self.build(rows, {"weights": {"musiq_z": 1}}, {
+                "enable_psnr_pair_constraint": False, "min_psnr_gap": -0.15,
+            })
+
+    def test_static_psnr_ablation_signature_is_distinct_and_default_compatible(self):
+        default = preference_signature({"mode": "static"}, {})
+        self.assertNotIn("enable_psnr_pair_constraint", default)
+        self.assertEqual(default, preference_signature({"mode": "static"}, {
+            "enable_psnr_pair_constraint": True,
+        }))
+        disabled = preference_signature({"mode": "static"}, {"enable_psnr_pair_constraint": False})
+        self.assertNotEqual(default, disabled)
+        self.assertIs(disabled["enable_psnr_pair_constraint"], False)
+        self.assertEqual(disabled, preference_signature({"mode": "static"}, {
+            "enable_psnr_pair_constraint": False, "min_psnr_gap": -10,
+            "weather_specific_thresholds": {"rain": 2},
+        }))
+        for mode in ({"mode": "dynamic"}, {}):
+            self.assertEqual(preference_signature(mode, {}), preference_signature(mode, {
+                "enable_psnr_pair_constraint": False,
+            }))
+        for invalid in ("false", "true", 0, 1, None):
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "must be a boolean"):
+                preference_signature({"mode": "static"}, {"enable_psnr_pair_constraint": invalid})
+
+    def test_static_dynamic_configs_are_complete_standalone_m32_experiments(self):
+        import yaml
+        from dpo.tail_risk import load_config
+
+        root = Path(__file__).resolve().parents[1] / "config"
+        configs = {}
+        for mode in ("static", "dynamic"):
+            path = root / f"dpo_sd3_reward_{mode}.yaml"
+            raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+            self.assertNotIn("base_config", raw)
+            config = configs[mode] = load_config(path)
+            self.assertEqual(config, raw)
+            self.assertEqual(set(config), {"weather_prompts", "candidate_generation", "reward", "model",
+                                           "preference_filter", "tail_risk", "training", "evaluation"})
+            self.assertEqual(config["reward"]["mode"], mode)
+            self.assertEqual(config["candidate_generation"]["num_candidates_per_image"], 32)
+            self.assertEqual(config["candidate_generation"]["candidate_guidance_scales"], [1.0] * 32)
+            self.assertEqual(config["preference_filter"]["pairs_per_group"], 12)
+            self.assertIn("dpo_candidates_m32_complete_groups", config["preference_filter"]["candidate_metrics_path"])
+            self.assertEqual(Path(config["training"]["preference_manifest"]).parent,
+                             Path(config["preference_filter"]["output_dir"]))
+        static, dynamic = configs["static"], configs["dynamic"]
+        self.assertTrue(static["preference_filter"]["enable_psnr_pair_constraint"])
+        self.assertNotIn("enable_psnr_pair_constraint", dynamic["preference_filter"])
+        for section in ("weather_prompts", "model", "candidate_generation", "tail_risk"):
+            self.assertEqual(static[section], dynamic[section])
+        self.assertEqual({k: v for k, v in static["reward"].items() if k != "mode"},
+                         {k: v for k, v in dynamic["reward"].items() if k != "mode"})
+        self.assertEqual({k: v for k, v in static["preference_filter"].items()
+                          if k not in {"output_dir", "enable_psnr_pair_constraint"}},
+                         {k: v for k, v in dynamic["preference_filter"].items() if k != "output_dir"})
+        for key, value in static["training"].items():
+            if key not in {"preference_manifest", "output_dir"}:
+                self.assertEqual(value, dynamic["training"][key])
+        for section in ("preference_filter", "training", "evaluation"):
+            self.assertNotEqual(static[section]["output_dir"], dynamic[section]["output_dir"])
+        self.assertEqual(list(root.glob("dpo_sd3_reward_static*.yaml")), [root / "dpo_sd3_reward_static.yaml"])
+        self.assertEqual(list(root.glob("dpo_sd3_reward_dynamic*.yaml")), [root / "dpo_sd3_reward_dynamic.yaml"])
+
     def test_fidelity_metric_nonfinite_candidate_skips(self):
         for overrides, selection in (({"psnr": "nan"}, {}), ({"dists": ""}, {
             "fidelity_constraints": {"max_dists_pair_degradation": 0.1},

@@ -13,7 +13,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .rewards import ModeReward, build_reward, preference_signature
+from .rewards import ModeReward, build_reward, preference_signature, psnr_pair_constraint_enabled
 
 
 PAIR_FIELDS = (
@@ -119,6 +119,7 @@ def build_preference_pairs(
     reward = build_reward(reward_config)
     new_mode = isinstance(reward, ModeReward)
     mode = reward.mode if new_mode else "legacy"
+    psnr_pair_enabled = psnr_pair_constraint_enabled(mode, selection)
     contract = preference_signature(reward_config, selection) if new_mode else None
     input_sha256 = _sha256(csv_path)
     if new_mode:
@@ -287,8 +288,8 @@ def build_preference_pairs(
     branches_after_mode = Counter()
     branches_after = Counter()
     rng = random.Random(int(selection.get("random_seed", 42)))
-    print(f"[pairs] reward_mode={mode}; PSNR minimum={selection.get('min_psnr_gap', 0.0)}, "
-          f"weather overrides={selection.get('weather_specific_thresholds') or {}}, "
+    print(f"[pairs] reward_mode={mode}; PSNR minimum={selection.get('min_psnr_gap', 0.0) if psnr_pair_enabled else 'disabled'}, "
+          f"weather overrides={(selection.get('weather_specific_thresholds') or {}) if psnr_pair_enabled else {}}, "
           f"maximum={max_gap}; DISTS degradation={max_dists_pair_degradation}; "
           f"baseline={baseline_mode} (PSNR tolerance={baseline_psnr_tolerance}, "
           f"DISTS tolerance={baseline_dists_tolerance})")
@@ -333,7 +334,7 @@ def build_preference_pairs(
             if not new_mode and reward_gap <= min_reward_gap:
                 rejected_by_reason[f"{weather}:reward_gap"] += 1
                 continue
-            if psnr_gap < _threshold(weather, selection):
+            if psnr_pair_enabled and psnr_gap < _threshold(weather, selection):
                 rejected_by_reason[f"{weather}:psnr_gap"] += 1
                 continue
             if max_gap is not None and psnr_gap > max_gap:
@@ -544,6 +545,7 @@ def build_preference_pairs(
         branch_names = ("static", "nr", "fr")
         final_branches = Counter(pair["reward_branch"] for pair in pairs)
         summary.update({
+            "psnr_pair_constraint_enabled": psnr_pair_enabled,
             "reward_contract": contract, "reward_mode": mode,
             "manifest_sha256": _sha256(manifest_path),
             "candidate_metrics_sha256": input_sha256,

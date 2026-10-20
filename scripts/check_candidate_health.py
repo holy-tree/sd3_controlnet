@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
 
-from dpo.rewards import build_reward, preference_signature
+from dpo.rewards import build_reward, preference_signature, psnr_pair_constraint_enabled
 from scripts.summarize_dpo_candidates import _finite, _table, stable_candidate_seed
 
 
@@ -49,6 +49,7 @@ def check_pairs(db, path, config, groups, issue):
     if reward is not None and not hasattr(reward, "compare"):
         raise ValueError("Pair audit expects an explicit static/dynamic reward config")
     selection = config.get("preference_filter", {}) if config else {}
+    psnr_pair_enabled = psnr_pair_constraint_enabled(reward.mode, selection) if reward else None
     summary_path = path.parent / "preference_summary.json"
     if config:
         saved = read_json(summary_path) if summary_path.is_file() else {}
@@ -102,7 +103,7 @@ def check_pairs(db, path, config, groups, issue):
                     psnr_gap, dists_gap = chosen["psnr"] - rejected["psnr"], chosen["dists"] - rejected["dists"]
                     minimum = (selection.get("weather_specific_thresholds") or {}).get(
                         pair["weather"], selection.get("min_psnr_gap", 0))
-                    if psnr_gap < float(minimum) - 1e-8:
+                    if psnr_pair_enabled and psnr_gap < float(minimum) - 1e-8:
                         raise ValueError("PSNR pair degradation exceeds configured limit")
                     maximum = selection.get("max_psnr_gap")
                     if maximum is not None and psnr_gap > float(maximum) + 1e-8:
@@ -145,6 +146,7 @@ def check_pairs(db, path, config, groups, issue):
     for name in ("pairs", "valid_pairs", "invalid_pairs", "musiq_up_but_clipiqa_and_nima_down"):
         counts.setdefault(name, 0)
     return {**counts, "configured_pairs_per_group": limit, "groups_with_pairs": len(per_group),
+            "psnr_pair_constraint_enabled": psnr_pair_enabled,
             "pairs_per_weather": dict(per_weather), "pair_count_distribution": dict(Counter(per_group.values())),
             "max_candidate_appearances": db.execute("SELECT max(uses) FROM candidates").fetchone()[0],
             "metric_deltas": deltas}

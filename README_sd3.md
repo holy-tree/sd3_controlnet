@@ -83,9 +83,11 @@ M32 generation/simple export, IQA scoring, static/dynamic preferences, single-GP
 validation logs, EMA, resume, and evaluation. After candidates are available, the required
 sequence is aesthetic scoring -> preference construction -> training -> evaluation.
 
-The current M32 experiments use `config/dpo_sd3_reward_static_m32_partial.yaml` and
-`config/dpo_sd3_reward_dynamic_m32_partial.yaml`. `config/dpo_sd3.yaml` supplies generation
-and shared defaults and retains legacy reward semantics; it is not the static/dynamic training preset.
+The current M32 experiments use the complete, standalone `config/dpo_sd3_reward_static.yaml`
+and `config/dpo_sd3_reward_dynamic.yaml`. Neither inherits another DPO config.
+Both use M32 data paths and up to 12 preference pairs per source. Toggle the static PSNR-pair
+ablation directly in the static file. `config/dpo_sd3.yaml` remains a legacy configuration,
+not a parent or replacement for these experiment configs.
 
 ## Main Files
 
@@ -97,6 +99,6 @@ and shared defaults and retains legacy reward semantics; it is not the static/dy
 - `config/train.yaml`: training configuration.
 - `config/eval_sd3.yaml`: evaluation configuration.
 - `docs/DPO_SD3.md`: canonical DPO workflow and commands.
-- `config/dpo_sd3.yaml`: candidate generation and shared DPO defaults.
-- `config/dpo_sd3_reward_static_m32_partial.yaml`: current static M32 experiment.
-- `config/dpo_sd3_reward_dynamic_m32_partial.yaml`: current dynamic M32 experiment.
+- `config/dpo_sd3.yaml`: legacy DPO/generation configuration.
+- `config/dpo_sd3_reward_static.yaml`: complete standalone static M32 experiment.
+- `config/dpo_sd3_reward_dynamic.yaml`: complete standalone dynamic M32 experiment.

@@ -110,6 +110,22 @@ class PreferenceProvenanceTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reward_contract"):
             validate_preference_reward(changed)
 
+    def test_static_psnr_switch_requires_new_pairs_and_rejects_old_resume_contract(self):
+        original = validate_preference_reward(self.train)
+        self.train["preference_filter"]["enable_psnr_pair_constraint"] = True
+        self.assertEqual(validate_preference_reward(self.train), original)
+        self.train["preference_filter"]["enable_psnr_pair_constraint"] = False
+        with self.assertRaisesRegex(ValueError, "reward_contract"):
+            validate_preference_reward(self.train)
+        self.build()
+        disabled = validate_preference_reward(self.train)
+        self.assertFalse(disabled["preference_signature"]["enable_psnr_pair_constraint"])
+        with self.assertRaisesRegex(ValueError, "provenance mismatch"):
+            validate_preference_resume({"version": 5, "reward_provenance": original}, self.train)
+        self.train["preference_filter"]["enable_psnr_pair_constraint"] = True
+        with self.assertRaisesRegex(ValueError, "reward_contract"):
+            validate_preference_reward(self.train)
+
     def test_new_mode_requires_signature_and_cannot_be_legacy(self):
         for summary in ({}, {key: value for key, value in self.summary.items() if key != "reward_contract"}):
             self.save_summary(summary)

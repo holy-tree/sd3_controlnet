@@ -1,16 +1,161 @@
-# Same scores, normalization and fidelity constraints as static; pairwise Q/F switch.
-base_config: "dpo_sd3_reward_static.yaml"
+# M32 动态 DPO 独立完整配置：评分、筛选、训练与评估均使用本文件。
+# 所有参数直接定义，不继承 static 或基础 DPO 配置。
+# python -m scripts.filter_dpo_pairs --config config/dpo_sd3_reward_dynamic.yaml
+# CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 --config config/dpo_sd3_reward_dynamic.yaml
 
+weather_prompts:
+  rain: "a clean, sharp, rain-free natural photograph with fine details"
+  snow: "a clean, sharp, snow-free natural photograph with fine details"
+  haze: "a clear, sharp, haze-free natural photograph with natural colors and fine details"
+
+# ==================== 1. M32 候选 ====================
+candidate_generation:
+  eval_config: "./config/eval_sd3.yaml"
+  dataset_rain: "/root/autodl-tmp/datasets2/train/rain"
+  dataset_snow: "/root/autodl-tmp/datasets2/train/snow"
+  dataset_haze: "/root/autodl-tmp/datasets2/train/haze"
+  selection_manifest: "/root/autodl-tmp/datasets2/manifests/dpo_source_selection_2000.json"
+  splits: ["train"]
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups"
+  num_candidates_per_image: 32
+  candidate_guidance_scales: [
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+  ]
+  seed: 20240805
+  # 清单已按每种天气 2000 张预选，按顺序使用，不再次随机抽样。
+  sample_mode: "head"
+  rain_max_samples: 2000
+  snow_max_samples: 2000
+  haze_max_samples: 2000
+  weather_psnr_gap_thresholds:
+    rain: 0.0
+    snow: 0.0
+    haze: 0.0
+  max_saved_groups_per_weather: 2000
+  num_inference_steps: 30
+  strength: 1.0
+  controlnet_conditioning_scale: 1.0
+  use_ra_fusion: true
+  ra_fusion_scale: 0.1
+  use_prompt: true
+
+# ==================== 2. 动态奖励 ====================
 reward:
   mode: "dynamic"
+  fr_weights:
+    psnr: 1.0
+    ssim: 1.0
+    lpips: 1.0
+  tau_q: 0.05
+  margin_static: 0.05
+  margin_fr: 0.05
 
+# ==================== 3. 偏好筛选 ====================
 preference_filter:
-  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic"
+  source_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_aesthetic.csv"
+  candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_fr_nr.csv"
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_partial"
+  pairs_per_group: 12
+  # 动态模式始终应用 PSNR 对间下界，不使用 static 专用消融开关。
+  min_psnr_gap: -0.15
+  weather_specific_thresholds:
+    rain: -0.15
+    snow: -0.15
+    haze: -0.15
+  max_psnr_gap: null
+  fidelity_constraints:
+    max_dists_pair_degradation: 0.01
+    baseline_mode: "group_median"
+    baseline_psnr_tolerance: 0.50
+    baseline_dists_tolerance: 0.02
+  max_pairs_per_weather: null
+  shuffle: true
+  random_seed: 42
 
+# ==================== 4. 模型与尾部加权 ====================
+model:
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-3-medium-diffusers"
+  controlnet_model_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/checkpoint-5000"
+  ra_fusion_path: "/root/autodl-tmp/sd3/experiment/SD3ControlNet_RA_Joint/checkpoint-5000/ra_fusion"
+  ra_fusion_scale: 0.1
+  controlnet_conditioning_scale: 1.0
+  revision: null
+  variant: null
+
+tail_risk:
+  enabled: false
+  candidate_reward_file: null
+  tail_quantile: 0.20
+  lambda_tail: 1.0
+  tail_deficit_max: 2.0
+  eps: 1.0e-8
+
+# ==================== 5. 单卡训练与验证 ====================
 training:
-  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic/preference_pairs.jsonl"
-  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic"
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_partial/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_M32_Partial"
   resume_from_checkpoint: null
+  train_controlnet: true
+  train_ra_fusion: true
+  use_ema: true
+  ema_decay: 0.9999
+  ema_use_warmup: true
+  ema_inv_gamma: 1.0
+  ema_power: 0.75
+  ema_update_after_step: 0
+  ema_update_interval: 1
+  ema_device: "cpu"
+  validation_use_ema: true
+  resolution: 512
+  train_batch_size: 8
+  gradient_accumulation_steps: 1
+  dataloader_num_workers: 4
+  max_train_steps: 10000
+  checkpointing_steps: 1000
+  logging_steps: 10
+  checkpoints_total_limit: 2
+  run_checkpoint_validation: true
+  validation_before_training: false
+  validation_eval_config: "./config/eval_sd3.yaml"
+  validation_num_samples_per_weather: 10
+  validation_save_images: true
+  validation_num_inference_steps: 30
+  validation_guidance_scale: 1.0
+  validation_strength: 1.0
+  validation_seed: 42
+  validation_lpips_net: "alex"
+  validation_compute_iqa: true
+  validation_iqa_device: "cpu"
+  beta: 5000.0
+  controlnet_learning_rate: 5.0e-8
+  ra_fusion_learning_rate: 1.0e-7
+  max_grad_norm: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.01
+  adam_epsilon: 1.0e-8
+  lr_scheduler: "constant_with_warmup"
+  lr_warmup_steps: 50
+  mixed_precision: "bf16"
+  upcast_vae: true
+  gradient_checkpointing: true
+  max_sequence_length: 77
+  sft_weight: 0.0
+  gt_flow_weight: 0.1
+  gt_x0_l1_weight: 0.01
+  weight_by_psnr_gap: false
+  require_candidate_provenance: true
+  report_to: "tensorboard"
+  logging_dir: null
+  seed: 42
 
+# ==================== 6. 评估 ====================
 evaluation:
-  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic"
+  eval_config: "./config/eval_sd3.yaml"
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic_m32_partial"
+  controlnet_model_path: null
+  ra_fusion_path: null
+  enable_fid: true

@@ -336,10 +336,15 @@ class CandidateCoordinatorTest(unittest.TestCase):
         self.assertTrue(source_lock.is_file())
         self.assertFalse((self.base / ".snapshot.generation.lock").exists())
 
-    def test_partial_experiment_configs_share_scores_not_old_data_paths(self):
+    def test_standalone_experiment_configs_share_m32_scores_not_output_paths(self):
         root = Path(__file__).resolve().parents[1]
-        static = cli.load_config(root / "config" / "dpo_sd3_reward_static_m32_partial.yaml")
-        dynamic = cli.load_config(root / "config" / "dpo_sd3_reward_dynamic_m32_partial.yaml")
+        static = cli.load_config(root / "config" / "dpo_sd3_reward_static.yaml")
+        dynamic = cli.load_config(root / "config" / "dpo_sd3_reward_dynamic.yaml")
+        for mode, config in (("static", static), ("dynamic", dynamic)):
+            raw = yaml.safe_load((root / "config" / f"dpo_sd3_reward_{mode}.yaml").read_text(encoding="utf-8"))
+            self.assertNotIn("base_config", raw)
+            self.assertEqual(config, raw)
+            self.assertEqual(config["preference_filter"]["pairs_per_group"], 12)
         self.assertEqual(static["preference_filter"]["candidate_metrics_path"], dynamic["preference_filter"]["candidate_metrics_path"])
         self.assertIn("dpo_candidates_m32_complete_groups", static["preference_filter"]["candidate_metrics_path"])
         self.assertNotEqual(static["training"]["preference_manifest"], dynamic["training"]["preference_manifest"])
