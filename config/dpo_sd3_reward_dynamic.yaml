@@ -118,7 +118,7 @@ training:
   train_batch_size: 8
   gradient_accumulation_steps: 1
   dataloader_num_workers: 4
-  max_train_steps: 10000
+  max_train_steps: 20000
   checkpointing_steps: 1000
   logging_steps: 10
   checkpoints_total_limit: 2
@@ -135,8 +135,8 @@ training:
   validation_compute_iqa: true
   validation_iqa_device: "cpu"
   beta: 5000.0
-  controlnet_learning_rate: 5.0e-8
-  ra_fusion_learning_rate: 1.0e-7
+  controlnet_learning_rate: 1.0e-6
+  ra_fusion_learning_rate: 2.0e-6
   max_grad_norm: 1.0
   adam_beta1: 0.9
   adam_beta2: 0.999
