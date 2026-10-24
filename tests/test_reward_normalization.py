@@ -22,7 +22,8 @@ from scripts import rescore_dpo_candidates as cli
 
 
 def candidates():
-    return [dict(weather=weather, candidate_path=f"missing-{weather}-{index}.png",
+    return [dict(weather=weather, subdataset=weather, global_index=0, noise_index=index,
+                 candidate_path=f"missing-{weather}-{index}.png",
                  **{name: value + offset for name in SIX_METRICS})
             for weather, offset in (("rain", 0), ("snow", 100))
             for index, value in enumerate((1, 2, 3, 4))]
@@ -103,7 +104,7 @@ class RewardNormalizationTest(unittest.TestCase):
                          "reward_q", "reward_f", "reward_static"):
                 self.assertEqual(a[name], b[name])
         config = self.root / "weighted.yaml"
-        config.write_text("reward:\n  mode: dynamic\n  tau_q: 999\n  fr_weights:\n"
+        config.write_text("reward:\n  mode: dynamic\n  lambda_fidelity: 999\n  fr_weights:\n"
                           "    psnr: 0\n    ssim: 0\n    lpips: 1\n", encoding="utf-8")
         weighted_rows, weighted = self.run_cli("weighted.csv", extra=("--config", str(config)))
         self.assertEqual(static["statistics"], weighted["statistics"])
@@ -307,23 +308,28 @@ class RewardNormalizationTest(unittest.TestCase):
         self.assertFalse(sidecar.exists())
         self.assertEqual(self.input.read_bytes(), source)
 
-    def test_historical_reward_is_relabelled_never_dynamic_global_reward(self):
+    def test_historical_reward_is_preserved_and_group_dynamic_scores_are_added(self):
         rows = [dict(row, reward=999) for row in candidates()]
         self.write_csv(rows)
         with self.assertWarnsRegex(UserWarning, "historical reward"):
             output, _ = self.run_cli(mode="dynamic")
         self.assertTrue(all(row["original_reward"] == "999" for row in output))
         self.assertTrue(all("reward" not in row for row in output))
+        self.assertTrue(all(row["reward_dynamic"] != "" and row["baseline_f_candidate_count"] == "4" for row in output))
+        for row in output:
+            self.assertAlmostEqual(float(row["base_fidelity_contribution"]), .5 * float(row["reward_f"]))
+            self.assertAlmostEqual(float(row["reward_dynamic"]), float(row["reward_q"]) +
+                                   float(row["base_fidelity_contribution"]) - float(row["fidelity_penalty"]))
         self.assertIn("reward", self.read_csv(self.input)[0])
 
     def test_inherited_config_and_legacy_without_mode(self):
         self.write_csv(candidates())
-        (self.root / "base.yaml").write_text("reward:\n  mode: static\n  tau_q: 0.7\n", encoding="utf-8")
+        (self.root / "base.yaml").write_text("reward:\n  mode: static\n  lambda_fidelity: 0.7\n", encoding="utf-8")
         derived = self.root / "derived.yaml"
         derived.write_text("base_config: base.yaml\nreward:\n  mode: dynamic\n", encoding="utf-8")
         rows, metadata = self.run_cli(extra=("--config", str(derived)))
         self.assertEqual(rows[0]["reward_mode"], "dynamic")
-        self.assertEqual(metadata["reward_signature"]["tau_q"], 0.7)
+        self.assertEqual(metadata["reward_signature"]["lambda_fidelity"], 0.7)
         argv = ["rescore", "--input_csv", str(self.input), "--output_csv", str(self.root / "legacy.csv")]
 
         def score(rows, *_):

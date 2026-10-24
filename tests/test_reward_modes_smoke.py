@@ -60,7 +60,7 @@ class RewardModesSmokeTest(unittest.TestCase):
                 config_path = root / f"{mode}.yaml"
                 config_path.write_text(yaml.safe_dump({
                     "base_config": str(ROOT / "config" / f"dpo_sd3_reward_{mode}.yaml"),
-                    "reward": {"tau_q": 0.5, "margin_static": 0.01, "margin_fr": 0.01},
+                    "reward": ({"margin_static": 0.01} if mode == "static" else {"margin_dynamic": 0.01}),
                     "preference_filter": {
                         "candidate_metrics_path": str(normalized), "output_dir": str(root / mode),
                         "source_metrics_path": str(original),
@@ -96,7 +96,7 @@ class RewardModesSmokeTest(unittest.TestCase):
                 validate_preference_reward(train)
             self.assertEqual(summaries["static"]["normalization_signature"],
                              summaries["dynamic"]["normalization_signature"])
-            self.assertEqual(summaries["dynamic"]["branch_counts_final"], {"static": 0, "nr": 2, "fr": 1})
+            self.assertEqual(summaries["dynamic"]["branch_counts_final"], {"dynamic": 3})
             mismatched = {
                 "reward": configs["static"]["reward"],
                 "preference_filter": configs["static"]["preference_filter"],

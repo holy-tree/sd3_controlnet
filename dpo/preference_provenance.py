@@ -7,15 +7,15 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from .rewards import build_reward, preference_signature, reward_signature
+from .rewards import build_reward, preference_signature, reward_signature, validate_dynamic_pair_record
 
 
 def require_scalar_reward(reward_config: Mapping | None) -> None:
     if (reward_config or {}).get("mode") == "dynamic":
         raise ValueError(
-            "Dynamic reward has no single global candidate scalar reward (pairs can use Q or F); "
-            "candidate reward export and tail-risk weighting/training are unsupported. "
-            "Ordinary DPO with dynamic preferences is supported with tail_risk.enabled=false."
+            "Dynamic reward requires a source-group median F baseline; this row-local scalar export "
+            "and tail-risk path does not provide that context. Use the dynamic pair builder's "
+            "dynamic_candidate_rewards.csv; ordinary dynamic DPO uses tail_risk.enabled=false."
         )
 
 
@@ -91,6 +91,13 @@ def validate_preference_reward(train_config: Mapping) -> dict:
             raise ValueError("Preference reward_contract/mode mismatch or missing new-mode signature")
         if any(row.get("reward_mode") != mode for row in records):
             raise ValueError("Preference manifest reward mode mismatch")
+        if mode == "dynamic":
+            reward = build_reward(reward_config)
+            for index, row in enumerate(records, 1):
+                try:
+                    validate_dynamic_pair_record(row, reward)
+                except ValueError as error:
+                    raise ValueError(f"Dynamic preference record {index}: {error}") from error
         if "selection" not in saved or preference_signature(reward_config, saved["selection"]) != contract:
             raise ValueError("Preference summary selection contract mismatch")
         if "reward_weights" in saved and saved["reward_weights"] != dict(build_reward(reward_config).weights):

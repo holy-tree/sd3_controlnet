@@ -37,7 +37,7 @@ DIRECTIONS = {
     "psnr": "up", "ssim": "up", "lpips": "down", "dists": "down",
     "musiq": "up", "clipiqa": "up", "nima": "up", "topiq_nr": "up",
     "topiq_iaa": "up", "topiq_fr": "up", "niqe": "down",
-    "reward_static": "up", "reward_q": "up", "reward_f": "up",
+    "reward_static": "up", "reward_dynamic": "up", "reward_q": "up", "reward_f": "up",
 }
 ISSUE_FIELDS = ["severity", "code", "group_id", "row_number", "path", "detail"]
 GROUP_FIELDS = [

@@ -88,6 +88,9 @@ and `config/dpo_sd3_reward_dynamic.yaml`. Neither inherits another DPO config.
 Both use M32 data paths and up to 12 preference pairs per source. Toggle the static PSNR-pair
 ablation directly in the static file. `config/dpo_sd3.yaml` remains a legacy configuration,
 not a parent or replacement for these experiment configs.
+Dynamic preferences use `Q + eta_fidelity * F - lambda_fidelity * max(0, median_group_F - F)^2`.
+Pairs with clear Q/F dominance bypass the reward margin but still pass all hard fidelity gates;
+other pairs use the reward tradeoff rule. Rebuild v3 dynamic preferences before a fresh run.
 
 ## Main Files
 

@@ -88,14 +88,16 @@ class OfflineIqaLogicTest(unittest.TestCase):
         apply_reward_normalization([row], normalization)
         self.assertIsNone(row["reward"])
 
-    def test_dynamic_analysis_does_not_invent_a_scalar_best(self):
+    def test_dynamic_analysis_requires_historical_group_context(self):
         from dpo.offline_iqa_analysis import load_normalization
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "normalization.json"
             path.write_text(json.dumps({"statistics": {}, "reward_signature": {"mode": "dynamic"}}))
-            with self.assertRaisesRegex(ValueError, "no scalar reward-best"):
+            with self.assertRaisesRegex(ValueError, "group median F baselines"):
                 load_normalization(path)
+            with self.assertRaisesRegex(ValueError, "group median F baselines"):
+                apply_reward_normalization([], {"statistics": {}, "reward_signature": {"mode": "dynamic"}})
 
     def test_metric_cache_recovers_valid_rows_around_torn_append(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -76,14 +76,15 @@ class RewardModesTest(unittest.TestCase):
         better = dict(row, lpips_z=0)
         self.assertGreater(reward(better), reward(row))
 
-    def test_legacy_dispatch_and_dynamic_has_no_scalar(self):
+    def test_legacy_dispatch_and_dynamic_scalar_requires_group_baseline(self):
         self.assertIsInstance(build_reward(), MetricReward)
         self.assertEqual(build_reward()({"psnr": 30}), 30)
         self.assertEqual(reward_signature({})["mode"], "legacy")
         reward = build_reward({"mode": "dynamic"})
-        with self.assertRaisesRegex(TypeError, "no universal scalar"):
+        with self.assertRaisesRegex(TypeError, "requires.*baseline_f"):
             reward(candidate(0))
-        self.assertEqual(set(reward.weights), {"q", "f"})
+        self.assertAlmostEqual(reward(candidate(0, q=0.3, f=-0.6), baseline_f=0), -0.36)
+        self.assertEqual(set(reward.weights), {"q", "f", "eta_fidelity", "lambda_fidelity"})
         self.assertLess(reward.weights["f"]["lpips_z"], 0)
 
     def test_reward_validation(self):
@@ -149,56 +150,64 @@ class RewardModesTest(unittest.TestCase):
         self.assertFalse(pairs)
         self.assertEqual(summary["rejected_by_reason"]["rain:static_tie"], 1)
 
-    def test_dynamic_fr_reverses_q_and_ignores_legacy_knobs(self):
-        config = {"mode": "dynamic", "tau_q": 0.125, "margin_fr": 0.125}
-        rows = [candidate(0, q=0.0625), candidate(1, q=0, f=0.125)]
+    def test_dynamic_penalty_can_reverse_q_and_ignores_legacy_selection_knobs(self):
+        config = {"mode": "dynamic", "lambda_fidelity": 1, "margin_dynamic": 0.01}
+        rows = [candidate(0, q=0.0625, f=-1), candidate(1, q=0, f=0)]
         summary, pairs = self.build(rows, config, {
             "min_reward_gap": 1000, "pair_strategy": "unknown", "pair_selection": "unknown",
             "max_candidate_appearances": 0, "max_samples_per_pair": 0,
         })
         pair = pairs[0]
         self.assertEqual(pair["chosen_noise_index"], 1)
-        self.assertEqual(pair["reward_branch"], "fr")
-        self.assertEqual(pair["reward_gap"], 0.125)
-        self.assertEqual(pair["chosen_reward"], pair["chosen_f"])
-        self.assertEqual(pair["rejected_reward"], pair["rejected_f"])
+        self.assertEqual(pair["reward_branch"], "dynamic")
+        self.assertEqual(pair["baseline_f"], -0.5)
+        self.assertEqual(pair["reward_gap"], 0.6875)
+        self.assertEqual(pair["chosen_reward"], 0)
+        self.assertEqual(pair["rejected_reward"], -0.6875)
+        self.assertEqual(pair["rejected_fidelity_penalty"], 0.25)
         self.assertEqual(pair["gap_q"], 0.0625)
         self.assertLess(pair["chosen_q"], pair["rejected_q"])
         self.assertNotIn("rain:reward_gap", summary["rejected_by_reason"])
 
-    def test_dynamic_tau_equality_uses_q_even_when_f_disagrees(self):
+    def test_dynamic_above_baseline_still_prices_fidelity(self):
         summary, pairs = self.build(
-            [candidate(0, q=0.125, f=-10), candidate(1, f=10)],
-            {"mode": "dynamic", "tau_q": 0.125},
+            [candidate(0, q=.3, f=.1), candidate(1, q=.2, f=.7),
+             candidate(2, q=-2, f=-1), candidate(3, q=-2, f=0), candidate(4, q=-2, f=0)],
+            {"mode": "dynamic"}, {"pairs_per_group": 20},
         )
-        self.assertEqual(pairs[0]["chosen_noise_index"], 0)
-        self.assertEqual(pairs[0]["reward_branch"], "nr")
-        self.assertEqual(pairs[0]["chosen_reward"], pairs[0]["chosen_q"])
-        self.assertEqual(pairs[0]["reward_gap"], 0.125)
-        self.assertEqual(summary["branch_usage_fractions"]["nr"], 1)
+        pair = next(pair for pair in pairs if {pair["chosen_noise_index"], pair["rejected_noise_index"]} == {0, 1})
+        self.assertEqual(pair["chosen_noise_index"], 1)
+        self.assertEqual(pair["baseline_f"], 0)
+        self.assertEqual(pair["chosen_fidelity_penalty"], 0)
+        self.assertAlmostEqual(pair["chosen_reward"], .55)
+        self.assertGreater(pair["chosen_f"], pair["rejected_f"])
+        self.assertEqual(pair["reason"], "reward_tradeoff")
+        self.assertEqual(summary["branch_usage_fractions"], {"dynamic": 1})
 
-    def test_dynamic_fr_margin_and_branch_ties(self):
-        config = {"mode": "dynamic", "tau_q": 0.125, "margin_fr": 0.125}
-        for f, reason, count in ((0, "fr_tie", 0), (0.0625, "fr_gap", 0), (0.125, None, 1)):
-            with self.subTest(f=f):
-                summary, pairs = self.build([candidate(0), candidate(1, f=f)], config)
+    def test_dynamic_reward_margin_ties_and_threshold_equality(self):
+        config = {"mode": "dynamic", "lambda_fidelity": 0, "margin_dynamic": 0.125}
+        for q, reason, count in ((0, "small_differences", 0), (0.0625, "dynamic_gap", 0), (0.125, None, 1)):
+            with self.subTest(q=q):
+                summary, pairs = self.build([candidate(0), candidate(1, q=q)], config)
                 self.assertEqual(len(pairs), count)
                 if reason:
                     self.assertEqual(summary["rejected_by_reason"][f"rain:{reason}"], 1)
-        summary, pairs = self.build([candidate(0), candidate(1, f=1)], {"mode": "dynamic", "tau_q": 0})
-        self.assertFalse(pairs)
-        self.assertEqual(summary["rejected_by_reason"]["rain:nr_tie"], 1)
+        summary, pairs = self.build([candidate(0), candidate(1, f=1)], {
+            "mode": "dynamic", "lambda_fidelity": 0, "margin_dynamic": 0,
+        })
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["reason"], "reward_tradeoff")
 
-    def test_nontransitive_triple_compares_each_unordered_pair_once(self):
+    def test_dynamic_scalar_order_is_transitive_and_compares_each_pair_once(self):
         summary, pairs = self.build(
             [candidate(2, q=0.125), candidate(0, f=2), candidate(1, q=0.0625, f=1)],
-            {"mode": "dynamic", "tau_q": 0.125},
+            {"mode": "dynamic"},
         )
         self.assertEqual(summary["num_evaluated_pairs"], 3)
         self.assertEqual({(pair["chosen_noise_index"], pair["rejected_noise_index"]) for pair in pairs},
-                         {(0, 1), (1, 2), (2, 0)})
-        self.assertEqual(summary["branch_counts_before_filter"], {"static": 0, "nr": 1, "fr": 2})
-        self.assertAlmostEqual(summary["branch_usage_fractions"]["fr"], 2 / 3)
+                          {(0, 1), (1, 2), (0, 2)})
+        self.assertEqual(summary["branch_counts_before_filter"], {"dynamic": 3})
+        self.assertEqual(summary["branch_usage_fractions"], {"dynamic": 1})
 
     def test_twelve_candidates_evaluate_66_and_uniformly_select_nine(self):
         rows = [candidate(i, q=i, f=i) for i in range(12)]
@@ -289,7 +298,7 @@ class RewardModesTest(unittest.TestCase):
     def test_final_branch_statistics_follow_weather_truncation(self):
         summary, pairs = self.build(
             [candidate(0, f=2), candidate(1, q=0.0625, f=1), candidate(2, q=0.125)],
-            {"mode": "dynamic", "tau_q": 0.125},
+            {"mode": "dynamic"},
             {"max_pairs_per_weather": 1, "shuffle": True},
         )
         self.assertEqual(summary["num_evaluated_pairs"], 3)
@@ -323,7 +332,7 @@ class RewardModesTest(unittest.TestCase):
                 "baseline_dists_tolerance": 0.01}}, "baseline_floor"),
             ({}, {"min_psnr_gap": -1, "weather_specific_thresholds": {"rain": 0.1}}, "psnr_gap"),
         )
-        for mode, branch, q in (("static", "static", 1), ("dynamic", "nr", 1), ("dynamic", "fr", 0.03125)):
+        for mode, branch, q in (("static", "static", 1), ("dynamic", "dynamic", 1), ("dynamic", "dynamic", 0.03125)):
             for chosen_overrides, selection, reason in cases:
                 with self.subTest(mode=mode, branch=branch, reason=reason):
                     summary, pairs = self.build(
@@ -441,8 +450,13 @@ class RewardModesTest(unittest.TestCase):
         self.assertNotIn("enable_psnr_pair_constraint", dynamic["preference_filter"])
         for section in ("weather_prompts", "model", "candidate_generation", "tail_risk"):
             self.assertEqual(static[section], dynamic[section])
-        self.assertEqual({k: v for k, v in static["reward"].items() if k != "mode"},
-                         {k: v for k, v in dynamic["reward"].items() if k != "mode"})
+        self.assertEqual(static["reward"]["fr_weights"], dynamic["reward"]["fr_weights"])
+        self.assertEqual(dynamic["reward"]["lambda_fidelity"], 1)
+        self.assertEqual(dynamic["reward"]["margin_dynamic"], .05)
+        self.assertEqual(dynamic["reward"]["eta_fidelity"], .5)
+        self.assertEqual(dynamic["reward"]["min_gap_q"], .01)
+        self.assertEqual(dynamic["reward"]["min_gap_fr"], .01)
+        self.assertTrue(all(key not in dynamic["reward"] for key in ("tau_q", "margin_fr", "margin_static")))
         self.assertEqual({k: v for k, v in static["preference_filter"].items()
                           if k not in {"output_dir", "enable_psnr_pair_constraint"}},
                          {k: v for k, v in dynamic["preference_filter"].items() if k != "output_dir"})
@@ -485,7 +499,7 @@ class RewardModesTest(unittest.TestCase):
     def test_signatures_canonical_defaults_and_effective_behavior(self):
         minimal = {"mode": "dynamic"}
         explicit = {"mode": "dynamic", "fr_weights": {"lpips": 1, "ssim": 1, "psnr": 1},
-                    "tau_q": 0.05, "margin_static": 0.05, "margin_fr": 0.05}
+                    "lambda_fidelity": 1, "margin_dynamic": .05}
         self.assertEqual(reward_signature(minimal), reward_signature(explicit))
         self.assertEqual(reward_signature(minimal), reward_signature({**explicit, "fr_weights": {
             "psnr": 3, "ssim": 3, "lpips": 3}}))
@@ -501,11 +515,11 @@ class RewardModesTest(unittest.TestCase):
         })
         self.assertEqual(expected, actual)
         self.assertNotEqual(expected, preference_signature(minimal, {"pairs_per_group": 20}))
-        self.assertEqual(expected["algorithm_version"], "unordered_uniform_v1")
+        self.assertEqual(expected["algorithm_version"], "unordered_uniform_pareto_penalty_v1")
         self.assertEqual(expected["pair_selection"], "uniform_without_replacement")
         self.assertIsNone(expected["max_candidate_appearances"])
         self.assertNotEqual(expected, preference_signature(minimal, {"random_seed": 43}))
-        self.assertNotEqual(expected, preference_signature({"mode": "dynamic", "tau_q": 0.1}, {}))
+        self.assertNotEqual(expected, preference_signature({"mode": "dynamic", "lambda_fidelity": 2}, {}))
         self.assertNotEqual(expected, preference_signature(minimal, {"weather_specific_thresholds": {"rain": -0.1}}))
 
     def test_selection_validation(self):
@@ -602,8 +616,9 @@ class RewardModesTest(unittest.TestCase):
         self.assertIn("reward_mode=dynamic", self.last_log)
         self.assertIn("DISTS degradation", self.last_log)
         required = {"pair_id", "chosen_reward", "rejected_reward", "reward_gap", "chosen_metrics", "rejected_metrics",
-                    "reward_mode", "reward_branch", "chosen_q", "rejected_q", "chosen_f", "rejected_f", "gap_q",
-                    "tau_q", "margin_static", "margin_fr"}
+                     "reward_mode", "reward_branch", "chosen_q", "rejected_q", "chosen_f", "rejected_f", "gap_q",
+                     "baseline_f", "baseline_f_candidate_count", "lambda_fidelity", "margin_dynamic",
+                     "chosen_fidelity_deficit", "rejected_fidelity_penalty"}
         self.assertTrue(required <= set(pairs[0]))
         normalization = {
             "normalization": "per-weather robust z-score: (x - median) / IQR", "clip_z": 3,

@@ -17,7 +17,7 @@ from collections import Counter, defaultdict
 from contextlib import closing
 from pathlib import Path
 
-from dpo.rewards import build_reward, preference_signature, psnr_pair_constraint_enabled
+from dpo.rewards import build_reward, preference_signature, psnr_pair_constraint_enabled, validate_dynamic_pair_record
 from scripts.summarize_dpo_candidates import _finite, _table, stable_candidate_seed
 
 
@@ -92,9 +92,32 @@ def check_pairs(db, path, config, groups, issue):
                     if pair.get("reward_mode") != reward.mode:
                         raise ValueError("pair reward mode differs from config")
                     ca, cb = reward.components(chosen), reward.components(rejected)
+                    if reward.mode == "dynamic":
+                        f_values = groups[chosen["group_id"]].get("fidelity_scores", [])
+                        if not f_values:
+                            raise ValueError("No full-group F baseline available")
+                        baseline_f = statistics.median(f_values)
+                        ca, cb = reward.with_baseline(ca, baseline_f), reward.with_baseline(cb, baseline_f)
+                        for field, expected in (("baseline_f", baseline_f), ("eta_fidelity", reward.eta_fidelity),
+                                                ("lambda_fidelity", reward.lambda_fidelity),
+                                                ("margin_dynamic", reward.margin_dynamic),
+                                                ("min_gap_q", reward.min_gap_q), ("min_gap_fr", reward.min_gap_fr)):
+                            if not math.isclose(float(pair[field]), expected, rel_tol=1e-6, abs_tol=1e-6):
+                                raise ValueError(f"saved dynamic {field} differs from full-group calculation")
+                        if int(pair["baseline_f_candidate_count"]) != len(f_values):
+                            raise ValueError("saved dynamic baseline candidate count differs from full group")
+                        validate_dynamic_pair_record(pair, reward)
+                        for name, scores in (("chosen", ca), ("rejected", cb)):
+                            if not math.isclose(float(pair[f"{name}_q"]), scores["q"], rel_tol=1e-6, abs_tol=1e-6) or not math.isclose(float(pair[f"{name}_f"]), scores["f"], rel_tol=1e-6, abs_tol=1e-6):
+                                raise ValueError(f"saved dynamic {name} Q/F differs from candidate CSV")
+                            for field in ("base_fidelity_contribution", "fidelity_deficit", "fidelity_penalty"):
+                                if not math.isclose(float(pair[f"{name}_{field}"]), scores[field], rel_tol=1e-6, abs_tol=1e-6):
+                                    raise ValueError(f"saved dynamic {name}_{field} differs from candidate scores")
                     comparison = reward.compare(ca, cb)
-                    if comparison["reason"] or comparison["delta"] <= 0:
+                    if comparison["reason"] or (comparison["direction"] if reward.mode == "dynamic" else comparison["delta"]) <= 0:
                         raise ValueError("pair orientation or reward margin fails the configured rule")
+                    if reward.mode == "dynamic" and pair["reason"] != comparison["accept_reason"]:
+                        raise ValueError("saved dynamic reason differs from candidate CSV comparison")
                     for name, component in (("chosen", ca), ("rejected", cb)):
                         if not math.isclose(float(pair[f"{name}_reward"]), component[comparison["key"]],
                                             rel_tol=1e-6, abs_tol=1e-6):
@@ -247,6 +270,7 @@ def check(candidate_csv, output_dir, expected=32, pairs=None, config_path=None,
     if config_path:
         from dpo.tail_risk import load_config
         config = load_config(config_path)
+    dynamic_reward = build_reward(config["reward"]) if config and config.get("reward", {}).get("mode") == "dynamic" else None
     output.mkdir(parents=True, exist_ok=True)
     counts, codes, severity, split_counts, cfg_counts = Counter(), Counter(), Counter(), Counter(), Counter()
     groups = {}
@@ -333,6 +357,11 @@ def check(candidate_csv, output_dir, expected=32, pairs=None, config_path=None,
                     except sqlite3.IntegrityError:
                         raise ValueError("duplicate candidate path or source/slot")
                     group["slots"].add(slot)
+                    if dynamic_reward is not None:
+                        try:
+                            group.setdefault("fidelity_scores", []).append(dynamic_reward.fidelity(info))
+                        except (KeyError, TypeError, ValueError):
+                            pass
                     part = group["parts"]["prefix" if slot < prefix_count else "added"]
                     for metric in available:
                         if info[metric] is not None:

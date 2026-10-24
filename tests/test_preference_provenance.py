@@ -97,6 +97,37 @@ class PreferenceProvenanceTest(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, "reward_contract"):
                 validate_preference_reward(changed)
 
+    def test_dynamic_quadratic_parameters_and_old_dynamic_signature_require_new_preferences(self):
+        self.train["reward"] = {"mode": "dynamic"}
+        self.build()
+        current = validate_preference_reward(self.train)
+        self.assertEqual(current["reward_signature"]["version"], 3)
+        for key, value in (("eta_fidelity", .8), ("lambda_fidelity", 2), ("margin_dynamic", .1),
+                           ("min_gap_q", .02), ("min_gap_fr", .02)):
+            changed = copy.deepcopy(self.train)
+            changed["reward"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "reward_contract"):
+                validate_preference_reward(changed)
+        for version in (1, 2):
+            old_summary = copy.deepcopy(self.summary)
+            old_summary["reward_contract"]["reward"]["version"] = version
+            old_summary["reward_contract"]["algorithm_version"] = "unordered_uniform_group_penalty_v1"
+            self.save_summary(old_summary)
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, "reward_contract"):
+                validate_preference_reward(self.train)
+
+    def test_dynamic_training_rejects_missing_or_stale_pair_decision_metadata(self):
+        self.train["reward"] = {"mode": "dynamic"}
+        self.build()
+        manifest = Path(self.train["preference_manifest"])
+        original = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+        for field in ("reason", "eta_fidelity", "delta_Q", "chosen_base_fidelity_contribution"):
+            records = copy.deepcopy(original)
+            del records[0][field]
+            manifest.write_text("\n".join(json.dumps(row) for row in records) + "\n", encoding="utf-8")
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "Dynamic preference record"):
+                validate_preference_reward(self.train)
+
     def test_pairing_fidelity_and_random_seed_conflicts(self):
         for field, value in (("pairs_per_group", 3), ("max_pairs_per_weather", 2),
                              ("random_seed", 43), ("min_psnr_gap", -0.1),
@@ -294,7 +325,7 @@ class PreferenceProvenanceTest(unittest.TestCase):
 
         config = {"reward": {"mode": "dynamic"}, "tail_risk": {"enabled": True}}
         for operation in (export_candidate_rewards, weight_tail_risk, validate_tail_risk_training):
-            with self.subTest(operation=operation.__name__), self.assertRaisesRegex(ValueError, "single global candidate scalar"):
+            with self.subTest(operation=operation.__name__), self.assertRaisesRegex(ValueError, "median F baseline"):
                 operation(config)
         self.assertFalse(validate_tail_risk_training({
             "reward": {"mode": "dynamic"}, "tail_risk": {"enabled": False},

@@ -23,7 +23,7 @@ per_candidate_metrics.csv
 | 配置 | 用途 |
 |---|---|
 | `config/dpo_sd3_reward_static.yaml` | 独立完整的 M32 静态配置，包含评分、筛选、训练与评估全部参数 |
-| `config/dpo_sd3_reward_dynamic.yaml` | 独立完整的 M32 动态配置，包含评分、筛选、训练与评估全部参数 |
+| `config/dpo_sd3_reward_dynamic.yaml` | 独立完整的 M32 基础保真贡献、二次惩罚及双优优先动态配置 |
 | `config/dpo_sd3.yaml` | 保留的历史配置，供旧实验使用；不是上述两份配置的父配置 |
 
 静态和动态各只保留一份配置，均不使用 `base_config`，也不相互继承。
@@ -38,9 +38,9 @@ per_candidate_metrics.csv
 | 原中断任务 | `/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_selected2000_3gpu` |
 | 简版导出候选集 | `/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups` |
 | 静态偏好目录 | `/root/autodl-tmp/sd3/experiment/dpo_preferences_static_m32_partial` |
-| 动态偏好目录 | `/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_partial` |
+| 动态偏好目录 | `/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_quadratic` |
 | 静态训练目录 | `/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Static_M32_Partial` |
-| 动态训练目录 | `/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_M32_Partial` |
+| 动态训练目录 | `/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_M32_Quadratic` |
 
 更换候选集时，同步修改 `candidate_generation.output_dir`、
 `preference_filter.source_metrics_path`、`preference_filter.candidate_metrics_path`；
@@ -182,14 +182,15 @@ LPIPS 标准化分数保留原始方向，只在 F 中取负一次。
 | 模式 | 偏好方向与差值门槛 |
 |---|---|
 | 静态 `static` | 按 R 决定方向；平分或绝对差值小于 `margin_static=0.05` 时跳过 |
-| 动态 `dynamic` | Q 的绝对差值达到 `tau_q=0.05` 时按 Q；否则按 F，平分或 F 差值小于 `margin_fr=0.05` 时跳过 |
+| 动态 `dynamic` | 先跳过 Q/F 均不明显的组合，再优先确定双优方向；其他组合按 R_dynamic 与奖励差门槛判断 |
 
-等于阈值时接受。动态模式逐对决定分支，不构建全组动态排序。
+等于阈值时接受。静态公式保持不变；当前动态模式已替换旧的逐对 Q/F 阈值切换，
+在同一源图内每张候选都有统一分数，排序满足传递性。
 每组 32 个候选有 `32*31/2=496` 个无序组合，应用奖励和保真约束后，
 用固定随机种子无放回均匀抽样，最多保留 `pairs_per_group=12` 对。
 此数量可配置，不是程序硬编码上限。
 
-默认情况下，两种模式使用相同保真约束，Q 分支也必须满足：
+默认情况下，两种模式都必须满足以下硬保真约束：
 
 ```text
 chosen_PSNR - rejected_PSNR >= -0.15 dB
@@ -197,6 +198,96 @@ chosen_DISTS - rejected_DISTS <= 0.01
 chosen_PSNR >= group_median_PSNR - 0.50 dB
 chosen_DISTS <= group_median_DISTS + 0.02
 ```
+
+#### 动态奖励：基础保真贡献、二次惩罚与双优优先
+
+Q、F 和共用的天气归一化保持不变。对同一源图的全部候选先计算：
+
+```text
+B = median(F_1, F_2, ..., F_32)
+d_i = max(0, B - F_i)
+R_dynamic_i = Q_i + eta_fidelity * F_i - lambda_fidelity * d_i^2
+```
+
+- `eta_fidelity > 0`：无论是否达到 B，F 都按正系数计入基础贡献；在同一 B、Q 不变时，F 下降必使奖励下降。
+  冲突时，美学增益仍可能抵消保真代价，由下述规则决定取舍。
+- F 低于 B 时，额外按缺口平方扣分；缺口翻倍时，在相同 λ 下二次惩罚变为四倍。
+- B 是同图候选的相对典型保真水平，不是绝对合格线，也不是原始 PSNR 中位数。
+  原始 PSNR/DISTS 的硬约束仍在决定偏好方向后应用，不能由动态奖励绕过。
+
+直接编辑唯一的动态配置：
+
+```yaml
+reward:
+  mode: dynamic
+  eta_fidelity: 0.5
+  lambda_fidelity: 1.0
+  margin_dynamic: 0.05
+  min_gap_q: 0.01
+  min_gap_fr: 0.01
+```
+
+`eta_fidelity`、`min_gap_q`、`min_gap_fr` 必须为正数，`lambda_fidelity` 不小于零。
+λ 为 0 时，奖励仍为 `Q + eta_fidelity*F`，不是纯 Q。`margin_dynamic` 可为非负数。
+以上数值仅为试验起点，不代表已验证最优；Q/F 差值阈值作用于归一化后的分量，不是原始 PSNR 的 dB 阈值。
+这些参数只影响离线偏好构建，不直接作为训练损失或 GT 辅助项系数。
+旧动态参数 `tau_q`、`margin_fr` 不再有效，配置中保留它们会明确报错。
+
+B 在组内去重后、硬保真/文件过滤前，由 F 有效的候选统一计算；完整数据应为 32 张。
+候选缺少 Q 时不参与配对，但其有效 F 仍可参与基准。F、身份或索引无效的记录及重复候选不重复计入。
+不要在只剩下合格偏好对后重算 B，也不能只拿当前 A/B 两张图的 F 中位数作为 B。
+`baseline_f_candidate_count` 会记录实际参与基准的数量，便于发现不足 32 张的组。
+
+对枚举到的原始 A/B，定义 `delta_Q=Q_A-Q_B`、`delta_F=F_A-F_B`、`delta_R=R_A-R_B`，依次处理：
+
+1. 若 `abs(delta_Q) < min_gap_q` 且 `abs(delta_F) < min_gap_fr`，跳过，原因为 `small_differences`。
+2. 若 `delta_Q >= min_gap_q` 且 `delta_F >= min_gap_fr`，A 为 chosen，原因为 `both_better`。
+3. 若 Q/F 差值都达到对称的负阈值，B 为 chosen，原因为 `both_better`。
+4. 其他情况按 R_dynamic 定向；平分或 `abs(delta_R) < margin_dynamic` 时跳过，
+   否则原因为 `reward_tradeoff`。差值等于门槛时接受。
+
+双优分支绕过 `margin_dynamic`，但所有接受分支都必须再通过原 PSNR、DISTS 和组中位数硬约束。
+旧的无参差值门槛不会再次删除已接受的有参优势样本。
+最后按固定种子 42 无放回均匀抽取每组最多 12 对，不改变配对预算，也不强制总是用最高分候选配对。
+偏好记录中的 `chosen_reward`/`rejected_reward` 都是统一的 R_dynamic，
+另存 B、基础保真贡献、缺口、惩罚及奖励参数；`reward_branch` 为 `dynamic`，
+`reason` 为 `both_better` 或 `reward_tradeoff`。
+记录中的 `delta_Q`、`delta_F`、`delta_R` 始终是原始 A−B，不是 chosen−rejected；
+对应 `candidate_a_noise_index`、`candidate_b_noise_index` 会一并保存。
+每组 B 和基准候选数也保存在 `evaluated_pairs_per_group` 中。
+
+筛选还会输出 `dynamic_candidate_rewards.csv`，按组内动态分数降序排列，
+保留原列，并增加 `eta_fidelity` 和 `base_fidelity_contribution`（η×F），
+同时记录 `rank_in_group`、Q、F、B、缺口、二次惩罚和最终动态奖励。
+若重新评分脚本使用 dynamic 配置，也会在评分 CSV 添加 `reward_dynamic` 等组基准字段；
+已有共用评分 CSV 不需要重写，偏好构建器会按当前配置重新计算奖励。
+
+`dynamic_pair_decisions.csv.gz` 流式记录所有已枚举候选对的原始索引、B、三类差值和决策/拒绝原因。
+`status` 区分 `decision_rejected`、`hard_rejected`、`not_selected` 和 `kept`；
+双优定向后未通过硬约束的对仍记录其初始 `decision_reason=both_better` 和实际硬拒绝原因。
+通过规则和硬约束却未被最终抽样/数量预算保留时，状态为 `not_selected`。
+M32 完整组可能合计约 300 万条决策；使用压缩 CSV 和临时磁盘流式处理，不把这些记录集中存入内存。
+
+`preference_summary.json` 中的 `dynamic_selection` 汇总：
+
+- `accepted_before_hard`、`eligible_after_hard`、`kept`：双优/奖励权衡分支在硬筛前、硬筛后及最终保留的对数。
+- `rejected`：小差异、奖励差不足、奖励平分、硬保真失败及未被最终抽样保留的数量。
+- `hard_fidelity_by_reason`、`hard_fidelity_by_decision`：硬约束拒绝的细分原因与最初接受分支。
+- `chosen_minus_rejected`：最终偏好对的原始 PSNR、原始 LPIPS、Q 的平均差及负差比例，按偏好对等权。
+  LPIPS 的负差代表改善，不应误读为退化；另有 `worse_fraction` 按各指标方向报告变差比例。
+
+这是本项目的实验性取舍方案，不保证所有指标同时提高。
+新动态奖励与偏好契约版本为 3，旧 Q/F 切换及上一版纯二次惩罚的数据都不能只改标签继续使用。
+训练前会核验新契约和每条记录的公式、参数、方向、原因及三类差值，不能静默复用旧公式数据。
+更新后只需重新运行动态筛选，不重新生成候选或计算 IQA，也不自动生成静态结果：
+
+```bash
+python -m scripts.filter_dpo_pairs --config config/dpo_sd3_reward_dynamic.yaml
+```
+
+沿用现有配置内的输出路径管理方式，不另建训练入口。需保留上一轮结果时，先在同一动态 YAML 中
+同步修改偏好输出目录、训练清单、训练输出和评估输出路径，再筛选；后续训练应从同一 SFT 初始化新实验，
+不要直接续训另一奖励版本的检查点。筛选本身不启动训练。
 
 #### 静态消融：是否启用 PSNR 对间差值下界
 
@@ -248,7 +339,7 @@ CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 \
 新模式不使用旧版的覆盖优先选择、候选出现次数上限、`max_samples_per_pair` 或
 `min_reward_gap`。不要通过这些旧参数调整当前每组对数，使用 `pairs_per_group`。
 构建器按当前配置重算 Q/F，不直接信任旧奖励列；历史 `reward` 可另存为 `original_reward`。
-静态对保存 R，动态对保存当前分支的 Q 或 F，训练损失本身不因分支改变。
+静态对保存 R_static，动态对保存 R_dynamic，训练损失本身保持同一 DPO 形式。
 
 更改模式、FR 权重或门槛后，应重建偏好对，无需重新运行 IQA。
 偏好汇总绑定奖励、筛选参数、候选 CSV、归一化和清单的签名/哈希，训练及续训会验证契约。
@@ -470,6 +561,7 @@ python -m scripts.check_candidate_health \
 - `pairs.metric_deltas`：偏好候选相对非偏好候选的指标差及变差比例。
 - `pairs.musiq_up_but_clipiqa_and_nima_down`：MUSIQ 上升而另外两项无参指标下降的偏好对数量。
 - `pairs.max_candidate_appearances`：候选是否在偏好清单中反复出现。
+- 对新动态偏好，检查器还会从全组重建 B，核对 λ、缺口、惩罚和 R_dynamic，不信任手工填写的基准。
 - `prefix_vs_added`：同组内前 12 张与后 20 张的平均指标差异，逐组配对后汇总。
   PSNR 等高分为优的指标若新增部分系统性更低，或 LPIPS 系统性更高，应优先检查新增候选。
   `groups.csv` 还记录前 12 张与全组的 PSNR 中位数，便于判断组中位数保真基线是否被拉低。
@@ -554,7 +646,7 @@ python -m scripts.summarize_dpo_candidates \
 
 以下是按需运行的独立实验，不是主流程的额外必需步骤：
 
-- [尾部风险加权](TAIL_RISK_DPO.md)：在既有偏好上做加权对照。当前主配置关闭此功能；动态奖励没有统一标量，不能直接使用该尾部算法。
+- [尾部风险加权](TAIL_RISK_DPO.md)：在既有偏好上做加权对照。当前主配置关闭此功能；新动态虽有组内统一标量，但现有尾部工具没有提供冻结组基准上下文，仍不支持该路径。
 - [同图在线/离线 IQA 诊断](OFFLINE_IQA_ANALYSIS.md)：对比 GT、SFT、DPO，并检查候选中的保真合格择优空间。
 - [M=8/M=12 随机性实验](SEED_RANDOMNESS.md)：独立的嵌套样本量和输出多样性分析，不改变主候选集的 M=32 设置。
 
@@ -565,6 +657,7 @@ python -m unittest discover -s tests -p 'test_export_candidates_simple.py'
 python -m unittest discover -s tests -p 'test_analyze_candidate_csv.py'
 python -m unittest discover -s tests -p 'test_candidate_health.py'
 python -m unittest discover -s tests -p 'test_reward_modes.py'
+python -m unittest discover -s tests -p 'test_dynamic_fidelity_reward.py'
 python -m unittest discover -s tests -p 'test_reward_modes_smoke.py'
 python -m unittest discover -s tests -p 'test_preference_provenance.py'
 ```

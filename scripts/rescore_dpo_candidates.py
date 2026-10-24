@@ -29,7 +29,7 @@ from dpo.reward_normalization import (
     AESTHETIC_METRICS, FR_METRICS, SIX_METRICS, NORMALIZATION,
     apply_robust_statistics, normalization_fingerprint, normalize_candidate_scores,
 )
-from dpo.rewards import build_reward, reward_signature
+from dpo.rewards import build_reward, dynamic_group_baselines, dynamic_group_key, reward_signature
 from dpo.tail_risk import _publish_new, file_sha256, load_config
 
 
@@ -342,7 +342,7 @@ def main(argv: list[str] | None = None) -> None:
         if "reward" in original_fields:
             if "original_reward" in original_fields:
                 raise ValueError("Cannot preserve historical reward: original_reward already exists")
-            warnings.warn("Preserving historical reward as original_reward; no global mode reward is exported")
+            warnings.warn("Preserving historical reward as original_reward; configured mode scores are recomputed")
             for row in rows:
                 row["original_reward"] = row.pop("reward")
             original_fields = ["original_reward" if name == "reward" else name for name in original_fields]
@@ -354,6 +354,26 @@ def main(argv: list[str] | None = None) -> None:
                 row.update(reward_q=components["q"], reward_f=components["f"],
                            reward_static=components["static_reward"])
         added_fields.extend(("reward_q", "reward_f", "reward_static", "reward_mode"))
+        if reward.mode == "dynamic":
+            baselines = dynamic_group_baselines(rows, reward, input_csv.parent)
+            for row in rows:
+                row.update(reward_dynamic="", baseline_f="", baseline_f_candidate_count="",
+                           fidelity_deficit="", base_fidelity_contribution="", fidelity_penalty="",
+                           eta_fidelity=reward.eta_fidelity, lambda_fidelity=reward.lambda_fidelity)
+                if row["reward_q"] != "" and row["reward_f"] != "":
+                    key = dynamic_group_key(row, input_csv.parent)
+                    if key not in baselines:
+                        raise ValueError(f"No valid full-group fidelity baseline for {key}")
+                    info = baselines[key]
+                    scores = reward.with_baseline({"q": row["reward_q"], "f": row["reward_f"]}, info["baseline_f"])
+                    row.update(reward_dynamic=scores["dynamic_reward"], baseline_f=scores["baseline_f"],
+                               baseline_f_candidate_count=info["candidate_count"],
+                                fidelity_deficit=scores["fidelity_deficit"],
+                                base_fidelity_contribution=scores["base_fidelity_contribution"],
+                                fidelity_penalty=scores["fidelity_penalty"])
+            added_fields.extend(("reward_dynamic", "baseline_f", "baseline_f_candidate_count",
+                                  "fidelity_deficit", "base_fidelity_contribution", "fidelity_penalty",
+                                  "eta_fidelity", "lambda_fidelity"))
 
     # Moving the CSV must not change the meaning of its image references.
     if output_csv.parent != input_csv.parent:

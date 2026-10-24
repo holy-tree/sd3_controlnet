@@ -49,15 +49,20 @@ reward:
     psnr: 1.0
     ssim: 1.0
     lpips: 1.0
-  tau_q: 0.05
-  margin_static: 0.05
-  margin_fr: 0.05
+  # B 为同一源图所有 F 有效候选的 F 中位数，先于硬保真筛选计算。
+  # R_dynamic = Q + eta_fidelity * F - lambda_fidelity * max(0, B - F)^2
+  # 这些数值是试验起点，不表示已验证最优；差值阈值作用于标准化 Q/F。
+  eta_fidelity: 0.5
+  lambda_fidelity: 1.0
+  margin_dynamic: 0.05
+  min_gap_q: 0.01
+  min_gap_fr: 0.01
 
 # ==================== 3. 偏好筛选 ====================
 preference_filter:
   source_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_aesthetic.csv"
   candidate_metrics_path: "/root/autodl-tmp/sd3/experiment/dpo_candidates_m32_complete_groups/per_candidate_metrics_fr_nr.csv"
-  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_partial"
+  output_dir: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_quadratic"
   pairs_per_group: 12
   # 动态模式始终应用 PSNR 对间下界，不使用 static 专用消融开关。
   min_psnr_gap: -0.15
@@ -95,8 +100,8 @@ tail_risk:
 
 # ==================== 5. 单卡训练与验证 ====================
 training:
-  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_partial/preference_pairs.jsonl"
-  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_M32_Partial"
+  preference_manifest: "/root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_m32_quadratic/preference_pairs.jsonl"
+  output_dir: "/root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_M32_Quadratic"
   resume_from_checkpoint: null
   train_controlnet: true
   train_ra_fusion: true
@@ -155,7 +160,7 @@ training:
 # ==================== 6. 评估 ====================
 evaluation:
   eval_config: "./config/eval_sd3.yaml"
-  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic_m32_partial"
+  output_dir: "/root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic_m32_quadratic"
   controlnet_model_path: null
   ra_fusion_path: null
   enable_fid: true

@@ -132,6 +132,36 @@ class CandidateHealthTest(unittest.TestCase):
         for code in ("zscore_mismatch", "pair_contract_mismatch", "too_many_pairs_per_group"):
             self.assertIn(code, result["issue_counts"])
 
+    def test_dynamic_pair_audit_reconstructs_full_group_penalties(self):
+        self.config["reward"] = {"mode": "dynamic", "lambda_fidelity": 1, "margin_dynamic": .01}
+        self.config_path.write_text(yaml.safe_dump(self.config), encoding="utf-8")
+        pairs = self.make_pairs()
+        result = self.run_check(pairs=pairs, config_path=self.config_path)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["pairs"]["valid_pairs"], 6)
+        self.assertEqual(result["pairs"]["invalid_pairs"], 0)
+
+    def test_dynamic_both_better_audit_does_not_reimpose_reward_margin(self):
+        self.config["reward"] = {"mode": "dynamic", "margin_dynamic": 100}
+        self.config_path.write_text(yaml.safe_dump(self.config), encoding="utf-8")
+        pairs = self.make_pairs()
+        records = [json.loads(line) for line in pairs.read_text().splitlines()]
+        self.assertTrue(all(row["reason"] == "both_better" and row["reward_gap"] < 100 for row in records))
+        result = self.run_check(pairs=pairs, config_path=self.config_path)
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(result["pairs"]["valid_pairs"], 6)
+
+    def test_dynamic_pair_audit_rejects_tampered_baseline(self):
+        self.config["reward"] = {"mode": "dynamic"}
+        self.config_path.write_text(yaml.safe_dump(self.config), encoding="utf-8")
+        pairs = self.make_pairs()
+        records = [json.loads(line) for line in pairs.read_text().splitlines()]
+        records[0]["baseline_f"] += .25
+        pairs.write_text("\n".join(json.dumps(row) for row in records) + "\n", encoding="utf-8")
+        result = self.run_check(pairs=pairs, config_path=self.config_path)
+        self.assertEqual(result["pairs"]["invalid_pairs"], 1)
+        self.assertIn("baseline_f", (self.root / "report/issues.csv").read_text(encoding="utf-8-sig"))
+
     def test_pair_audit_accepts_disabled_static_psnr_gate_without_disabling_other_checks(self):
         self.rows[1].update(musiq=100, clipiqa=.99, nima=9)
         stats, _ = normalize_candidate_scores(self.rows, verify_existing=False)

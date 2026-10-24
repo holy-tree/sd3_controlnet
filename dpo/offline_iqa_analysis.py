@@ -579,8 +579,8 @@ def load_normalization(path: Path | None) -> dict | None:
         raise ValueError(f"Normalization JSON has no statistics mapping: {path}")
     if (payload.get("reward_signature") or {}).get("mode") == "dynamic":
         raise ValueError(
-            "Dynamic preference has no scalar reward-best for this IQA analyzer. "
-            "Use the preference builder's per-pair Q/F diagnostics; do not rank by a proxy reward."
+            "Dynamic reward needs historical source-group median F baselines, which this IQA analyzer does not supply. "
+            "Use the preference builder's dynamic_candidate_rewards.csv; do not substitute a proxy reward."
         )
     return payload
 
@@ -590,6 +590,8 @@ def apply_reward_normalization(rows: Sequence[dict], normalization: Mapping | No
     if not normalization:
         return
     signature = normalization.get("reward_signature") or {}
+    if signature.get("mode") == "dynamic":
+        raise ValueError("Dynamic IQA reward comparison requires historical group median F baselines")
     mode_reward = None
     if signature.get("mode") == "static":
         from dpo.rewards import build_reward
