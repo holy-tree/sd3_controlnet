@@ -182,6 +182,9 @@ python -m scripts.check_texture_dpo --output experiment/texture_dpo_check_v1
 带完成标记的目录和含无关文件的目录不会被该选项覆盖/归档。首次发布版本产生的
 无 attempt marker、但含合法 texture CSV 表头的失败目录也支持此方式重试。
 输入 CSV 要求同源图记录连续（当前完整组导出满足），否则明确报错。
+评分启动时流式统计候选总数，随后显示按候选图片更新的 `Texture IQA` 进度条，
+包括百分比、处理速度、预计剩余时间，以及已完成组数、当前天气和图块数。
+局部归一化写出阶段另显示 `Normalize local IQA` 进度条；计数不将整张 CSV 载入内存。
 
 ### 候选校验和含义
 

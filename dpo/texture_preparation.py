@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from PIL import Image
+from tqdm.auto import tqdm
 
 from .reward_normalization import apply_robust_statistics, fit_robust_statistics, normalization_fingerprint
 from .rewards import dynamic_group_key
@@ -200,12 +201,21 @@ def score_texture_candidates(config, scorer=None, device="cpu", restart_incomple
     directory = Path(score_cfg["output_dir"]).expanduser().resolve()
     source_hash = file_sha256(source)
     _scoring_directory(directory, source, prep, source_hash, restart_incomplete)
-    scorer = scorer or PyIQAPatchScorer(config, device)
+    print("[texture-score] counting candidate records...", flush=True)
+    with source.open(newline="", encoding="utf-8-sig") as f:
+        total_candidates = sum(1 for _ in csv.DictReader(f))
+    print(f"[texture-score] candidates={total_candidates}; device={device}", flush=True)
+    if scorer is None:
+        print("[texture-score] loading IQA models...", flush=True)
+        scorer = PyIQAPatchScorer(config, device)
     raw_path, output = directory/"per_candidate_texture_raw.csv", directory/"per_candidate_texture.csv"
     gt_manifest = directory/"gt_sources.jsonl"
     rejected = Counter()
     group_count = candidate_count = 0
-    with raw_path.open("w", newline="", encoding="utf-8") as f, gt_manifest.open("w", encoding="utf-8") as sources:
+    with raw_path.open("w", newline="", encoding="utf-8") as f, \
+            gt_manifest.open("w", encoding="utf-8") as sources, \
+            tqdm(total=total_candidates, desc="Texture IQA", unit="candidate",
+                 dynamic_ncols=True, mininterval=1.0) as progress:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
         for key, rows in candidate_groups(source):
@@ -253,10 +263,12 @@ def score_texture_candidates(config, scorer=None, device="cpu", restart_incomple
                 if index == 0 and group_count < int(score_cfg.get("visualize_groups", 3)):
                     save_texture_visualization(directory/"visualizations"/f"group_{group_count:04d}", gt, candidate, mask, patches)
                 candidate_count += 1
+                progress.set_postfix(groups=group_count+int(index == len(rows)-1),
+                                     weather=key[0], patches=len(patches), refresh=False)
+                progress.update(1)
             group_count += 1
-            if group_count % 100 == 0:
-                print(f"[texture-score] groups={group_count}, candidates={candidate_count}", flush=True)
     # Fit only the three LOCAL metrics, on their complete per-weather population.
+    print("[texture-score] fitting local per-weather normalization...", flush=True)
     with raw_path.open(newline="", encoding="utf-8") as f:
         values = [{"weather": row["weather"], **{m: row[m] for m in LOCAL_METRICS}} for row in csv.DictReader(f)]
     stats = fit_robust_statistics(values, metrics=LOCAL_METRICS)
@@ -264,7 +276,8 @@ def score_texture_candidates(config, scorer=None, device="cpu", restart_incomple
     with raw_path.open(newline="", encoding="utf-8") as f, output.open("w", newline="", encoding="utf-8") as out:
         writer = csv.DictWriter(out, fieldnames=FIELDS)
         writer.writeheader()
-        for row in csv.DictReader(f):
+        for row in tqdm(csv.DictReader(f), total=candidate_count, desc="Normalize local IQA",
+                        unit="candidate", dynamic_ncols=True, mininterval=1.0):
             apply_robust_statistics([row], stats, metrics=LOCAL_METRICS, clip_z=3.0)
             row["reward_q_texture"] = (sum(w*float(row[m+"_z"]) for m, w in LOCAL_COEFFICIENTS.items())
                                         if all(row[m+"_z"] != "" for m in LOCAL_METRICS) else "")
