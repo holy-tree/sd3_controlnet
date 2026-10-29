@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.metadata
 import json
 import math
 import random
 import statistics
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from itertools import combinations, groupby
 from pathlib import Path
 
@@ -25,7 +27,7 @@ from .tail_risk import file_sha256
 
 FIELDS = ("texture_schema", "weather", "subdataset", "global_index", "noise_index", "candidate_index",
           "guidance_scale", "candidate_path", "gt_path", "lq_path", "psnr", "dists", "lpips",
-          "output_checksum_sha256", "texture_binding", "texture_patch_count", *LOCAL_METRICS,
+          "output_checksum_sha256", "candidate_file_sha256", "texture_binding", "texture_patch_count", *LOCAL_METRICS,
           *(name+"_z" for name in LOCAL_METRICS), "reward_q_texture")
 
 
@@ -42,6 +44,80 @@ def _write_json(path, value):
 def _resolve(value, base):
     path = Path(value).expanduser()
     return str((path if path.is_absolute() else base/path).resolve())
+
+
+def _verify_candidate_pixels(path, expected):
+    """Verify the generator's decoded-pixel hash, not the PNG container hash.
+
+    randomness_check.output_checksum hashes quantized CHW tensor bytes. Some
+    later writers use RGB HWC bytes; the existing health checker accepts both.
+    Keep output_checksum_sha256 verbatim and store file integrity separately.
+    """
+    with Image.open(path) as image:
+        image.load()
+        rgb = image.convert("RGB")
+        if rgb.width != rgb.height:
+            raise ValueError("Expected square candidates from the project's generation crop")
+        if expected:
+            hwc = hashlib.sha256(rgb.tobytes()).hexdigest()
+            chw = hashlib.sha256(b"".join(channel.tobytes() for channel in rgb.split())).hexdigest()
+            if expected not in (chw, hwc):
+                raise ValueError(
+                    f"Saved candidate PIXEL checksum mismatch: {path}; expected={expected}; "
+                    f"decoded_rgb_chw={chw}; decoded_rgb_hwc={hwc}"
+                )
+
+
+def _candidate_file_checksum(row):
+    # Backward compatibility: earlier completed texture artifacts stored a file
+    # hash under output_checksum_sha256. New artifacts use the explicit column.
+    expected = row.get("candidate_file_sha256") or row.get("output_checksum_sha256")
+    if not expected or file_sha256(row["candidate_path"]) != expected:
+        raise ValueError("Candidate FILE checksum mismatch since local scoring: " + row["candidate_path"])
+    return expected
+
+
+def _scoring_directory(directory, source, prep, source_hash, restart_incomplete):
+    """Explicit restart archives only recognizable incomplete texture output."""
+    if source == directory or directory in source.parents:
+        raise ValueError("Texture scoring output must not contain its input CSV")
+    if directory.exists():
+        if (directory/"texture_scores.json").exists():
+            raise FileExistsError("Completed texture scoring output is never overwritten: " + str(directory))
+        if not restart_incomplete:
+            raise FileExistsError(
+                f"Incomplete scoring directory exists: {directory}. "
+                "Use --restart-incomplete to archive it and restart scoring from scratch."
+            )
+        allowed = {"per_candidate_texture_raw.csv", "per_candidate_texture.csv", "gt_sources.jsonl",
+                   "texture_normalization.json", "visualizations", "texture_scoring_attempt.json"}
+        entries = {p.name for p in directory.iterdir()}
+        if entries - allowed:
+            raise ValueError("Refusing to archive directory containing unrelated files: " + str(entries-allowed))
+        attempt = directory/"texture_scoring_attempt.json"
+        raw = directory/"per_candidate_texture_raw.csv"
+        if attempt.is_file():
+            if _json(attempt).get("schema") != SCHEMA:
+                raise ValueError("Unrecognized incomplete scoring attempt schema")
+        elif raw.is_file():
+            # Supports failures from the initial release, before attempt markers.
+            with raw.open(newline="", encoding="utf-8-sig") as f:
+                header = next(csv.reader(f), [])
+            if not {"texture_schema", "texture_binding", "musiq_texture", "reward_q_texture"}.issubset(header):
+                raise ValueError("Unrecognized incomplete texture CSV")
+        elif entries:
+            raise ValueError("Cannot identify this directory as incomplete texture scoring output")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = directory.with_name(directory.name+".incomplete-"+stamp)
+        if backup.exists():
+            raise FileExistsError(backup)
+        directory.rename(backup)
+        print(f"[texture-score] archived incomplete output: {backup}", flush=True)
+    directory.mkdir(parents=True, exist_ok=False)
+    _write_json(directory/"texture_scoring_attempt.json", {
+        "schema": SCHEMA, "preparation": prep, "input_csv": str(source),
+        "input_sha256": source_hash, "status": "incomplete_until_texture_scores_json_is_published",
+    })
 
 
 def _validate_normalization(path, preparation):
@@ -116,14 +192,14 @@ class PyIQAPatchScorer:
         return result
 
 
-def score_texture_candidates(config, scorer=None, device="cpu"):
+def score_texture_candidates(config, scorer=None, device="cpu", restart_incomplete=False):
     settings = spatial_settings(config)
     prep = preparation_contract(config)
     score_cfg = config["texture_scoring"]
     source = Path(score_cfg["input_csv"]).expanduser().resolve()
     directory = Path(score_cfg["output_dir"]).expanduser().resolve()
     source_hash = file_sha256(source)
-    directory.mkdir(parents=True, exist_ok=False)
+    _scoring_directory(directory, source, prep, source_hash, restart_incomplete)
     scorer = scorer or PyIQAPatchScorer(config, device)
     raw_path, output = directory/"per_candidate_texture_raw.csv", directory/"per_candidate_texture.csv"
     gt_manifest = directory/"gt_sources.jsonl"
@@ -164,19 +240,15 @@ def score_texture_candidates(config, scorer=None, device="cpu"):
                     raise ValueError("candidate_index differs from noise_index")
                 slots.add(slot)
                 paths.add(path)
+                _verify_candidate_pixels(path, row.get("output_checksum_sha256"))
                 checksum = file_sha256(path)
-                if row.get("output_checksum_sha256") and row["output_checksum_sha256"] != checksum:
-                    raise ValueError("Saved candidate checksum mismatch: " + path)
-                with Image.open(path) as candidate_image:
-                    if candidate_image.width != candidate_image.height:
-                        raise ValueError("Expected square candidates from the project's generation crop")
                 candidate = aligned_rgb(path, settings["resolution"])
                 metrics = scorer(torch.stack([candidate[:, y:y+h, x:x+w] for x, y, w, h in patches])) if patches else {}
                 if patches and (set(metrics) != set(LOCAL_METRICS) or not all(math.isfinite(float(v)) for v in metrics.values())):
                     raise ValueError("Invalid local IQA output")
                 writer.writerow({**{name: row.get(name, "") for name in FIELDS}, **metrics,
                                  "texture_schema": SCHEMA, "gt_path": gt_path, "lq_path": lq_path,
-                                 "output_checksum_sha256": checksum, "texture_binding": source_record["texture_binding"],
+                                  "candidate_file_sha256": checksum, "texture_binding": source_record["texture_binding"],
                                  "texture_patch_count": len(patches)})
                 if index == 0 and group_count < int(score_cfg.get("visualize_groups", 3)):
                     save_texture_visualization(directory/"visualizations"/f"group_{group_count:04d}", gt, candidate, mask, patches)
@@ -210,7 +282,9 @@ def score_texture_candidates(config, scorer=None, device="cpu"):
                 "normalization_path": str(norm_path), "normalization_sha256": file_sha256(norm_path),
                 "gt_manifest_path": str(gt_manifest), "gt_manifest_sha256": file_sha256(gt_manifest),
                 "candidate_policy": _json(policy_path).get("candidate_policy") if policy_path.is_file() else None,
-                "num_source_groups": group_count, "num_candidate_rows": candidate_count, "rejected": dict(rejected)}
+                "num_source_groups": group_count, "num_candidate_rows": candidate_count, "rejected": dict(rejected),
+                "checksum_semantics": {"output_checksum_sha256": "source decoded RGB pixel hash, preserved verbatim (CHW or HWC)",
+                                       "candidate_file_sha256": "SHA256 over complete candidate file bytes"}}
     _write_json(directory/"texture_scores.json", metadata)  # completion marker, published last
     return metadata
 
@@ -271,7 +345,7 @@ def build_texture_preferences(config):
                 if not Path(row["candidate_path"]).is_file():
                     raise FileNotFoundError(row["candidate_path"])
                 candidates.append({"q": q, "psnr": psnr, "dists": dists, "slot": int(row["noise_index"]),
-                                   "path": row["candidate_path"], "checksum": row["output_checksum_sha256"],
+                                   "path": row["candidate_path"], "checksum": _candidate_file_checksum(row),
                                    "z": {m+"_z": float(row[m+"_z"]) for m in LOCAL_METRICS}})
             except (ValueError, KeyError, FileNotFoundError):
                 rejected["invalid_candidate"] += 1

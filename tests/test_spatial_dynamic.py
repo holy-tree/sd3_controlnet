@@ -26,7 +26,8 @@ from dpo.spatial_config import (MODE, SCHEMA, spatial_settings, training_signatu
                                 preparation_contract, texture_filter_contract)
 from dpo.spatial_dataset import SpatialPreferenceDataset, collate_spatial_pairs
 from dpo.tail_risk_training import DPOLogWindow, training_dpo_loss
-from dpo.texture_preparation import score_texture_candidates, build_texture_preferences
+from dpo.texture_preparation import (score_texture_candidates, build_texture_preferences,
+                                     _verify_candidate_pixels, _candidate_file_checksum, FIELDS)
 from dpo.preference_provenance import validate_preference_reward
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,11 @@ def prepare_fixture(root, all_flat=False, bad_fidelity=False):
                          "noise_index": index, "candidate_index": index, "guidance_scale": 1,
                          "candidate_path": str(path), "gt_path": str(folder/"gt.png"), "lq_path": str(folder/"lq.png"),
                          "psnr": 30+.01*index, "dists": .10-.001*index, "lpips": .2-.001*index})
+            # Real generator CSVs contain PIXEL checksums, not PNG file hashes.
+            with Image.open(path) as saved:
+                rgb = saved.convert("RGB")
+                pixels = (b"".join(c.tobytes() for c in rgb.split()) if index % 2 == 0 else rgb.tobytes())
+            rows[-1]["output_checksum_sha256"] = hashlib.sha256(pixels).hexdigest()
             if bad_fidelity and group == 1:
                 if index == 3:
                     rows[-1]["psnr"] = 29
@@ -173,6 +179,62 @@ class SpatialNumericsTest(unittest.TestCase):
 
 
 class TexturePipelineTest(unittest.TestCase):
+    def test_generator_chw_and_hwc_pixel_hashes_are_not_file_hashes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tree = ast.parse((ROOT/"utils/randomness_check.py").read_text(encoding="utf-8"))
+            definitions = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in {"tensor_to_pil", "output_checksum"}]
+            namespace = {"torch": torch, "hashlib": hashlib, "Image": Image}
+            exec(compile(ast.Module(body=definitions, type_ignores=[]), "actual_generation_checksums", "exec"), namespace)
+            image = torch.arange(3*8*8).reshape(3,8,8).float()/(3*8*8)
+            path = root/"candidate.png"
+            namespace["tensor_to_pil"](image).save(path)
+            chw = namespace["output_checksum"](image)
+            with Image.open(path) as saved:
+                hwc = hashlib.sha256(saved.convert("RGB").tobytes()).hexdigest()
+            container = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(len({chw, hwc, container}), 3)
+            _verify_candidate_pixels(path, chw)
+            _verify_candidate_pixels(path, hwc)
+            with self.assertRaisesRegex(ValueError, "PIXEL checksum mismatch"):
+                _verify_candidate_pixels(path, container)
+            self.assertEqual(_candidate_file_checksum({"candidate_path": str(path), "candidate_file_sha256": container,
+                                                       "output_checksum_sha256": chw}), container)
+            # Completed artifacts from the initial release remain readable.
+            self.assertEqual(_candidate_file_checksum({"candidate_path": str(path), "output_checksum_sha256": container}), container)
+            Image.new("RGB", (8,8), "red").save(path)
+            with self.assertRaisesRegex(ValueError, "PIXEL checksum mismatch"):
+                _verify_candidate_pixels(path, chw)
+
+    def test_archive_incomplete_and_restart_preserves_old_files_and_rejects_completed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cfg, _, _, _, _ = prepare_fixture(root)
+            target = root/"failed_legacy"
+            target.mkdir()
+            old_raw = target/"per_candidate_texture_raw.csv"
+            with old_raw.open("w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([name for name in FIELDS if name != "candidate_file_sha256"])
+            before = old_raw.read_bytes()
+            cfg["texture_scoring"]["output_dir"] = str(target)
+            with self.assertRaisesRegex(FileExistsError, "restart-incomplete"):
+                score_texture_candidates(cfg, scorer=FakeScorer())
+            fresh = score_texture_candidates(cfg, scorer=FakeScorer(), restart_incomplete=True)
+            backups = list(root.glob("failed_legacy.incomplete-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0]/old_raw.name).read_bytes(), before)
+            self.assertEqual(fresh["num_candidate_rows"], 8)
+            self.assertTrue((target/"texture_scoring_attempt.json").is_file())
+            with self.assertRaisesRegex(FileExistsError, "Completed"):
+                score_texture_candidates(cfg, scorer=FakeScorer(), restart_incomplete=True)
+            unknown = root/"unrelated"
+            unknown.mkdir()
+            (unknown/"notes.txt").write_text("user work", encoding="utf-8")
+            cfg["texture_scoring"]["output_dir"] = str(unknown)
+            with self.assertRaisesRegex(ValueError, "unrelated files"):
+                score_texture_candidates(cfg, scorer=FakeScorer(), restart_incomplete=True)
+            self.assertEqual((unknown/"notes.txt").read_text(), "user work")
+
     def test_same_crops_mask_bindings_independent_gt_and_versioning(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -181,6 +243,13 @@ class TexturePipelineTest(unittest.TestCase):
             self.assertEqual(summary["num_gt_sources"], 2)
             self.assertEqual(summary["num_groups_with_pairs"], 1)
             self.assertGreater(summary["num_preference_pairs"], 0)
+            with (root/"input.csv").open(newline="", encoding="utf-8") as f:
+                original = list(csv.DictReader(f))
+            with Path(score["candidate_metrics_path"]).open(newline="", encoding="utf-8") as f:
+                scored = list(csv.DictReader(f))
+            for old, new in zip(original, scored):
+                self.assertEqual(new["output_checksum_sha256"], old["output_checksum_sha256"])
+                self.assertEqual(new["candidate_file_sha256"], hashlib.sha256(Path(new["candidate_path"]).read_bytes()).hexdigest())
             # Exactly the texture source was scored, with identical crop layouts.
             self.assertEqual(len(scorer.inputs), 4)
             self.assertTrue(all(x.shape == scorer.inputs[0].shape for x in scorer.inputs))

@@ -19,9 +19,14 @@ def main():
     parser.add_argument("stage", choices=("score", "filter"))
     parser.add_argument("--config", default="config/dpo_sd3_reward_dynamic_texture.yaml")
     parser.add_argument("--device", default="cpu", help="IQA scoring device; diffusion is never run")
+    parser.add_argument("--restart-incomplete", action="store_true",
+                        help="Score only: archive recognized incomplete output and restart; never overwrite completed results")
     args = parser.parse_args()
     config = load_config(args.config)
-    result = score_texture_candidates(config, device=args.device) if args.stage == "score" else build_texture_preferences(config)
+    if args.restart_incomplete and args.stage != "score":
+        parser.error("--restart-incomplete only applies to score")
+    result = (score_texture_candidates(config, device=args.device, restart_incomplete=args.restart_incomplete)
+              if args.stage == "score" else build_texture_preferences(config))
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
 

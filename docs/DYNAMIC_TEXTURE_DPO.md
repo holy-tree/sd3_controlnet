@@ -157,6 +157,10 @@ spatial_dynamic:
 # 1. 只读取已有候选图片，新增局部 IQA 评分；可以显式改为 --device cuda:0。
 python -m scripts.prepare_texture_dpo score --config config/dpo_sd3_reward_dynamic_texture.yaml --device cpu
 
+# 原评分进程已退出，且上次仅留下不完整输出时：归档失败目录，从头重试。
+# 显式覆盖无效的 OpenMP 环境变量；此例将 IQA 放在 GPU 上。
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m scripts.prepare_texture_dpo score --config config/dpo_sd3_reward_dynamic_texture.yaml --device cuda:0 --restart-incomplete
+
 # 2. 在新的偏好目录中筛选 Q_texture 偏好。
 python -m scripts.prepare_texture_dpo filter --config config/dpo_sd3_reward_dynamic_texture.yaml
 # 等价入口：python -m scripts.filter_dpo_pairs --config config/dpo_sd3_reward_dynamic_texture.yaml
@@ -171,9 +175,24 @@ python -m unittest discover -s tests -p 'test_spatial_dynamic.py' -v
 python -m scripts.check_texture_dpo --output experiment/texture_dpo_check_v1
 ```
 
-评分/偏好输出目录必须是新目录，现有输入和旧结果不会被覆盖。
+评分/偏好默认要求新目录，现有输入和旧结果不会被覆盖。
 评分最后发布 `texture_scores.json` 作为完成标记；失败留下的目录不能被误当成完整评分。
+`score --restart-incomplete` 仅在确认旧进程已退出后使用：将可识别的失败目录重命名为
+`原目录.incomplete-UTC时间戳`，保留所有失败产物，然后从头评分；不是续算已评分部分。
+带完成标记的目录和含无关文件的目录不会被该选项覆盖/归档。首次发布版本产生的
+无 attempt marker、但含合法 texture CSV 表头的失败目录也支持此方式重试。
 输入 CSV 要求同源图记录连续（当前完整组导出满足），否则明确报错。
+
+### 候选校验和含义
+
+生成器的 `output_checksum_sha256` 是量化 RGB **像素**的 SHA256：原始生成器使用
+CHW 通道顺序，另有历史写入器使用 HWC 顺序。局部评分与现有健康检查一样兼容这两种
+像素布局，并保留输入字段原值，不能拿它与 PNG 文件字节哈希比较。
+
+新增 `candidate_file_sha256` 专门保存完整 PNG 文件字节 SHA256；偏好记录中的
+`chosen_checksum`/`rejected_checksum` 使用此文件哈希，供训练时检查内容变化。
+已完成的早期 texture 产物若尚无新列，筛选器只兼容其旧字段中确实匹配文件字节的
+旧约定；不会重写其文件或元数据。真正的像素不匹配仍然报错，不关闭校验。
 
 主要新增产物：
 
