@@ -11,6 +11,8 @@ from .rewards import build_reward, preference_signature, reward_signature, valid
 
 
 def require_scalar_reward(reward_config: Mapping | None) -> None:
+    if (reward_config or {}).get("mode") == "dynamic_texture":
+        raise ValueError("dynamic_texture requires its versioned local-IQA preference pipeline")
     if (reward_config or {}).get("mode") == "dynamic":
         raise ValueError(
             "Dynamic reward requires a source-group median F baseline; this row-local scalar export "
@@ -55,6 +57,9 @@ def validate_preference_reward(train_config: Mapping) -> dict:
     normalization statistics remain checked, and every available saved input is hashed.
     """
     reward_config = train_config.get("reward") or {}
+    if reward_config.get("mode") == "dynamic_texture":
+        from .texture_preparation import validate_texture_preference
+        return validate_texture_preference(train_config)
     selection = train_config.get("preference_filter") or {}
     formula = reward_signature(reward_config)
     contract = preference_signature(reward_config, selection)

@@ -38,6 +38,9 @@ from tqdm.auto import tqdm
 from dpo.dataset import PreferencePairDataset, collate_preference_pairs
 from dpo.ema import ModelEMA
 from dpo.losses import flow_matching_gt_losses
+from dpo.spatial_config import spatial_settings, training_signature as spatial_training_signature
+from dpo.spatial import texture_weighted_mse, decoded_gt_mse, gt_timestep_indices
+from dpo.spatial_dataset import SpatialPreferenceDataset, collate_spatial_pairs
 from dpo.provenance import checkpoint_checksum
 from dpo.reference import snapshot_reference_parameters
 from dpo.tail_risk import load_config as load_dpo_config, normalize_tail_risk_config
@@ -368,6 +371,7 @@ def write_resume_metadata(
     dataset_length: int,
 ) -> None:
     from dpo.preference_provenance import validate_preference_reward
+    from dpo.spatial_config import training_signature as spatial_training_signature
 
     metadata = {
         "version": 5,
@@ -412,6 +416,9 @@ def write_resume_metadata(
         "ema_inv_gamma": float(train_config.get("ema_inv_gamma", 1.0)),
         "ema_power": float(train_config.get("ema_power", 0.75)),
     })
+    spatial_signature = spatial_training_signature(train_config)
+    if spatial_signature is not None:
+        metadata.update(version=6, spatial_dynamic=spatial_signature)
     temporary = checkpoint_dir / "dpo_resume.json.tmp"
     with temporary.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, ensure_ascii=False)
@@ -427,6 +434,7 @@ def validate_resume_metadata(
     dataset_length: int,
 ) -> dict:
     from dpo.preference_provenance import validate_preference_resume
+    from dpo.spatial_config import training_signature as spatial_training_signature
 
     with (checkpoint_dir / "dpo_resume.json").open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
@@ -472,6 +480,9 @@ def validate_resume_metadata(
             "ema_inv_gamma": float(train_config.get("ema_inv_gamma", 1.0)),
             "ema_power": float(train_config.get("ema_power", 0.75)),
         })
+    spatial_signature = spatial_training_signature(train_config)
+    if spatial_signature is not None or "spatial_dynamic" in metadata:
+        expected["spatial_dynamic"] = spatial_signature
     mismatches = {
         key: {
             "checkpoint": metadata.get(key, False) if key == "use_ema" else metadata.get(key),
@@ -715,6 +726,10 @@ def main() -> None:
     train_config = dict(config["training"])
     train_config["reward"] = copy.deepcopy(config.get("reward") or {})
     train_config["preference_filter"] = copy.deepcopy(config.get("preference_filter") or {})
+    spatial = spatial_settings(config)
+    if spatial is not None:
+        train_config["spatial_dynamic"] = copy.deepcopy(config.get("spatial_dynamic") or {})
+        spatial_training_signature(train_config)
     train_config["tail_risk"] = normalize_tail_risk_config(config.get("tail_risk"))
     tail_risk = validate_tail_risk_training(train_config)
     reward_provenance = validate_preference_reward(train_config)
@@ -726,7 +741,7 @@ def main() -> None:
     gt_x0_l1_weight = float(train_config.get("gt_x0_l1_weight", 0.0))
     if gt_flow_weight < 0.0 or gt_x0_l1_weight < 0.0:
         raise ValueError("training.gt_flow_weight and gt_x0_l1_weight must be non-negative")
-    gt_supervision_enabled = gt_flow_weight > 0.0 or gt_x0_l1_weight > 0.0
+    gt_supervision_enabled = gt_flow_weight > 0.0 or gt_x0_l1_weight > 0.0 or spatial is not None
     if not train_controlnet and not train_ra_fusion:
         raise ValueError("At least one of training.train_controlnet/train_ra_fusion must be true")
     if validation_use_ema and not use_ema:
@@ -740,6 +755,14 @@ def main() -> None:
     validate_candidate_policy(model_config, train_config)
 
     output_dir = Path(train_config["output_dir"])
+    if spatial is not None and output_dir.exists() and any(output_dir.iterdir()):
+        if not train_config.get("resume_from_checkpoint"):
+            raise FileExistsError("Use a new output_dir for dynamic_texture, or explicitly resume its checkpoint")
+        saved = load_dpo_config(output_dir / "dpo_config.yaml")
+        saved_train = {**saved["training"], "reward": saved["reward"],
+                       "spatial_dynamic": saved.get("spatial_dynamic")}
+        if spatial_training_signature(saved_train) != spatial_training_signature(train_config):
+            raise ValueError("Texture resume objective/config mismatch before overwriting the saved config")
     logging_dir = Path(train_config.get("logging_dir") or output_dir / "tensorboard")
     accelerator = Accelerator(
         gradient_accumulation_steps=int(train_config.get("gradient_accumulation_steps", 1)),
@@ -800,6 +823,8 @@ def main() -> None:
         model_path, subfolder="scheduler", revision=revision
     )
     upcast_vae = bool(train_config.get("upcast_vae", True))
+    if spatial is not None and not upcast_vae:
+        raise ValueError("dynamic_texture decoded GT MSE requires upcast_vae=true")
     vae_load_kwargs = {"torch_dtype": torch.float32} if upcast_vae else {}
     vae = AutoencoderKL.from_pretrained(
         model_path,
@@ -862,16 +887,26 @@ def main() -> None:
         weight_decay=float(train_config.get("adam_weight_decay", 0.01)),
         eps=float(train_config.get("adam_epsilon", 1e-8)),
     )
-    dataset = PreferencePairDataset(
-        train_config["preference_manifest"], resolution=int(train_config.get("resolution", 512)),
-        tail_risk_enabled=tail_risk["enabled"],
-    )
+    if spatial is None:
+        dataset = PreferencePairDataset(
+            train_config["preference_manifest"], resolution=int(train_config.get("resolution", 512)),
+            tail_risk_enabled=tail_risk["enabled"],
+        )
+    else:
+        dataset = SpatialPreferenceDataset(train_config["preference_manifest"],
+                                           train_config["gt_source_manifest"], spatial)
+        if training_logger is not None:
+            with Path(train_config["preference_manifest"]).with_name("preference_summary.json").open(encoding="utf-8") as f:
+                preparation_summary = json.load(f)
+            training_logger.info("texture_data pairs=%s independent_gt_sources=%s rejected=%s",
+                                 dataset.num_preference_pairs, len(dataset.gt_records),
+                                 json.dumps(preparation_summary["rejected"], ensure_ascii=False))
     dataloader = DataLoader(
         dataset,
         batch_size=int(train_config.get("train_batch_size", 1)),
         shuffle=True,
         num_workers=int(train_config.get("dataloader_num_workers", 0)),
-        collate_fn=collate_preference_pairs,
+        collate_fn=collate_spatial_pairs if spatial is not None else collate_preference_pairs,
     )
     max_steps = int(train_config.get("max_train_steps", 1000))
     if max_steps <= 0:
@@ -1054,6 +1089,9 @@ def main() -> None:
     )
     prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
     unique_prompts = list(dict.fromkeys(str(row.get("prompt", "")) for row in dataset.records))
+    if spatial is not None:
+        unique_prompts.extend(str(row.get("prompt", "")) for row in dataset.gt_records)
+        unique_prompts = list(dict.fromkeys(unique_prompts))
     if validation_enabled:
         unique_prompts.extend(
             validation_prompt_for_record(record, validation_config)
@@ -1168,6 +1206,8 @@ def main() -> None:
 
     scheduler_timesteps = scheduler.timesteps.to(device)
     scheduler_sigmas = scheduler.sigmas.to(device)
+    spatial_gt_indices = (gt_timestep_indices(scheduler_sigmas, scheduler.config.num_train_timesteps, spatial["gt"])
+                          if spatial is not None else None)
     progress = tqdm(
         total=max_steps,
         initial=initial_global_step,
@@ -1277,7 +1317,12 @@ def main() -> None:
                 }
                 with accelerator.autocast():
                     policy_pred = transformer(**policy_forward_kwargs)[0]
-                policy_mse = per_sample_mse(policy_pred, target)
+                if spatial is not None:
+                    mask = batch["texture_mask"].to(device=device, dtype=torch.float32)
+                    pair_mask = torch.cat([mask, mask])
+                    policy_mse = texture_weighted_mse(policy_pred, target, pair_mask, spatial["texture_strength"])
+                else:
+                    policy_mse = per_sample_mse(policy_pred, target)
                 with torch.no_grad(), accelerator.autocast():
                     reference_pred = functional_call(
                         raw_transformer,
@@ -1286,7 +1331,8 @@ def main() -> None:
                         reference_forward_kwargs,
                         strict=False,
                     )[0]
-                    reference_mse = per_sample_mse(reference_pred, target)
+                    reference_mse = (texture_weighted_mse(reference_pred, target, pair_mask, spatial["texture_strength"])
+                                     if spatial is not None else per_sample_mse(reference_pred, target))
                 chosen_policy, rejected_policy = policy_mse.split(batch_size)
                 chosen_reference, rejected_reference = reference_mse.split(batch_size)
                 sample_weights = None
@@ -1309,9 +1355,11 @@ def main() -> None:
                 gt_flow_loss = torch.zeros((), device=device, dtype=torch.float32)
                 gt_x0_l1_loss = torch.zeros((), device=device, dtype=torch.float32)
                 weighted_gt_loss = torch.zeros((), device=device, dtype=torch.float32)
-                if gt_supervision_enabled:
+                gt_rgb_mse = torch.zeros((), device=device, dtype=torch.float32)
+                spatial_gt_due = spatial is not None and global_step % spatial["gt"]["interval"] == 0
+                if gt_supervision_enabled and (spatial is None or spatial_gt_due):
                     with torch.no_grad():
-                        gt_pixels = batch["gt_pixel_values"].to(
+                        gt_pixels = batch["aux_gt_pixel_values" if spatial is not None else "gt_pixel_values"].to(
                             device=device, dtype=vae.dtype
                         )
                         gt_latents = vae.encode(gt_pixels).latent_dist.mode()
@@ -1319,21 +1367,36 @@ def main() -> None:
                             gt_latents - vae.config.shift_factor
                         ) * vae.config.scaling_factor
                         gt_latents = gt_latents.to(weight_dtype)
+                        gt_sigma, gt_timesteps, gt_noise = sigma, timesteps, shared_noise
+                        gt_control_image, gt_restoration = control_image, restoration
+                        gt_prompt, gt_pooled = prompt_embeds, pooled_embeds
+                        if spatial is not None:
+                            # Independent all-source GT stream: never substitute the
+                            # chosen/rejected clean latent for a GT reconstruction.
+                            gt_lq = batch["aux_conditioning_pixel_values"].to(device=device, dtype=vae.dtype)
+                            posterior = vae.encode(gt_lq).latent_dist.mode()
+                            gt_restoration = (posterior-vae.config.shift_factor)*vae.config.scaling_factor
+                            gt_control_image = (posterior-control_shift)*vae.config.scaling_factor
+                            gt_prompt, gt_pooled = prompt_embeddings(batch["aux_prompts"])
+                            selected = spatial_gt_indices[torch.randint(len(spatial_gt_indices), (batch_size,), device=device)]
+                            gt_timesteps = scheduler_timesteps[selected]
+                            gt_sigma = scheduler_sigmas[selected].to(weight_dtype).view(-1, 1, 1, 1)
+                            gt_noise = torch.randn_like(gt_latents)
                         gt_noisy = (
-                            (1.0 - sigma) * gt_latents + sigma * shared_noise
+                            (1.0 - gt_sigma) * gt_latents + gt_sigma * gt_noise
                         )
-                        gt_target = shared_noise - gt_latents
+                        gt_target = gt_noise - gt_latents
 
                     gt_controlnet_kwargs = dict(
                         hidden_states=gt_noisy,
-                        timestep=timesteps,
-                        encoder_hidden_states=prompt_embeds,
+                        timestep=gt_timesteps,
+                        encoder_hidden_states=gt_prompt,
                         pooled_projections=(
-                            torch.zeros_like(pooled_embeds)
+                            torch.zeros_like(gt_pooled)
                             if force_zero_pooled
-                            else pooled_embeds
+                            else gt_pooled
                         ),
-                        controlnet_cond=control_image.to(weight_dtype),
+                        controlnet_cond=gt_control_image.to(weight_dtype),
                         conditioning_scale=float(
                             model_config.get("controlnet_conditioning_scale", 1.0)
                         ),
@@ -1347,24 +1410,28 @@ def main() -> None:
                     with accelerator.autocast():
                         gt_prediction = transformer(
                             hidden_states=gt_noisy,
-                            timestep=timesteps,
-                            encoder_hidden_states=prompt_embeds,
-                            pooled_projections=pooled_embeds,
+                            timestep=gt_timesteps,
+                            encoder_hidden_states=gt_prompt,
+                            pooled_projections=gt_pooled,
                             block_controlnet_hidden_states=gt_control_samples,
-                            restoration_cond=restoration.to(weight_dtype),
+                            restoration_cond=gt_restoration.to(weight_dtype),
                             return_dict=False,
                         )[0]
-                    gt_flow_loss, gt_x0_l1_loss = flow_matching_gt_losses(
-                        gt_prediction,
-                        gt_target,
-                        gt_noisy,
-                        gt_latents,
-                        sigma,
-                    )
-                    weighted_gt_loss = (
-                        gt_flow_weight * gt_flow_loss
-                        + gt_x0_l1_weight * gt_x0_l1_loss
-                    )
+                    if spatial is not None:
+                        gt_rgb_mse = decoded_gt_mse(vae, gt_prediction, gt_noisy, gt_sigma, gt_pixels)
+                        weighted_gt_loss = spatial["lambda_fidelity"] * gt_rgb_mse
+                    else:
+                        gt_flow_loss, gt_x0_l1_loss = flow_matching_gt_losses(
+                            gt_prediction,
+                            gt_target,
+                            gt_noisy,
+                            gt_latents,
+                            sigma,
+                        )
+                        weighted_gt_loss = (
+                            gt_flow_weight * gt_flow_loss
+                            + gt_x0_l1_weight * gt_x0_l1_loss
+                        )
                     accelerator.backward(weighted_gt_loss)
 
                 loss = dpo_loss + weighted_gt_loss.detach()
@@ -1373,6 +1440,12 @@ def main() -> None:
                     "loss_gt_x0_l1": gt_x0_l1_loss.detach(),
                     "loss_gt_weighted": weighted_gt_loss.detach(),
                 })
+                if spatial is not None:
+                    stats.update(loss_dpo_texture=stats["loss_dpo"], loss_gt_rgb_mse=gt_rgb_mse.detach(),
+                                 gt_aux_active=gt_rgb_mse.new_tensor(float(spatial_gt_due)),
+                                 texture_mask_mean=mask.mean().detach(),
+                                 texture_mask_coverage=(mask >= 0.5).float().mean().detach(),
+                                 texture_pairs_in_batch=pair_weights.to(device).sum().detach())
                 log_window.update(stats, loss, pair_weights, batch["is_tail_pair"])
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(trainable, float(train_config.get("max_grad_norm", 1.0)))
@@ -1502,7 +1575,9 @@ def main() -> None:
         with (output_dir / "training_summary.json").open("w", encoding="utf-8") as handle:
             json.dump({
                 "global_step": global_step,
-                "num_preference_pairs": len(dataset),
+                "num_preference_pairs": dataset.num_preference_pairs if spatial is not None else len(dataset),
+                **({"spatial_dynamic": spatial_training_signature(train_config),
+                    "num_gt_sources": len(dataset.gt_records)} if spatial is not None else {}),
                 "beta": beta,
                 "tail_risk": tail_risk_resume_signature(train_config),
                 "reward_mode": reward_provenance["reward_mode"],

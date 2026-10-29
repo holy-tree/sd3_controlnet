@@ -92,6 +92,12 @@ Dynamic preferences use `Q + eta_fidelity * F - lambda_fidelity * max(0, median_
 Pairs with clear Q/F dominance bypass the reward margin but still pass all hard fidelity gates;
 other pairs use the reward tradeoff rule. Rebuild v3 dynamic preferences before a fresh run.
 
+The separate `config/dpo_sd3_reward_dynamic_texture.yaml` experiment adds GT-Sobel texture-weighted
+DPO, offline full-patch local IQA preferences, and a fixed-weight, full-image decoded GT MSE.
+See [Dynamic 纹理双目标训练](docs/DYNAMIC_TEXTURE_DPO.md) for preparation commands, alignment,
+versioned data, the zero-texture-strength ablation, and added training cost. Static versus this
+new mode is a complete-method comparison, not a reward-formula-only ablation.
+
 ## Main Files
 
 - `train_controlnet_sd3.py`: SD3 ControlNet and RA training entry point.

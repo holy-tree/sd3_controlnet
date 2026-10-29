@@ -24,9 +24,11 @@ per_candidate_metrics.csv
 |---|---|
 | `config/dpo_sd3_reward_static.yaml` | 独立完整的 M32 静态配置，包含评分、筛选、训练与评估全部参数 |
 | `config/dpo_sd3_reward_dynamic.yaml` | 独立完整的 M32 基础保真贡献、二次惩罚及双优优先动态配置 |
+| `config/dpo_sd3_reward_dynamic_texture.yaml` | 新增 dynamic 专用局部美学偏好、GT 纹理加权 DPO 与固定权重全图 GT MSE，见[独立说明](DYNAMIC_TEXTURE_DPO.md) |
 | `config/dpo_sd3.yaml` | 保留的历史配置，供旧实验使用；不是上述两份配置的父配置 |
 
-静态和动态各只保留一份配置，均不使用 `base_config`，也不相互继承。
+原静态和 quadratic 动态各保留一份配置，均不使用 `base_config`，也不相互继承。
+新增 `dynamic_texture` 为另一个明确版本的完整方法，独立准备局部评分和偏好，不能混用旧数据。
 修改某种模式时，直接编辑该模式的文件；另一模式不会自动改变。
 两份配置共用 M32 候选评分，分别保存偏好、训练和评估结果。做公平对照时，请同步共同超参数。
 静态 PSNR 下界消融也直接修改 `dpo_sd3_reward_static.yaml`，不再使用额外叠加文件。
@@ -50,7 +52,8 @@ per_candidate_metrics.csv
 
 ### 当前生效的训练设置
 
-以下是两份独立 M32 配置直接定义的值，以实际 YAML 为准：
+以下列出 static 配置的训练基准；quadratic dynamic 的步数/学习率以其 YAML 为准，
+`dynamic_texture` 的设置与新增成本见[独立说明](DYNAMIC_TEXTURE_DPO.md)：
 
 | 参数 | 当前值 |
 |---|---:|

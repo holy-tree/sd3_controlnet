@@ -23,6 +23,12 @@ def main() -> None:
     parser.add_argument("--skip_file_check", action="store_true")
     args = parser.parse_args()
     config = load_config(args.config)
+    if (config.get("reward") or {}).get("mode") == "dynamic_texture":
+        if args.candidate_metrics_path or args.output_dir or args.skip_file_check:
+            raise ValueError("Use explicit versioned texture config paths; CLI legacy overrides are unsupported")
+        from dpo.texture_preparation import build_texture_preferences
+        print(json.dumps(build_texture_preferences(config), indent=2, ensure_ascii=False))
+        return
     generation = config["candidate_generation"]
     filtering = config["preference_filter"]
     candidate_metrics = args.candidate_metrics_path or filtering.get(
