@@ -98,6 +98,14 @@ See [Dynamic 纹理双目标训练](docs/DYNAMIC_TEXTURE_DPO.md) for preparation
 versioned data, the zero-texture-strength ablation, and added training cost. Static versus this
 new mode is a complete-method comparison, not a reward-formula-only ablation.
 
+After the fixed-GT-weight probe, use [三模型留出验证与续训](docs/TEXTURE_FINAL_VALIDATION.md)
+to freeze DPO-disjoint sources, compare raw SFT/base/candidate outputs with paired seeds,
+and prepare a monitored continuation without changing the loss or reusing test data for tuning.
+
+For an explicit equal-budget comparison of fixed fidelity weights (1000/2000/5000/10000),
+see [多 lambda 单卡对照](docs/TEXTURE_LAMBDA_SWEEP.md). Preparation only writes configs;
+training is explicit, and all checkpoints share one held-out cohort and one SFT baseline.
+
 ## Main Files
 
 - `train_controlnet_sd3.py`: SD3 ControlNet and RA training entry point.

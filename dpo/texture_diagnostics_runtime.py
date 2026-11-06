@@ -79,7 +79,7 @@ class PipelineRunner(torch.nn.Module):
 
 
 class RealEngine:
-    def __init__(self, args, snapshot, runtime):
+    def __init__(self, args, snapshot, runtime, extra_prompts=()):
         # Deliberately import the actual loader, not a reimplementation or mock.
         from scripts import train_dpo_sd3 as trainer
         self.trainer, self.args = trainer, args
@@ -184,6 +184,7 @@ class RealEngine:
             "maximum":float(self.sigmas[self.gt_indices].to(self.dtype).max())}
         self.force_zero = bool(getattr(self.controlnet.config, "force_zeros_for_pooled_projection", False))
         prompts = {""}
+        prompts.update(extra_prompts)
         for item in self.plan:
             for indices in item["indices"]:
                 for index in indices:

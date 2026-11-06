@@ -1,5 +1,9 @@
 # dynamic_texture 真实模型诊断（只诊断，不训练）
 
+已有梯度与15张图的机制证据、希望收敛验证后继续训练时，见
+[固定留出集三模型终检与续训](TEXTURE_FINAL_VALIDATION.md)。
+它不再重复申请梯度临时空间，重点检查DPO未见输入上的完整推理、整图美学和seed稳定性。
+
 入口：`scripts/diagnose_dynamic_texture.py`。本工具不构造 optimizer，不调用 step，
 不裁剪梯度，不改奖励、选对、GT 目标或训练配置；现有 trainer 文件保持不变。
 真实运行只调用项目实际 SD3/ControlNet/RA/VAE 加载函数，不提供小模型或 CPU 模型替代。
