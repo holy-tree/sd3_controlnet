@@ -103,6 +103,9 @@ dot(g_F,g_total) = dot(g_Q,g_F) + lambda_fidelity*norm(g_F)^2
 
 ## 产物与证据等级
 
+完成真实诊断后，可按[固定 GT 权重短程探针](TEXTURE_FIDELITY_PROBE.md)处理：
+先 CPU 复查缺失梯度和固定系数的代数影响，再显式生成一组不覆盖原实验的单变量配置。
+
 ```text
 output/
   diagnostics.csv              # row_type 区分 pair_sample / micro_gradient /
