@@ -8,6 +8,8 @@ from __future__ import annotations
 import hashlib
 import math
 import mmap
+import shutil
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -16,6 +18,21 @@ import numpy as np
 SCOPES = ("all", "controlnet", "ra")
 CHUNK = 262144
 PAGE_RELEASE_FLOATS = 16*CHUNK  # ~16 MiB per mapped vector between writeback/release
+
+
+def gradient_workspace(output_directory, scratch_parent, required_bytes):
+    """Choose a private workspace; capacity checks do not allocate gradient files."""
+    parent = Path(scratch_parent).expanduser().resolve() if scratch_parent else Path(output_directory).resolve()
+    if not parent.is_dir():
+        raise ValueError("Gradient scratch parent must already exist: " + str(parent))
+    free = shutil.disk_usage(parent).free
+    if free < required_bytes:
+        raise RuntimeError(
+            f"Diagnostic scratch disk {parent}: need {required_bytes} bytes "
+            f"({required_bytes/1024**3:.2f} GiB), available {free} bytes ({free/1024**3:.2f} GiB). "
+            "Use --scratch-dir on a different disk, or --inference-only to skip gradient measurement."
+        )
+    return (parent/("texture_diag_grad_"+uuid.uuid4().hex) if scratch_parent else parent/"gradient_buffers"), free
 
 
 def release_pages(*vectors):
@@ -122,8 +139,21 @@ class GradientLedger:
         self.registry, self.accumulation = registry, accumulation
         self.size = sum(e["numel"] for e in registry)
         self.files = [self.directory/(name+".f32") for name in ("q_micro", "q_acc", "f_acc")]
-        self.q_micro, self.q_acc, self.f_acc = [np.memmap(p, dtype="float32", mode="w+", shape=(self.size,)) for p in self.files]
-        self.reset()
+        created = []
+        try:
+            for path in self.files:
+                created.append(np.memmap(path, dtype="float32", mode="w+", shape=(self.size,)))
+            self.q_micro, self.q_acc, self.f_acc = created
+            self.reset()
+        except BaseException:
+            # Clean only files in the private directory created above. Never
+            # leave partially allocated multi-GB vectors after ENOSPC/quota errors.
+            for vector in created:
+                vector._mmap.close()
+            for path in self.files:
+                path.unlink(missing_ok=True)
+            self.directory.rmdir()
+            raise
 
     def reset(self):
         for start in range(0, self.size, CHUNK):

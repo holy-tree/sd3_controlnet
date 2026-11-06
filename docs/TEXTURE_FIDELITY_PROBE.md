@@ -99,6 +99,10 @@ CUDA_VISIBLE_DEVICES=0 python -m scripts.train_dpo_sd3 --config "$BASE/texture_f
 
 ## 4. 使用相同种子再测两组
 
+若梯度临时盘空间不足，可按[磁盘不足恢复入口](DYNAMIC_TEXTURE_DIAGNOSTICS.md#磁盘空间不足时不必重训)
+先使用 `--inference-only` 检查现有 checkpoint，不重新执行 200 步训练；
+需要完整梯度时用 `--scratch-dir` 指向空间充足的磁盘。
+
 ```bash
 BASE=/root/autodl-tmp/sd3/experiment
 RUNS="$BASE/Texture_FidelityProbe_200_v1"

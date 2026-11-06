@@ -43,6 +43,37 @@ all-reduce 梯度。每个窗口按一个 `(DPO天气, GT天气)` 层抽样，�
 haze/haze；完全保留 dataset 的原 pair/独立 GT 索引映射，不换 GT 来凑同一天气。
 如果没有某个天气或同天气组合，会明确标记。分层抽样不是精确恢复训练时下一批数据。
 
+### 磁盘空间不足时，不必重训
+
+梯度诊断的三个 float32 参数向量可能需要约 12.86 GB（11.98 GiB），
+实际大小由可训练参数数目决定，与 `--batches` 或 lambda 大小无关。
+减少 batch 数或关闭逐样本梯度不会缩小这三个向量。
+空间检查发生在分配之前；这种失败通常不会在该次报告目录留下 12 GB 的梯度文件。
+空表仅表示未测量，不表示梯度为零，也不能用于推断权重效果。
+
+可以先只检查已经训练好的两个 checkpoint 的真实一步/完整推理，**无需梯度临时向量**：
+
+```bash
+BASE=/root/autodl-tmp/sd3/experiment
+RUNS="$BASE/Texture_FidelityProbe_200_v1"
+for ARM in baseline fidelity; do
+  python -m scripts.diagnose_dynamic_texture --config "$RUNS/$ARM/dpo_config.yaml" --checkpoint "$RUNS/$ARM/checkpoint-200" --batches 3 --seed 42 --inference-only --device cuda:0 --output "$BASE/diagnostic_fidelity_probe_${ARM}_200_infer_only_v1"
+done
+```
+
+`--inference-only` 自动启用完整推理，跳过全部 gradient/backward/DPO 拉差检查；
+仍使用真实模型、原采样计划、GT 文件哈希、同条件 sigma/noise/prompt/seed、
+PSNR/SSIM/LPIPS、可视化及参数/参考不变校验。
+`--batches` 此时仅控制相同的分层抽样计划，不表示执行了这些梯度窗口。
+它仍需要 GPU 和保存图像/报告的少量磁盘，不能代替新 checkpoint 的梯度结论。
+
+若要完成梯度诊断，先用 `df -h` 找出真实磁盘上有足够空间的目录，再添加
+`--scratch-dir /实际存在且空间充足的目录`。该选项将三个向量放到私有的
+`texture_diag_grad_<uuid>` 子目录，完成/正常异常清理时只删除自己的文件，不删除父目录内容。
+`--keep-gradient-buffers` 才会显式保留向量。不要选 `/dev/shm` 等 RAM-backed tmpfs 来绕过磁盘限制，
+否则会转成容器内存压力。完成报告仍写入 `--output`；原训练/候选/偏好路径不动。
+两组按顺序诊断，同一个临时盘空间会在两次运行间复用，不需同时预留两倍空间。
+
 ## 梯度测量口径
 
 ```text

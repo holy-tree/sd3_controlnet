@@ -3,16 +3,56 @@
 No tiny model replaces real inference: these tests use explicit known vectors.
 """
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
 
-from dpo.texture_diagnostics import GradientLedger, gradient_metrics, distribution, tensor_digest
+from dpo.texture_diagnostics import GradientLedger, gradient_metrics, distribution, tensor_digest, gradient_workspace
 
 
 class GradientMeasurementMathTest(unittest.TestCase):
+    def test_external_scratch_uses_its_disk_and_owns_only_private_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            report=root/"report"; report.mkdir()
+            disk=root/"scratch_disk"; disk.mkdir()
+            marker=disk/"user_notes.txt"; marker.write_text("keep",encoding="utf-8")
+            with patch("dpo.texture_diagnostics.shutil.disk_usage",return_value=types.SimpleNamespace(free=1024)) as query:
+                workspace, free=gradient_workspace(report,disk,48)
+                query.assert_called_once_with(disk.resolve())
+            self.assertEqual(workspace.parent,disk.resolve())
+            self.assertFalse(workspace.exists())
+            p=torch.nn.Parameter(torch.zeros(4))
+            ledger=GradientLedger(workspace,[{"parameter":p,"name":"v","numel":4,"groups":{"all"}}],1)
+            ledger.close()
+            self.assertFalse(workspace.exists())
+            self.assertEqual(marker.read_text(),"keep")
+            with patch("dpo.texture_diagnostics.shutil.disk_usage",return_value=types.SimpleNamespace(free=1)):
+                with self.assertRaisesRegex(RuntimeError,"inference-only"):
+                    gradient_workspace(report,None,48)
+            self.assertFalse((report/"gradient_buffers").exists())
+
+    def test_partial_scratch_allocation_failure_cleans_private_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory=Path(temporary)/"owned"
+            original=np.memmap
+            count=0
+            def failing(*args,**kwargs):
+                nonlocal count
+                count+=1
+                if count==3:
+                    raise OSError("simulated disk quota error")
+                return original(*args,**kwargs)
+            p=torch.nn.Parameter(torch.zeros(4))
+            with patch("dpo.texture_diagnostics.np.memmap",side_effect=failing):
+                with self.assertRaisesRegex(OSError,"quota"):
+                    GradientLedger(directory,[{"parameter":p,"name":"v","numel":4,"groups":{"all"}}],1)
+            self.assertFalse(directory.exists())
+
     def test_signed_dot_and_weighted_norm_formula(self):
         result = gradient_metrics(25.0, 10.0, -11.0, .2)
         self.assertAlmostEqual(result["dpo_norm"], 5)

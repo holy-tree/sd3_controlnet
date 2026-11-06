@@ -7,7 +7,6 @@ import hashlib
 import json
 import math
 import random
-import shutil
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from pathlib import Path
@@ -26,7 +25,7 @@ from .spatial_config import spatial_settings, training_signature
 from .spatial_dataset import SpatialPreferenceDataset, collate_spatial_pairs
 from .tail_risk_training import training_dpo_loss
 from .texture_diagnostics import (GradientLedger, SCOPES, correlation, distribution,
-                                  individual_gradient_norms, parameter_registry, tensor_digest)
+                                  individual_gradient_norms, parameter_registry, tensor_digest, gradient_workspace)
 
 
 def sampling_plan(dataset, windows, batch_size, accumulation, seed):
@@ -105,7 +104,7 @@ class RealEngine:
         mixed = self.train.get("mixed_precision", "no")
         self.dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "no": torch.float32, "float32": torch.float32}[mixed]
         self.loss_scale = 1.0
-        if mixed == "fp16":
+        if mixed == "fp16" and not args.inference_only:
             scaler_file = self.checkpoint/"scaler.pt"
             if args.loss_scale is not None:
                 self.loss_scale = args.loss_scale
@@ -123,8 +122,10 @@ class RealEngine:
         self.plan, bucket_counts = sampling_plan(self.dataset, args.batches, self.batch_size, self.accumulation, args.seed)
         runtime.update(sampling_buckets=bucket_counts, sampling_plan=self.plan,
                        missing_dpo_weathers=[w for w in ("rain", "snow", "haze") if not any(p["weather"] == w for p in self.plan)],
-                       weights="raw checkpoint training parameters; not EMA", loss_scale=self.loss_scale,
-                       backward_factor=self.backward_factor, original_world_size=self.meta["num_processes"],
+                       weights="raw checkpoint training parameters; not EMA",
+                       loss_scale=None if args.inference_only else self.loss_scale,
+                       backward_factor=None if args.inference_only else self.backward_factor,
+                       original_world_size=self.meta["num_processes"],
                        accumulation_scope="single_rank_configured_microbatch_mean_average")
         trainer.set_seed(int(self.train.get("seed", 42)))
         model_path = self.model_config["pretrained_model_name_or_path"]
@@ -352,6 +353,10 @@ class RealEngine:
         for source in tqdm(source_records, desc="Paired real inference", unit="source"):
             if not source_is_training(source):
                 raise ValueError("Refusing held-out/test paths in training diagnostic")
+            from .tail_risk import file_sha256
+            for name in ("gt", "lq"):
+                if file_sha256(source[name+"_path"]) != source[name+"_sha256"]:
+                    raise ValueError("GT/LQ source changed since preference preparation")
             key = tuple(source["source_key"])
             sid = hashlib.sha256(json.dumps(key).encode()).hexdigest()[:12]
             folder = directory/"visualizations"/(key[0]+"_"+sid)
@@ -431,6 +436,8 @@ def summarize_gradients(rows):
     summary = {}
     for kind in ("micro_gradient", "accum_gradient"):
         records = [row for row in rows if row.get("row_type") == kind]
+        if not records:
+            continue
         combinations = sorted({(r["weather"],r["gt_weather"]) for r in records})
         for group in SCOPES:
             for weather, gt_weather in [("all","all"), *combinations]:
@@ -451,7 +458,10 @@ def summarize_runtime(runtime, rows):
     all_pairs = [r for r in rows if r.get("row_type") == "pair_sample" and r.get("pair_weight",0)>0]
     pairs = [r for r in all_pairs if r.get("dpo_metrics_finite")]
     findings = []
-    findings.append(f"有效偏好样本中 DPO 数值非有限的对={len(all_pairs)-len(pairs)}；这些样本不作为正常的拉差/饱和统计。")
+    if runtime.get("gradient_diagnostics_skipped"):
+        findings.append("本次显式使用仅推理模式，未测量梯度或DPO拉差，也未分配梯度临时向量。")
+    elif all_pairs:
+        findings.append(f"有效偏好样本中 DPO 数值非有限的对={len(all_pairs)-len(pairs)}；这些样本不作为正常的拉差/饱和统计。")
     runtime["dpo_summary"] = {}
     for weather in ["all", *sorted({r["weather"] for r in pairs})]:
         chosen = [r for r in pairs if weather == "all" or r["weather"] == weather]
@@ -466,7 +476,7 @@ def summarize_runtime(runtime, rows):
                 "sigmoid_rounded_one_count":sum(r["sigmoid_rounded_one"] for r in chosen)}
             findings.append(f"DPO {weather}: {sum(r['both_fm_errors_worse_but_margin_better'] for r in chosen)}/{n} 对在 chosen/rejected FM 误差都高于参考时仍得到更优偏好差；sigmoid 数值舍入到1的对={sum(r['sigmoid_rounded_one'] for r in chosen)}，logit导数为0的对={sum(r['dpo_logit_coefficient']==0 for r in chosen)}。")
     runtime["per_sample_gradient_summary"] = {}
-    for scope in SCOPES:
+    for scope in (SCOPES if pairs else ()):
         field = "individual_gradient_norm_"+scope
         available = [r for r in pairs if field in r]
         norms = [r.get(field) for r in available]
@@ -495,9 +505,11 @@ def summarize_runtime(runtime, rows):
     ratios = distribution([r.get("gt_to_dpo_ratio") for r in combined])
     finite_cos = [r["cosine"] for r in combined if r.get("cosine") is not None]
     dot_bad = [r for r in combined if r.get("gt_due") and r.get("scheduled_gt_dot_total") is not None and r["scheduled_gt_dot_total"]<0]
-    findings.append(f"累计梯度：加权GT/DPO范数比中位数={ratios['median']}；有效余弦中负值={sum(x<0 for x in finite_cos)}/{len(finite_cos)}；实际启用GT的窗口中 g_F·g_total<0 的窗口={len(dot_bad)}。这些数值不设经验合理性阈值。")
+    if combined:
+        findings.append(f"累计梯度：加权GT/DPO范数比中位数={ratios['median']}；有效余弦中负值={sum(x<0 for x in finite_cos)}/{len(finite_cos)}；实际启用GT的窗口中 g_F·g_total<0 的窗口={len(dot_bad)}。这些数值不设经验合理性阈值。")
     samples_with_alignment = [r for r in pairs if "mask_alignment_close_at_1e_5" in r]
-    findings.append(f"返回张量的GT/mask对齐数值复查：{sum(not r['mask_alignment_close_at_1e_5'] for r in samples_with_alignment)}/{len(samples_with_alignment)} 超出1e-5数值容差；该检查包含RGB归一化往返误差，详情见CSV，不能单独当作裁剪错位的证据。")
+    if samples_with_alignment:
+        findings.append(f"返回张量的GT/mask对齐数值复查：{sum(not r['mask_alignment_close_at_1e_5'] for r in samples_with_alignment)}/{len(samples_with_alignment)} 超出1e-5数值容差；该检查包含RGB归一化往返误差，详情见CSV，不能单独当作裁剪错位的证据。")
     full = [r for r in rows if r.get("row_type") == "inference_compare"]
     cases = Counter(r["case"] for r in full)
     if full:
@@ -522,9 +534,13 @@ def summarize_runtime(runtime, rows):
         priorities.append("存在情况C样本：优先复查一步GT代理与完整采样的一致性；先复现该小组样本，不直接增加GT权重。")
     if dot_bad:
         priorities.append("存在累计梯度一阶冲突：优先复查对应来源/时间步的冲突；加权GT范数比需同时考虑，不能只根据负余弦选λ。")
-    if not priorities:
+    if not combined and not full:
+        priorities = ["本次没有完成梯度或配对完整推理测量。先排除诊断执行失败原因；不能根据空表调整λ或判断训练效果。"]
+    elif not combined:
+        priorities.append("本次无梯度测量，不能判定新检查点的GT强弱或冲突；需要该结论时，改用有足够空间的 --scratch-dir 重新做梯度诊断。")
+    elif not priorities:
         priorities.append("先结合累计范数比及完整推理复现结果判断：只有GT相对弱、冲突证据少且代理方向一致时，再做一次加强固定GT权重的受控验证；本次不自动修改。")
-    if not full:
+    if not full and combined:
         priorities.append("补做 --full-inference，以区分代理失配(C)与两者同步退化(D)，避免仅凭梯度比例决定改训练代理。")
     runtime.update(findings=findings, priorities=priorities)
     runtime["measured_microbatches"] = sum(r.get("row_type") == "micro_gradient" and r.get("scope") == "all" for r in rows)
@@ -539,14 +555,19 @@ def run_diagnostics(args, state, rows, directory):
     try:
         engine = RealEngine(args, state["snapshot"], runtime)
         disk_bytes = 3*4*sum(e["numel"] for e in engine.registry)
-        runtime["gradient_scratch_bytes"] = disk_bytes
-        print(f"[diagnose] temporary gradient scratch: {disk_bytes/1024**3:.2f} GiB; CPU vectors are streamed in chunks", flush=True)
-        if shutil.disk_usage(directory).free < disk_bytes:
-            raise RuntimeError(f"Need {disk_bytes} bytes of free diagnostic scratch disk for bounded-RAM gradient vectors")
-        ledger = GradientLedger(directory/"gradient_buffers", engine.registry, engine.accumulation)
+        runtime["gradient_diagnostics_skipped"] = args.inference_only
+        runtime["gradient_scratch_bytes_if_measured"] = disk_bytes
+        runtime["gradient_scratch_bytes"] = 0 if args.inference_only else disk_bytes
+        if args.inference_only:
+            print("[diagnose] inference-only: skipping all gradient probes; no gradient scratch files", flush=True)
+        else:
+            print(f"[diagnose] temporary gradient scratch: {disk_bytes/1024**3:.2f} GiB; CPU vectors are streamed in chunks", flush=True)
+            workspace, available = gradient_workspace(directory, args.scratch_dir, disk_bytes)
+            runtime.update(gradient_workspace=str(workspace), gradient_scratch_available_bytes=available)
+            ledger = GradientLedger(workspace, engine.registry, engine.accumulation)
         coefficient = engine.settings["lambda_fidelity"]
         runtime["executed"] = True
-        for window, plan in enumerate(engine.plan):
+        for window, plan in enumerate([] if args.inference_only else engine.plan):
             ledger.reset()
             step = int(engine.meta["global_step"])+window
             due = step % engine.settings["gt"]["interval"] == 0
@@ -615,8 +636,9 @@ def run_diagnostics(args, state, rows, directory):
                 rows.append({"row_type":"accum_gradient","window":window,"weather":plan["weather"],
                              "gt_weather":plan["gt_weather"],"scope":scope,"microbatch_count":engine.accumulation,
                              "local_effective_batch":engine.batch_size*engine.accumulation, **values})
-        ledger.close(args.keep_gradient_buffers)
-        ledger = None
+        if ledger is not None:
+            ledger.close(args.keep_gradient_buffers)
+            ledger = None
         if args.full_inference:
             selected, counts, seen = [], Counter(), set()
             for plan in engine.plan:

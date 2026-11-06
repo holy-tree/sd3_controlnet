@@ -138,8 +138,11 @@ def report(directory, state, rows):
     for item in state["code_audit"]["findings"]:
         lines.append(f"- `{item['evidence']}`：{item['finding']}")
     lines += ["", "### 尚未验证的推测", "",
-              "- GT 权重较弱、目标冲突、一步 GT 代理和完整采样的分布差异都可能相关；默认 YAML 的 λ 或 β 数值本身不是证据。",
-              "- 没有 paired full-inference 数据时，不能区分情况 C（一步代理改善、完整 PSNR 下降）和 D（两者都变差）。"]
+              "- GT 权重较弱、目标冲突、一步 GT 代理和完整采样的分布差异都可能相关；默认 YAML 的 λ 或 β 数值本身不是证据。"]
+    if not runtime.get("inference_summary"):
+        lines.append("- 本次尚无已完成的 paired full-inference 数据，不能区分情况 C（一步代理改善、完整 PSNR 下降）和 D（两者都变差）。")
+    if runtime.get("gradient_diagnostics_skipped"):
+        lines.append("- 本次仅推理，不重新判断新检查点的梯度强弱或冲突频率。")
     snapshot = state.get("snapshot")
     lines += ["", "## 实际配置与输入"]
     if snapshot:
@@ -158,15 +161,21 @@ def report(directory, state, rows):
         lines += ["", "```json", json.dumps(values, indent=2, ensure_ascii=False), "```"]
     else:
         lines += ["", "未取得实际训练快照，β、λ、纹理强度、GT sigma/间隔和有效 batch 均未核实；没有使用默认 YAML 冒充。"]
-    lines += ["", "## 梯度统计", "", "完整均值、中位数、p05/p25/p75/p95 与缺失状态见 `diagnostic_state.json`，逐样本值见 `diagnostics.csv`。", "",
-              "|层级/参数/天气条件|有效窗口/微批|DPO范数中位数|加权GT范数中位数|GT/DPO 中位数 [p05,p95]|余弦均值|负余弦|负 scheduled GT·total|状态计数|",
-              "|---|---:|---:|---:|---|---:|---:|---:|---|"]
+    lines += ["", "## 梯度统计"]
+    if runtime.get("gradient_summary"):
+        lines += ["", "完整均值、中位数、p05/p25/p75/p95 与缺失状态见 `diagnostic_state.json`，逐样本值见 `diagnostics.csv`。", "",
+                  "|层级/参数/天气条件|有效窗口/微批|DPO范数中位数|加权GT范数中位数|GT/DPO 中位数 [p05,p95]|余弦均值|负余弦|负 scheduled GT·total|状态计数|",
+                  "|---|---:|---:|---:|---|---:|---:|---:|---|"]
+    else:
+        lines += ["", "本次未测得梯度。仅推理模式或执行失败不代表梯度为零，也不能据此判断 λ。"]
     def fmt(value):
         return f"{value:.5g}" if isinstance(value, (float,int)) else "N/A"
     for key, summary in runtime.get("gradient_summary", {}).items():
         q, f, r, c = (summary[n] for n in ("dpo_norm", "weighted_gt_norm", "gt_to_dpo_ratio", "cosine"))
         lines.append(f"|{key}|{q['n']}|{fmt(q['median'])}|{fmt(f['median'])}|{fmt(r['median'])} [{fmt(r['p05'])},{fmt(r['p95'])}]|{fmt(c['mean'])}|{summary['negative_cosine_count']}/{summary['cosine_valid_count']}|{summary['negative_scheduled_gt_dot_total_count']}/{summary['scheduled_dot_valid_count']}|{summary['status_counts']}|")
     lines += ["", "## DPO 拉差与样本贡献"]
+    if not runtime.get("dpo_summary"):
+        lines += ["", "本次没有 DPO 拉差/逐对梯度测量。"]
     for weather, values in runtime.get("dpo_summary", {}).items():
         lines.append(f"- {weather}：logit 中位数={fmt(values['logit']['median'])}，p05={fmt(values['logit']['p05'])}，p95={fmt(values['logit']['p95'])}；rejected 正贡献份额中位数={fmt(values['rejected_push_fraction']['median'])}。")
     for scope, values in runtime.get("per_sample_gradient_summary", {}).items():
@@ -206,13 +215,21 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--inspect-only", action="store_true")
     p.add_argument("--full-inference", action="store_true", help="Paired real SFT/current inference on sampled TRAINING GT sources")
+    p.add_argument("--inference-only", action="store_true",
+                   help="Only paired one-step/full inference; skip all gradient probes and their disk vectors")
     p.add_argument("--inference-samples-per-weather", type=int, default=1)
     p.add_argument("--local-iqa", action="store_true", help="After releasing SD3, score both full outputs with SAME frozen local stats")
     p.add_argument("--per-sample-gradients", action=argparse.BooleanOptionalAction, default=True,
                    help="Measure actual per-pair gradient contribution norms (extra backward passes)")
     p.add_argument("--keep-gradient-buffers", action="store_true", help="Retain diagnostic-only disk vectors; otherwise delete them after measuring")
+    p.add_argument("--scratch-dir", help="Existing directory on a disk with enough free space; creates and cleans a private gradient workspace")
     p.add_argument("--loss-scale", type=float, help="Explicit FP16 scaler override, recorded; otherwise read checkpoint scaler.pt")
     args = p.parse_args()
+    if args.inference_only:
+        args.full_inference = True
+        args.per_sample_gradients = False
+        if args.keep_gradient_buffers:
+            p.error("--inference-only does not create gradient buffers")
     if args.batches <= 0 or args.inference_samples_per_weather <= 0:
         p.error("counts must be positive")
     if not args.inspect_only and (not args.config or not args.checkpoint):
@@ -225,6 +242,10 @@ def parse_args():
             protected = Path(value).expanduser().resolve()
             if output == protected or protected in output.parents:
                 p.error("diagnostic output must be separate from the training/checkpoint directory")
+            if args.scratch_dir and not args.inference_only:
+                scratch = Path(args.scratch_dir).expanduser().resolve()
+                if scratch == protected or protected in scratch.parents:
+                    p.error("gradient scratch must be outside the training/checkpoint directory")
     return args
 
 
