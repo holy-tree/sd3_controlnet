@@ -1,5 +1,8 @@
 # Dynamic 专用：GT 纹理加权 DPO + 全图 GT MSE
 
+需要定位美学提升但 PSNR 下降时，见[真实模型诊断](DYNAMIC_TEXTURE_DIAGNOSTICS.md)：
+分别测量两项目标梯度、DPO 拉差和同条件一步/完整推理，不改变训练方案。
+
 本实验使用 `config/dpo_sd3_reward_dynamic_texture.yaml`，奖励模式为
 `dynamic_texture`，数据 schema 为 `sd3_dynamic_texture_v1`。
 原 static 和旧 quadratic dynamic 的奖励、选对公式以及默认训练路径继续保留。
