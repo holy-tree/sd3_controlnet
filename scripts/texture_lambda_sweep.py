@@ -24,6 +24,8 @@ def main():
     prepare.add_argument("--run-root", required=True, help="Separate training output root with enough disk")
     prepare.add_argument("--lambdas", default="1000,2000,5000,10000")
     prepare.add_argument("--steps", type=int, default=200)
+    prepare.add_argument("--storage-mode", choices=("full", "weights-only"), default="full",
+                         help="weights-only: after each NEW run completes, retain raw evaluation weights/config/logs and delete its generated optimizer/RNG/EMA/redundant exports; reused runs are preserved")
     prepare.add_argument("--reuse", action="append", default=[], metavar="LAMBDA=RUN_DIRECTORY", help="Explicitly reuse a matching SFT-started run; repeatable")
     train = sub.add_parser("train", help="Explicitly start single-GPU serial training; stop on first failure")
     train.add_argument("--gpu", default="0", help="One physical CUDA GPU index")
@@ -44,7 +46,7 @@ def main():
                 parser.error("--reuse expects unique LAMBDA=RUN_DIRECTORY entries")
             reuse[float(key)] = value
         plan = prepare_sweep(args.validation_plan, args.output, args.run_root,
-                             [float(v) for v in args.lambdas.split(",")], args.steps, reuse)
+                             [float(v) for v in args.lambdas.split(",")], args.steps, reuse, args.storage_mode)
         print("Prepared; training NOT started:", Path(args.output).resolve() / "sweep_plan.json")
         print("Arms:", ", ".join(f"{a['lambda']:g}" + (" (reuse)" if a["reused_snapshot"] else " (new training)") for a in plan["arms"]))
         print(json.dumps(storage_estimate(plan, pending_training_arms(plan)), indent=2))

@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from decimal import Decimal
 from pathlib import Path
 
@@ -103,7 +104,9 @@ def safe_separate(path, protected):
             raise ValueError("Use separate experiment directories: " + str(path) + " vs " + str(old))
 
 
-def prepare_sweep(validation_plan, output, run_root, lambdas=(1000, 2000, 5000, 10000), steps=200, reuse=None):
+def prepare_sweep(validation_plan, output, run_root, lambdas=(1000, 2000, 5000, 10000), steps=200, reuse=None, storage_mode="full"):
+    if storage_mode not in ("full", "weights-only"):
+        raise ValueError("Unknown sweep storage mode")
     validation_plan = Path(validation_plan).expanduser().resolve()
     cohort = read_json(validation_plan)
     if cohort.get("schema") != SCHEMA or cohort.get("role") not in ("dpo_holdout", "external_validation"):
@@ -168,6 +171,7 @@ def prepare_sweep(validation_plan, output, run_root, lambdas=(1000, 2000, 5000, 
         arm["config_sha256"] = digest(arm["config"])
     plan = {"schema": SWEEP_SCHEMA, "validation_plan": str(validation_plan), "validation_plan_sha256": digest(validation_plan),
             "source_snapshot": source, "input_files_sha256": inputs, "run_root": str(run_root), "steps": steps,
+            "storage_mode": storage_mode,
             "arms": arms, "protocol_sha256": {relative: digest(ROOT / relative) for relative in PROTOCOL_FILES},
             "comparison": "same SFT initialization, fixed lambda, equal optimizer-step budget; raw checkpoint vs SFT"}
     write_json(output / "sweep_plan.json", plan)
@@ -205,7 +209,8 @@ def storage_estimate(plan, pending=None):
     if not (checkpoint / "dpo_resume.json").is_file():
         raise FileNotFoundError("Source checkpoint needed for the storage estimate: " + str(checkpoint))
     size = sum(p.stat().st_size for p in checkpoint.rglob("*") if p.is_file())
-    exported = sum(p.stat().st_size for sub in ("controlnet", "ra_fusion") for p in (checkpoint / sub).rglob("*") if p.is_file())
+    raw_bytes = sum(p.stat().st_size for sub in ("controlnet", "ra_fusion") for p in (checkpoint / sub).rglob("*") if p.is_file())
+    exported = raw_bytes
     if (checkpoint / "ema_state.pt").is_file():
         exported += (checkpoint / "ema_state.pt").stat().st_size
     if pending is None:
@@ -217,11 +222,128 @@ def storage_estimate(plan, pending=None):
     cohort = read_json(plan["validation_plan"])
     # Three lossless RGB outputs (LQ/GT/prediction) per observation, plus overhead.
     validation = len(cohort["sources"]) * len(cohort["seeds"]) * (len(plan["arms"]) + 1) * (9 * cohort["resolution"] ** 2 + 4096)
-    estimate = len(pending) * (size + exported) + validation + 1024 ** 3
+    mode = plan.get("storage_mode", "full")
+    retained = raw_bytes + (checkpoint / "dpo_resume.json").stat().st_size + Path(plan["source_snapshot"]["config_path"]).stat().st_size + 1024 ** 2
+    # The trainer still writes a FULL run first. Compact only after successful
+    # completion, retaining all previous raw policies during the next run.
+    training_peak = (max(0, len(pending) - 1) * retained + size + exported if pending else 0) if mode == "weights-only" else len(pending) * (size + exported)
+    estimate = training_peak + validation + 1024 ** 3
     return {"pending_training_runs": len(pending), "checkpoint_bytes": size, "per_run_checkpoint_plus_export_bytes": size + exported,
+            "storage_mode": mode, "raw_policy_bytes": raw_bytes, "retained_per_new_run_bytes": retained if mode == "weights-only" else size + exported,
+            "estimated_training_peak_bytes": training_peak,
             "estimated_validation_bytes": validation, "estimated_additional_peak_bytes": estimate, "free_bytes": free,
             "filesystem_check_path": str(parent), "enough_space_estimate": free >= estimate,
-            "note": "Retains every arm; one final checkpoint plus final policy/EMA exports per run. Validation reserved conservatively on training disk; check evaluation disk separately if different."}
+            "note": ("Explicit weights-only mode: each NEW completed run retains raw policy/config/metadata/logs; optimizer/RNG/EMA and redundant exports are removed. Reused runs are never compacted. Peak includes one full run before cleanup. " if mode == "weights-only" else "Retains every arm with full training states and final exports. ") +
+                    "Validation reserved conservatively on training disk; check evaluation disk separately if different."}
+
+
+def atomic_json(path, value):
+    """Replace a small workflow record without exposing a truncated JSON."""
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        write_json(temporary, value)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def ownership_record(plan_path, arm):
+    return {"schema": "texture_sweep_owned_run_v1", "sweep_plan_sha256": digest(plan_path),
+            "config_sha256": arm["config_sha256"], "output_dir": arm["output_dir"], "method": arm["method"]}
+
+
+def claim_training_run(plan_path, arm):
+    """Record ownership BEFORE starting a new output, never adopt an old run."""
+    if arm["reused_snapshot"] or Path(arm["output_dir"]).exists():
+        raise FileExistsError("Cannot claim an existing/reused training run")
+    folder = Path(plan_path).parent / "training_ownership"
+    folder.mkdir(exist_ok=True)
+    path = folder / (arm["method"] + ".json")
+    expected = ownership_record(plan_path, arm)
+    if path.exists() and read_json(path) != expected:
+        raise ValueError("Training ownership record differs")
+    atomic_json(path, expected)
+
+
+def compact_new_arm(plan_path, arm, plan):
+    """Opt-in cleanup of ONLY this sweep's owned, completed NEW run.
+
+    Raw checkpoint/config/metadata stay byte-identical. An atomic journal allows
+    retry after interruption; reused probes and unknown files are never removed.
+    """
+    if plan.get("storage_mode", "full") != "weights-only" or arm["reused_snapshot"]:
+        raise ValueError("Compaction requires explicit weights-only mode and a new arm")
+    root = Path(arm["output_dir"])
+    expected_root = Path(plan["run_root"]) / lambda_name(arm["lambda"])
+    if arm["method"] != lambda_name(arm["lambda"]) or root != expected_root or root.resolve() != root or root.is_symlink():
+        raise ValueError("Compaction output is outside the owned run")
+    owner = Path(plan_path).parent / "training_ownership" / (arm["method"] + ".json")
+    if not owner.is_file() or read_json(owner) != ownership_record(plan_path, arm):
+        raise ValueError("Refuse to compact a run without this sweep's pre-training ownership record")
+    summary = read_json(root / "training_summary.json")
+    snapshot = arm_snapshot(arm, plan)
+    if summary.get("global_step") != plan["steps"] or summary.get("spatial_dynamic") != snapshot["metadata"]["spatial_dynamic"]:
+        raise ValueError("Training did not complete the planned budget/objective; no cleanup performed")
+    checkpoint = Path(snapshot["checkpoint"])
+    raw_files = {str(Path(path).relative_to(checkpoint)) for path in snapshot["weight_files_sha256"]}
+    allowed = {"ema_state.pt"}
+    allowed.update(raw_files)  # Redundant final policy exports at the run root.
+    allowed.update(str(Path(checkpoint.name) / "ema" / relative) for relative in raw_files)
+    allowed.update(str(Path(checkpoint.name) / name) for name in
+                   ("optimizer.bin", "scheduler.bin", "random_states_0.pkl", "scaler.pt", "ema_state.pt"))
+
+    def safe_file(relative):
+        candidate = root / relative
+        if candidate.resolve() == root or root not in candidate.resolve().parents:
+            raise ValueError("Cleanup path escapes the owned run")
+        current = candidate
+        while current != root:
+            if current.is_symlink():
+                raise ValueError("Refuse cleanup through a symlink: " + str(current))
+            current = current.parent
+        if candidate.exists() and not candidate.is_file():
+            raise ValueError("Expected a generated file: " + str(candidate))
+        return candidate
+
+    for path in snapshot["weight_files_sha256"]:
+        safe_file(str(Path(path).relative_to(root)))
+    marker = root / "weights_only.json"
+    if marker.exists():
+        journal = read_json(marker)
+        if journal.get("ownership") != ownership_record(plan_path, arm):
+            raise ValueError("Compaction journal belongs to another sweep")
+        check_snapshot_files(journal["retained_snapshot"])
+        if journal["retained_snapshot"] != snapshot:
+            raise ValueError("Retained raw checkpoint changed")
+        if journal.get("status") == "completed_weights_only":
+            return journal
+    else:
+        removals = []
+        for relative in sorted(allowed):
+            candidate = safe_file(relative)
+            if candidate.is_file():
+                removals.append({"relative_path": relative, "bytes": candidate.stat().st_size, "sha256": digest(candidate)})
+        journal = {"schema": "texture_sweep_weights_only_v1", "status": "compacting", "ownership": ownership_record(plan_path, arm),
+                   "retained_snapshot": snapshot, "removals": removals, "optimizer_resume_supported": False}
+        atomic_json(marker, journal)
+    # Preflight the entire remaining deletion set before deleting any file.
+    for item in journal["removals"]:
+        if item["relative_path"] not in allowed:
+            raise ValueError("Unrecognized cleanup journal path")
+        candidate = safe_file(item["relative_path"])
+        if candidate.exists() and (candidate.stat().st_size != item["bytes"] or digest(candidate) != item["sha256"]):
+            raise ValueError("Generated training-state file changed; no further cleanup: " + str(candidate))
+    for item in journal["removals"]:
+        candidate = safe_file(item["relative_path"])
+        if candidate.exists():
+            candidate.unlink()
+    check_snapshot_files(snapshot)
+    journal.update(status="completed_weights_only", removed_file_bytes=sum(item["bytes"] for item in journal["removals"]))
+    atomic_json(marker, journal)
+    return journal
 
 
 def pending_training_arms(plan):
@@ -242,6 +364,10 @@ def train_sweep(plan_path, gpu="0"):
         raise ValueError("Use one physical GPU index from a single-process shell")
     check_snapshot_files(plan["source_snapshot"])
     pending = pending_training_arms(plan)
+    if plan.get("storage_mode") == "weights-only":
+        for arm in plan["arms"]:
+            if not arm["reused_snapshot"] and arm not in pending:
+                compact_new_arm(path, arm, plan)
     space = storage_estimate(plan, pending)
     write_json(path.parent / "storage_estimate.json", space)
     if pending and not space["enough_space_estimate"]:
@@ -252,8 +378,12 @@ def train_sweep(plan_path, gpu="0"):
         if not space["enough_space_estimate"]:
             raise RuntimeError("Available disk fell below the remaining-run estimate; completed arms are preserved")
         print(f"Training {arm['method']}: {plan['steps']} optimizer steps from SFT", flush=True)
+        claim_training_run(path, arm)
         subprocess.run([sys.executable, "-m", "scripts.train_dpo_sd3", "--config", arm["config"]], cwd=str(ROOT), env=env, check=True)
         arm_snapshot(arm, plan)
+        if plan.get("storage_mode") == "weights-only":
+            journal = compact_new_arm(path, arm, plan)
+            print(f"{arm['method']}: retained raw evaluation weights; removed {journal['removed_file_bytes']/1024**3:.2f} GiB of generated state/exports", flush=True)
     print("All planned checkpoints available; training finished. Evaluation is a separate command.")
 
 
@@ -366,6 +496,7 @@ def report_sweep(plan_path):
     tradeoff_plot(root / "psnr_musiq_tradeoff.svg", points, {arm["method"]: "lambda=" + f"{arm['lambda']:g}" for arm in sweep["arms"]})
     def fmt(value): return "N/A" if value is None else f"{value:+.6g}"
     lines = ["# 固定 lambda 等预算比较", "", f"- 每组 {sweep['steps']} 个 optimizer steps；固定 SFT 初始化、训练 seed、偏好、GT、beta、学习率和有效 batch。",
+             f"- 存储模式：`{sweep.get('storage_mode','full')}`；weights-only 新组只保留 raw 评估权重，不能完整恢复 optimizer 续训。",
              f"- 数据角色：`{plan['role']}`；{len(plan['sources'])} 张源图 × {len(plan['seeds'])} 个固定推理 seed；SFT 仅生成一套共同输出。",
              "- 下面差值均为候选减 SFT；PSNR/SSIM/美学越大越好，LPIPS/DISTS 越小越好。",
              "- DPO 留出不代表 SFT 未见；此处是选参验证，最终 test 应在模型冻结后单独进行。", "",

@@ -73,7 +73,45 @@ python -m scripts.texture_lambda_sweep space --plan "$SWEEP/sweep_plan.json"
 不足时将 `RUNS` 改为真正空间充足的磁盘目录，并用新 `SWEEP` 路径重新 prepare。
 若报告目录和训练目录位于不同磁盘，还应分别 `df -h "$SWEEP"` 和 `df -h "$RUNS"`；
 估算为保守地在训练盘预留验证空间，不能替代另一个磁盘的实际配额检查。
-工具不自动删除原探针、checkpoint或中间结果，也不分配梯度诊断用的13GB临时向量。
+默认 `--storage-mode full` 保留完整训练结果；显式 `weights-only` 模式见下文。
+
+### 磁盘不足：显式仅保留评估权重
+
+如果三组完整输出需要87.31GiB、可用54.76GiB，可以采用 `--storage-mode weights-only`。
+该模式仍以原有设置完成每组训练（包括 EMA 更新和完整 checkpoint 保存），成功结束后再精简该新组：
+
+- **保留**：`checkpoint-200/controlnet`、`checkpoint-200/ra_fusion` 的 raw 权重及配置、
+  `dpo_resume.json`、`dpo_config.yaml`、训练日志/summary，以及精简记录 `weights_only.json`。
+- **删除本轮新组生成的**：checkpoint 的 optimizer/scheduler/RNG/scaler/EMA state、
+  checkpoint 内重复的 EMA 导出、运行根目录重复的 policy/EMA 导出。
+- **复用的原1000组不精简**；未知文件不删除。只清理开训前已有本计划 ownership 记录、
+  且完成指定步数的本轮新组，删除前校验保留权重的hash，支持中断后重试。
+
+这样按“前面已完成组的 raw 权重 + 当前一组完整训练/导出峰值 + 验证空间”估算，
+而不是累计三组完整训练状态。每组仍需先有空间写出完整 checkpoint，不能把峰值只按 raw 权重算。
+**这些新组可按同一协议评估，但不再支持完整恢复 optimizer 续训。**
+如选中的lambda需要完整200步状态续训，应从SFT用已固定的配置重跑该组，保留完整状态后继续；
+不能把仅存权重目录当完整 resume，亦不能改 reference 初始化路径。
+
+更新 `dpo/texture_lambda_sweep.py` 和 `scripts/texture_lambda_sweep.py` 后，原计划的 code hash 会变化，
+需要**新建计划目录**，不要手改旧JSON的hash。沿用原固定验证集即可，示例：
+
+```bash
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export BASE=/root/autodl-tmp/sd3/experiment
+export PROBE="$BASE/Texture_FidelityProbe_200_v1"
+export VAL="$BASE/texture_final_validation_v1"
+export SWEEP="$BASE/texture_lambda_sweep_200_weights_v1"
+export RUNS="$BASE/Texture_LambdaSweep_200_weights_v1"
+
+python -m scripts.texture_lambda_sweep prepare --validation-plan "$VAL/validation_plan.json" --lambdas 1000,2000,5000,10000 --steps 200 --reuse "1000=$PROBE/fidelity" --storage-mode weights-only --run-root "$RUNS" --output "$SWEEP"
+python -m scripts.texture_lambda_sweep space --plan "$SWEEP/sweep_plan.json"
+```
+
+查看新估算的 `storage_mode`、`raw_policy_bytes`、`estimated_training_peak_bytes` 和 `enough_space_estimate`。
+确认空间足够，再使用下方相同的 `train` 和 `run` 命令。
+原来因存储预检查失败的计划尚未开训，不需要重建验证集、重算IQA或删除原1000探针。
 
 ## 3. 显式开始单卡串行训练
 
@@ -155,5 +193,6 @@ python -m unittest discover -s tests -p 'test_texture_lambda_sweep.py' -v
 ```
 
 测试覆盖完整配置单变量、历史有效设置、复用的seed/预算/目标隔离、文件改变检测、
-磁盘不足不启动/失败即停止、SFT仅分配一次、源级配对统计、缺失数据与均值Pareto方向。
+磁盘不足不启动/失败即停止、weights-only的完整单组峰值/保留边界/中断恢复、
+SFT仅分配一次、源级配对统计、缺失数据与均值Pareto方向。
 这些是配置/文件处理/代数测试，不加载模型，不替代服务器真实SD3训练或验证。

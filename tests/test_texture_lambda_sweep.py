@@ -13,7 +13,7 @@ import yaml
 
 from dpo.spatial_config import preparation_contract, training_signature
 from dpo.texture_lambda_sweep import (
-    arm_snapshot, comparable_config, evaluation_plan, lambda_name, load_sweep,
+    arm_snapshot, claim_training_run, compact_new_arm, comparable_config, evaluation_plan, lambda_name, load_sweep,
     pareto_methods, pending_training_arms, prepare_sweep, report_sweep, storage_estimate, tradeoff_plot, train_sweep,
 )
 from dpo.texture_release_runtime import inference_groups
@@ -71,6 +71,25 @@ def fixture(root):
               "criteria": {"bootstrap_repetitions": 100, "psnr_tolerance_db": 0.}}
     write_json(validation / "validation_plan.json", cohort)
     return validation / "validation_plan.json", cfg
+
+
+def completed_run_fixture(arm, plan):
+    """Completed-run file layout only; no tensor/model runtime is simulated."""
+    directory = Path(arm["output_dir"])
+    cfg = yaml.safe_load(Path(arm["config"]).read_text(encoding="utf-8"))
+    snapshot = save_metadata_fixture(directory, cfg, plan["source_snapshot"]["metadata"])
+    checkpoint = Path(snapshot["checkpoint"])
+    for weight in snapshot["weight_files_sha256"]:
+        relative = Path(weight).relative_to(checkpoint)
+        for parent in (directory, checkpoint / "ema"):
+            target = parent / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"Opaque EMA export fixture, NOT model weights")
+    (directory / "ema_state.pt").write_bytes(b"Opaque generated state fixture")
+    (directory / "training.log").write_text("File IO fixture only\n", encoding="utf-8")
+    (directory / "controlnet" / "user_note.bin").write_bytes(b"Unknown file: preserve")
+    write_json(directory / "training_summary.json", {"global_step": plan["steps"], "spatial_dynamic": snapshot["metadata"]["spatial_dynamic"]})
+    return snapshot
 
 
 class TextureLambdaSweepTest(unittest.TestCase):
@@ -245,6 +264,125 @@ class TextureLambdaSweepTest(unittest.TestCase):
 
     def test_pareto_direction_and_missing_points(self):
         self.assertEqual(pareto_methods({"sft": (0, 0), "a": (.2, .1), "b": (.1, .1), "c": (.1, .3), "missing": (None, 10)}), ["a", "c"])
+
+    def test_weights_only_peak_accounts_for_one_full_run_and_previous_raw_weights(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            val, _ = fixture(root)
+            # A larger opaque state file exercises real byte accounting without
+            # allocating a fake network or serializing any tensors.
+            source = root / "old_probe" / "fidelity" / "checkpoint-200"
+            (source / "optimizer.bin").write_bytes(b"fixture" * (512 * 1024))
+            plan = prepare_sweep(val, root / "plan", root / "runs", reuse={1000: root / "old_probe" / "fidelity"}, storage_mode="weights-only")
+            compact = storage_estimate(plan)
+            full = storage_estimate({**plan, "storage_mode": "full"})
+            self.assertEqual(compact["pending_training_runs"], 3)
+            self.assertEqual(compact["estimated_training_peak_bytes"], 2 * compact["retained_per_new_run_bytes"] + compact["per_run_checkpoint_plus_export_bytes"])
+            self.assertLess(compact["estimated_additional_peak_bytes"], full["estimated_additional_peak_bytes"])
+            self.assertEqual(storage_estimate(plan, [plan["arms"][-1]])["estimated_training_peak_bytes"], compact["per_run_checkpoint_plus_export_bytes"])
+
+    def test_compaction_preserves_raw_hashes_metadata_logs_unknown_files_and_original_probe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            val, _ = fixture(root)
+            plan = prepare_sweep(val, root / "plan", root / "runs", reuse={1000: root / "old_probe" / "fidelity"}, storage_mode="weights-only")
+            path = root / "plan" / "sweep_plan.json"
+            arm = plan["arms"][1]
+            claim_training_run(path, arm)
+            before = completed_run_fixture(arm, plan)
+            original = {p: digest(p) for p in (Path(plan["source_snapshot"]["checkpoint"]) / "optimizer.bin", Path(plan["source_snapshot"]["config_path"]))}
+            result = compact_new_arm(path, arm, plan)
+            self.assertEqual(result["status"], "completed_weights_only")
+            self.assertFalse(result["optimizer_resume_supported"])
+            self.assertEqual(before, arm_snapshot(arm, plan))
+            directory = Path(arm["output_dir"])
+            self.assertFalse((directory / "checkpoint-200" / "optimizer.bin").exists())
+            self.assertFalse((directory / "checkpoint-200" / "ema_state.pt").exists())
+            self.assertFalse((directory / "checkpoint-200" / "ema" / "controlnet" / "fixture.bin").exists())
+            self.assertFalse((directory / "controlnet" / "fixture.bin").exists())
+            self.assertTrue((directory / "training.log").is_file())
+            self.assertTrue((directory / "controlnet" / "user_note.bin").is_file())
+            self.assertEqual({p: digest(p) for p in original}, original)
+            self.assertEqual(compact_new_arm(path, arm, plan), result)
+            with self.assertRaises(ValueError):
+                compact_new_arm(path, plan["arms"][0], plan)
+
+    def test_compaction_rejects_unowned_or_incomplete_runs_before_removing_any_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            val, _ = fixture(root)
+            plan = prepare_sweep(val, root / "plan", root / "runs", storage_mode="weights-only")
+            path = root / "plan" / "sweep_plan.json"
+            arm = plan["arms"][0]
+            completed_run_fixture(arm, plan)
+            with self.assertRaisesRegex(ValueError, "ownership record"):
+                compact_new_arm(path, arm, plan)
+            self.assertTrue((Path(arm["output_dir"]) / "checkpoint-200" / "optimizer.bin").is_file())
+            other = plan["arms"][1]
+            claim_training_run(path, other)
+            completed_run_fixture(other, plan)
+            write_json(Path(other["output_dir"]) / "training_summary.json", {"global_step": 199})
+            with self.assertRaisesRegex(ValueError, "did not complete"):
+                compact_new_arm(path, other, plan)
+            self.assertTrue((Path(other["output_dir"]) / "ema_state.pt").is_file())
+
+    def test_interrupted_compaction_can_retry_but_changed_raw_policy_blocks_cleanup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            val, _ = fixture(root)
+            plan = prepare_sweep(val, root / "plan", root / "runs", storage_mode="weights-only")
+            path = root / "plan" / "sweep_plan.json"
+            arm = plan["arms"][0]
+            claim_training_run(path, arm)
+            completed_run_fixture(arm, plan)
+            unlink = Path.unlink
+            def interrupted(target, *args, **kwargs):
+                if target.name == "optimizer.bin":
+                    raise OSError("Fixture interrupted during cleanup")
+                return unlink(target, *args, **kwargs)
+            with patch.object(Path, "unlink", interrupted):
+                with self.assertRaises(OSError):
+                    compact_new_arm(path, arm, plan)
+            marker = Path(arm["output_dir"]) / "weights_only.json"
+            self.assertEqual(json.loads(marker.read_text(encoding="utf-8"))["status"], "compacting")
+            self.assertEqual(compact_new_arm(path, arm, plan)["status"], "completed_weights_only")
+            other = plan["arms"][1]
+            claim_training_run(path, other)
+            snap = completed_run_fixture(other, plan)
+            with patch.object(Path, "unlink", side_effect=OSError("Fixture stop before cleanup")):
+                with self.assertRaises(OSError):
+                    compact_new_arm(path, other, plan)
+            next(iter(map(Path, snap["weight_files_sha256"]))).write_bytes(b"Changed retained file fixture")
+            with self.assertRaisesRegex(ValueError, "Pinned input changed"):
+                compact_new_arm(path, other, plan)
+            self.assertTrue((Path(other["output_dir"]) / "checkpoint-200" / "optimizer.bin").exists())
+
+    def test_weights_only_serial_workflow_compacts_before_next_launch_and_keeps_evaluation_loadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            val, _ = fixture(root)
+            plan = prepare_sweep(val, root / "plan", root / "runs", reuse={1000: root / "old_probe" / "fidelity"}, storage_mode="weights-only")
+            path = root / "plan" / "sweep_plan.json"
+            completed = []
+            def file_layout_only(command, **kwargs):
+                # Verify orchestration using completed-run file layouts only;
+                # no model/training result is simulated or validated.
+                if completed:
+                    self.assertFalse((Path(completed[-1]["output_dir"]) / "checkpoint-200" / "optimizer.bin").exists())
+                arm = next(a for a in plan["arms"] if a["config"] == command[-1])
+                self.assertTrue((path.parent / "training_ownership" / (arm["method"] + ".json")).is_file())
+                completed_run_fixture(arm, plan)
+                completed.append(arm)
+                return subprocess.CompletedProcess(command, 0)
+            with patch("dpo.texture_lambda_sweep.shutil.disk_usage", return_value=types.SimpleNamespace(free=10**15)), \
+                 patch("dpo.texture_lambda_sweep.subprocess.run", side_effect=file_layout_only) as launch:
+                train_sweep(path)
+                self.assertEqual(launch.call_count, 3)
+            self.assertEqual([a["lambda"] for a in completed], [2000, 5000, 10000])
+            for arm in completed:
+                self.assertEqual(json.loads((Path(arm["output_dir"]) / "weights_only.json").read_text(encoding="utf-8"))["status"], "completed_weights_only")
+            self.assertTrue((Path(plan["source_snapshot"]["checkpoint"]) / "optimizer.bin").is_file())
+            self.assertEqual(len(json.loads(evaluation_plan(path).read_text(encoding="utf-8"))["snapshots"]), 4)
 
 
 if __name__ == "__main__":
