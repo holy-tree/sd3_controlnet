@@ -1,5 +1,5 @@
 # Dynamic-only spatial dual-objective experiment, schema sd3_dynamic_texture_v1.
-# Standalone config. The weights below are experimental starting points, not validated optima.
+# Standalone formal-run config.
 weather_prompts:
   rain: "a clean, sharp, rain-free natural photograph with fine details"
   snow: "a clean, sharp, snow-free natural photograph with natural colors and fine details"
@@ -12,7 +12,7 @@ reward:
 
 spatial_dynamic:
   version: 1
-  lambda_fidelity: 0.1       # Fixed coefficient of full-image RGB GT MSE.
+  lambda_fidelity: 1000.0    # Fixed coefficient of full-image RGB GT MSE.
   texture_strength: 2.0      # Set ONLY this to 0 for the spatial-weighting ablation.
   horizontal_flip_probability: 0.0
   mask:
@@ -51,13 +51,13 @@ candidate_generation:
 
 preference_filter:
   candidate_metrics_path: /root/autodl-tmp/sd3/experiment/dpo_texture_scores_m32_v1/per_candidate_texture.csv
-  output_dir: /root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_texture_m32_v1
+  output_dir: /root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_texture_m32_v2
   pairs_per_group: 12
-  min_psnr_gap: -0.15
+  min_psnr_gap: -0.10        # chosen PSNR - rejected PSNR, in dB.
   weather_specific_thresholds:
-    rain: -0.15
-    snow: -0.15
-    haze: -0.15
+    rain: -0.10
+    snow: -0.10
+    haze: 0.0
   max_psnr_gap: null
   fidelity_constraints:
     max_dists_pair_degradation: 0.01
@@ -86,9 +86,9 @@ tail_risk:
   eps: 0.00000001
 
 training:
-  preference_manifest: /root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_texture_m32_v1/preference_pairs.jsonl
+  preference_manifest: /root/autodl-tmp/sd3/experiment/dpo_preferences_dynamic_texture_m32_v2/preference_pairs.jsonl
   gt_source_manifest: /root/autodl-tmp/sd3/experiment/dpo_texture_scores_m32_v1/gt_sources.jsonl
-  output_dir: /root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_Texture_M32_V1
+  output_dir: /root/autodl-tmp/sd3/experiment/SD3_ControlNet_RA_DPO_Dynamic_Texture_M32_V2
   resume_from_checkpoint: null
   train_controlnet: true
   train_ra_fusion: true
@@ -147,7 +147,7 @@ training:
 
 evaluation:
   eval_config: ./config/eval_sd3.yaml
-  output_dir: /root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic_texture_m32_v1
+  output_dir: /root/autodl-tmp/sd3/experiment/eval_sd3_dpo_dynamic_texture_m32_v2
   controlnet_model_path: null
   ra_fusion_path: null
   use_ema: true

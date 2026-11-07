@@ -120,10 +120,13 @@ Q_texture = 0.55*MUSIQ_texture_z + 0.35*CLIP-IQA_texture_z + 0.10*NIMA_texture_z
 随后应用原始 PSNR 对间下界/可选上界、DISTS 退化限制以及组中位数底线，
 最终固定种子、无放回均匀随机选最多 12 对，不按奖励差取前 12。
 
+正式配置要求 `PSNR(chosen) - PSNR(rejected)`：雨天、雪天至少 **−0.10 dB**，
+雾天至少 **0 dB**；未指定天气的全局下限为 −0.10 dB。
+
 ## 5. 配置与运行
 
 完整独立配置：`config/dpo_sd3_reward_dynamic_texture.yaml`。
-以下值仅是实验起点，不代表已验证最优：
+当前正式运行固定 `lambda_fidelity=1000`，对应配置如下：
 
 ```yaml
 reward:
@@ -131,7 +134,7 @@ reward:
   min_texture_q_gap: 0.05
 spatial_dynamic:
   version: 1
-  lambda_fidelity: 0.1
+  lambda_fidelity: 1000.0
   texture_strength: 2.0
   mask:
     window: 7
@@ -152,7 +155,19 @@ spatial_dynamic:
     interval: 1
     sigma_min: 0.05
     sigma_max: 0.70
+preference_filter:
+  min_psnr_gap: -0.10
+  weather_specific_thresholds:
+    rain: -0.10
+    snow: -0.10
+    haze: 0.0
 ```
+
+本次正式配置的偏好输出为 `dpo_preferences_dynamic_texture_m32_v2`，
+训练输出为 `SD3_ControlNet_RA_DPO_Dynamic_Texture_M32_V2`（均在原 experiment 根目录下）。
+训练清单已指向 v2。已有 v1 局部 IQA 评分可直接用于新筛选，**只执行下面第2步即可重新准备偏好**。
+旧的 −0.15 dB 偏好清单不满足新筛选合同；新运行从配置中的 SFT 路径起训，
+不能直接 resume 原有 λ/偏好合同不同的 checkpoint。
 
 在项目根目录执行；下列命令不会自动串联启动正式训练：
 
@@ -164,7 +179,7 @@ python -m scripts.prepare_texture_dpo score --config config/dpo_sd3_reward_dynam
 # 显式覆盖无效的 OpenMP 环境变量；此例将 IQA 放在 GPU 上。
 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 python -m scripts.prepare_texture_dpo score --config config/dpo_sd3_reward_dynamic_texture.yaml --device cuda:0 --restart-incomplete
 
-# 2. 在新的偏好目录中筛选 Q_texture 偏好。
+# 2. 复用已有局部评分，按 rain/snow >= -0.10、haze >= 0 筛选到 v2 偏好目录。
 python -m scripts.prepare_texture_dpo filter --config config/dpo_sd3_reward_dynamic_texture.yaml
 # 等价入口：python -m scripts.filter_dpo_pairs --config config/dpo_sd3_reward_dynamic_texture.yaml
 
